@@ -88,6 +88,13 @@ const createWindow = () => {
     minHeight: 640,
     backgroundColor: '#f4f1ea',
     ...(ICON_PATH ? { icon: ICON_PATH } : {}),
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset',
+          trafficLightPosition: { x: 14, y: 12 },
+          windowButtonVisibility: true
+        }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -99,6 +106,12 @@ const createWindow = () => {
     win.loadURL('http://localhost:5173');
   } else {
     win.loadFile(path.join(__dirname, '../dist/index.html'));
+  }
+
+  if (process.platform === 'darwin') {
+    win.setWindowButtonVisibility(true);
+    win.on('blur', () => win.setWindowButtonVisibility(true));
+    win.on('focus', () => win.setWindowButtonVisibility(true));
   }
 };
 

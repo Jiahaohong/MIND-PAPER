@@ -1,7 +1,7 @@
 {
-  "name": "aipaper",
+  "name": "mindpaper",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {
@@ -28,8 +28,8 @@
     "wait-on": "^7.2.0"
   },
   "build": {
-    "appId": "com.aipaper.local",
-    "productName": "AIPAPER",
+    "appId": "com.mindpaper.local",
+    "productName": "MIND PAPER",
     "directories": {
       "output": "release"
     },
@@ -40,7 +40,7 @@
       "package.json"
     ],
     "mac": {
-      "icon": "assets/aipaper.icns",
+      "icon": "assets/mindpaper.icns",
       "target": [
         "dmg",
         "zip"

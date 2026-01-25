@@ -1240,6 +1240,35 @@ const canUseElectron = () =>
   typeof window !== 'undefined' && window.electronAPI && typeof window.electronAPI.readPdf === 'function';
 
 export default function App() {
+  const isMac = useMemo(
+    () =>
+      typeof navigator !== 'undefined' &&
+      /mac/i.test(navigator.platform || navigator.userAgent || ''),
+    []
+  );
+
+  const [windowFocused, setWindowFocused] = useState(() =>
+    typeof document !== 'undefined' ? document.hasFocus() : true
+  );
+
+  useEffect(() => {
+    if (!isMac) return undefined;
+    document.body.classList.add('mac-titlebar');
+    return () => document.body.classList.remove('mac-titlebar');
+  }, [isMac]);
+
+  useEffect(() => {
+    if (!isMac) return undefined;
+    const handleFocus = () => setWindowFocused(true);
+    const handleBlur = () => setWindowFocused(false);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [isMac]);
+
   const [history, setHistory] = useState(loadHistory);
   const [folders, setFolders] = useState(loadFolders);
   const [activeView, setActiveView] = useState(VIEW_ALL);
@@ -4983,6 +5012,13 @@ export default function App() {
       />
 
       <div className="app-tabs">
+        {isMac && !windowFocused ? (
+          <div className="mac-traffic-lights" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+        ) : null}
         <div className={`app-tab home${currentId ? '' : ' active'}`}>
           <button type="button" className="app-tab-button" onClick={goHome} title="主界面">
             <span className="app-tab-icon" aria-hidden="true">
@@ -5037,7 +5073,7 @@ export default function App() {
           <div className="manager-shell">
               <aside className="manager-sidebar">
                 <div className="manager-brand">
-                  <div className="manager-logo">AIPAPER</div>
+                  <div className="manager-logo">MIND PAPER</div>
                 </div>
                 <div className="manager-section">
                   <button
@@ -5642,9 +5678,7 @@ export default function App() {
                     </div>
                   ) : status ? (
                     <div className="panel-subtitle">{status}</div>
-                  ) : (
-                    <div className="panel-subtitle">上传PDF后会生成问题</div>
-                  )}
+                  ) : null}
                 </div>
               ) : null}
 
@@ -5667,18 +5701,16 @@ export default function App() {
               {activeRightTab === 'chat' ? (
                 <>
                   <div className="chat-body">
-                    {messages.length === 0 ? (
-                      <div className="empty-state">从提问开始与AI对话</div>
-                    ) : (
-                      messages.map((message) => (
-                        <div key={message.id} className={`message ${message.role}`}>
-                          <div className="message-meta">
-                            {message.role === 'user' ? '你' : 'AI'}
+                    {messages.length > 0
+                      ? messages.map((message) => (
+                          <div key={message.id} className={`message ${message.role}`}>
+                            <div className="message-meta">
+                              {message.role === 'user' ? '你' : 'AI'}
+                            </div>
+                            {message.content}
                           </div>
-                          {message.content}
-                        </div>
-                      ))
-                    )}
+                        ))
+                      : null}
                     <div ref={chatEndRef} />
                   </div>
 
