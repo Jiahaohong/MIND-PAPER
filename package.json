@@ -2,6 +2,7 @@
   "name": "mindpaper",
   "private": true,
   "version": "0.1.1",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "main": "electron/main.cjs",
   "type": "module",
   "scripts": {

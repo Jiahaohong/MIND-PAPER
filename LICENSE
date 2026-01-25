@@ -1,21 +1,62 @@
-MIT License
+PolyForm Noncommercial License 1.0.0
 
-Copyright (c) 2026 Jiahaohong
+Acceptance
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+In order to receive this license, you must agree to its rules. The rules of this
+license are both obligations under that agreement and conditions to your license.
+You must not do anything with this software that triggers a rule that you cannot
+or will not follow.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+License
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+The licensor grants you a license to do everything with this software that would
+otherwise infringe the licensor's copyright, but only for noncommercial purposes.
+
+Notices
+
+You must ensure that anyone who gets a copy of any part of this software from you,
+with or without changes, also gets the text of this license or a link to
+https://polyformproject.org/licenses/noncommercial/1.0.0/.
+
+Commercial Purposes
+
+Any commercial use of this software is prohibited. Commercial use means use of
+this software for commercial advantage or monetary compensation, including
+selling products or services that include or are derived from the software, or
+using the software to provide services to third parties.
+
+Patent
+
+The licensor grants you a license, for noncommercial purposes only, to any patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using this software.
+
+No Liability
+
+As far as the law allows, this software comes as is, without any warranty or
+condition, and the licensor will not be liable to you for any damages arising out
+of these terms or the use or nature of this software, under any kind of legal
+claim.
+
+Definitions
+
+The terms "you", "your", "licensor", and "software" as used in this license are
+defined as follows:
+
+You: The individual or entity agreeing to these terms.
+
+Your: refers to that individual or entity.
+
+Licensor: The individual or entity offering these terms, including successors and
+assignees.
+
+Software: The software code, interfaces, and any associated materials.
+
+Termination
+
+If you violate any term of this license, your rights under this license terminate
+automatically.
+
+Contact
+
+For commercial licensing, contact the licensor.
