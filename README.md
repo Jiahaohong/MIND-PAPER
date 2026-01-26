@@ -9,16 +9,21 @@ Click setting buttons on the top right of the screen, add your own api key and a
 You can highlght any text in the pdf, or make it a subtitle. And all your highlight note will transfer into the mind map node automatically.
 
 ### Paper Outline
-[Demo 1](https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1.outline-usage.mov)
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1.outline-usage.mov" controls width="800"></video>
+
 
 ### Highlight Text
-[Demo 2](https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-highlight-usage.mov)
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-highlight-usage.mov" controls width="800"></video>
+
 
 ### Add Subtitle
-[Demo 3](https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-add-subtitle.mov)
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-add-subtitle.mov" controls width="800"></video>
+
 
 ### Related to Problem
-[Demo 4](https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-related-problem.mov)
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-related-problem.mov" controls width="800"></video>
+
 
 ### Mind Map
-[Demo 5](https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov)
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
+
