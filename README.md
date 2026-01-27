@@ -32,8 +32,14 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 - [ ] Improve PDF highlight selection experience
 
 ### v0.1.2
+
+#### New Function
 - [ ] Add regular translation API
 - [ ] Add model selection
+
+#### Bug Fix
+- [ ] PDF Outline Recognition Issue Fix
+- [ ] Fix for abnormal display of some images in PDF on Windows platform
 
 ### v0.1.1
 
