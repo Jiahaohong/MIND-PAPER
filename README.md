@@ -30,9 +30,11 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 ## TODO
 v0.1.3
 - [ ] Improve PDF highlight selection experience
+
 v0.1.2
 - [ ] Add regular translation API
 - [ ] Add model selection
+
 Initial Version
 File Management System
 - [x] Upload PDFs
