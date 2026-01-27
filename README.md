@@ -35,22 +35,22 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 - [ ] Add regular translation API
 - [ ] Add model selection
 
-### Initial Version
+### v0.1.1
 
-#### File Management System
+#### 1. File Management System
 - [x] Upload PDFs
 - [x] Manage folders and files
 
-#### Paper Reading System
+#### 2. Paper Reading System
 
-##### PDF Directory System
+##### 2.1 PDF Directory System
 - [x] PDF left-side directory
 - [x] Structured recording of highlighted content in PDF chapters
 - [x] Convert highlighted content into chapter mind maps
 - [x] Convert highlight records into chapter nodes
 - [x] Drag marks to change parent nodes
 
-##### AI Assistance System:
+##### 2.2 AI Assistance System:
 - [x] Ensure API works properly and resolve API connection issues
 - [ ] Related content analysis
 - [x] Guided questions
@@ -63,12 +63,12 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 - [x] Display translation results of highlighted marks in the navigation bar
 - [x] Avoid duplicate translations of highlighted marks
 
-#### Optimization
+#### 3. Optimization
 - [x] Smoother PDF scrolling with mouse wheel
 - [ ] When selecting PDF text with mouse, do not select entirely if exceeding page bounds
 - [x] Page style adjustments
 
-#### Release
+#### 4. Release
 - [x] Add software icon
 - [x] Package as Mac software
 - [x] Package as Windows software
