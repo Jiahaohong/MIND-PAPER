@@ -28,8 +28,11 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 <video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
 
 ## TODO
-### v0.1.3
+### v0.1.4
 - [ ] Improve PDF highlight selection experience
+
+### v0.1.3
+- [ ] Optimize 'Ask AI' prompt
 
 ### v0.1.2
 
@@ -38,7 +41,7 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 - [ ] Add model selection
 
 #### Bug Fix
-- [ ] PDF Outline Recognition Issue Fix
+- [ ] Fix PDF Outline Recognition Issue
 - [ ] Fix for abnormal display of some images in PDF on Windows platform
 
 ### v0.1.1
