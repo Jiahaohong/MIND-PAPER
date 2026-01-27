@@ -27,3 +27,42 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 ### Mind Map
 <video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
 
+## TODO
+v0.1.3
+- [ ] Improve PDF highlight selection experience
+v0.1.2
+- [ ] Add regular translation API
+- [ ] Add model selection
+Initial Version
+File Management System
+- [x] Upload PDFs
+- [x] Manage folders and files
+Paper Reading System
+PDF Directory System
+- [x] PDF left-side directory
+- [x] Structured recording of highlighted content in PDF chapters
+- [x] Convert highlighted content into chapter mind maps
+- [x] Convert highlight records into chapter nodes
+- [x] Drag marks to change parent nodes
+AI Assistance System:
+- [x] Ensure API works properly and resolve API connection issues
+- [ ] Related content analysis
+- [x] Guided questions
+- [x] Add questions
+- [x] Link questions with highlighted marks
+- [x] AI inquiries
+- [x] Translation
+- [x] Automatic translation of highlighted marks
+- [x] Record translation results of highlighted marks
+- [x] Display translation results of highlighted marks in the navigation bar
+- [x] Avoid duplicate translations of highlighted marks
+
+Optimization
+- [x] Smoother PDF scrolling with mouse wheel
+- [ ] When selecting PDF text with mouse, do not select entirely if exceeding page bounds
+- [x] Page style adjustments
+
+Release
+- [x] Add software icon
+- [x] Package as Mac software
+- [x] Package as Windows software
