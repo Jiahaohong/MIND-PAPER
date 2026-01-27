@@ -26,6 +26,7 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 
 ### Mind Map
 <video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
+<<<<<<< Updated upstream
 
 ## TODO
 ### v0.1.4
@@ -81,3 +82,5 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 - [x] Add software icon
 - [x] Package as Mac software
 - [x] Package as Windows software
+=======
+>>>>>>> Stashed changes

@@ -30,7 +30,7 @@
   },
   "build": {
     "appId": "com.mindpaper.local",
-    "productName": "MIND PAPER",
+    "productName": "MIND-PAPER",
     "directories": {
       "output": "release"
     },
@@ -49,6 +49,15 @@
       "category": "public.app-category.productivity",
       "identity": null,
       "hardenedRuntime": false
-    }
+    },
+    "win": {
+      "icon": "assets/mindpaper.ico",
+      "target": ["nsis", "zip"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "npmRebuild": false
   }
 }
