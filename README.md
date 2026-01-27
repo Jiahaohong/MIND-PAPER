@@ -1,6 +1,6 @@
 # Reconstructing high-dimensional ideas from low-dimensional papers
 
-## API Settings:
+## API Settings
 
 Click setting buttons on the top right of the screen, add your own api key and api base url to start using the app.
 
