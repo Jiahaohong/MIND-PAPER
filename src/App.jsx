@@ -67,6 +67,11 @@ const RELATED_SYSTEM_PROMPT =
   '你是PDF阅读助手。请从候选片段中挑选与选中文本逻辑相关的3-6个片段编号。' +
   '仅返回JSON数组，例如：[1,3,5]，不要添加解释。';
 
+const MODEL_OPTIONS = [
+  { value: 'gpt-3.5-turbo', label: 'gpt-3.5-turbo' },
+  { value: 'gpt-4o-mini', label: 'gpt-4o-mini' }
+];
+
 const STOPWORDS = new Set([
   'the',
   'and',
@@ -555,9 +560,43 @@ const groupItemsIntoLines = (items) => {
     .map((line) => {
       const text = line.items.map((item) => item.str).join(' ').replace(/\s+/g, ' ').trim();
       const height = line.items.reduce((acc, item) => Math.max(acc, item.height || 0), 0);
-      return { text, height, y: line.y };
+      let minX = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      line.items.forEach((item) => {
+        const x = item?.transform?.[4] ?? 0;
+        const width = item?.width ?? 0;
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x + width);
+      });
+      const x = Number.isFinite(minX) ? minX : 0;
+      const width = Number.isFinite(maxX) && Number.isFinite(minX) ? Math.max(0, maxX - minX) : 0;
+      return { text, height, y: line.y, x, width };
     })
     .filter((line) => line.text);
+};
+
+const detectTwoColumnLayout = (pageInfos) => {
+  if (!pageInfos.length) return false;
+  const sample = pageInfos.slice(0, Math.min(6, pageInfos.length));
+  let checked = 0;
+  let doubleColumn = 0;
+  sample.forEach((info) => {
+    const viewport = info?.viewport;
+    if (!viewport || !info?.items?.length) return;
+    const lines = groupItemsIntoLines(info.items);
+    const mid = viewport.width / 2;
+    let left = 0;
+    let right = 0;
+    lines.forEach((line) => {
+      if (line.text.length < 20) return;
+      const center = line.x + line.width / 2;
+      if (center < mid - 20) left += 1;
+      if (center > mid + 20) right += 1;
+    });
+    if (left >= 3 && right >= 3) doubleColumn += 1;
+    checked += 1;
+  });
+  return checked > 0 && doubleColumn / checked >= 0.5;
 };
 
 const getHeadingLevel = (text) => {
@@ -755,7 +794,8 @@ const extractOutline = async (doc, pageInfos) => {
   } catch {
     // ignore outline errors
   }
-  return buildFallbackOutline(pageInfos);
+  // No native outline: keep placeholder for future auto-detection.
+  return [];
 };
 
 const collectOutlineIds = (nodes, acc = {}) => {
@@ -1052,6 +1092,11 @@ const canUseOpenAILogic = () =>
   window.electronAPI &&
   typeof window.electronAPI.openaiLogic === 'function';
 
+const canUseTranslate = () =>
+  typeof window !== 'undefined' &&
+  window.electronAPI &&
+  typeof window.electronAPI.translateText === 'function';
+
 const canUseLogger = () =>
   typeof window !== 'undefined' &&
   window.electronAPI &&
@@ -1080,6 +1125,24 @@ const requestOpenAI = async ({ messages, temperature = 0.3, maxTokens = 600 }) =
     throw new Error(response?.error || 'OpenAI请求失败');
   }
   return response.content || '';
+};
+
+const requestTranslation = async (text) => {
+  if (canUseTranslate()) {
+    const response = await window.electronAPI.translateText({ text });
+    if (!response?.ok) {
+      throw new Error(response?.error || '翻译失败');
+    }
+    return response.content || '';
+  }
+  return requestOpenAI({
+    messages: [
+      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
+      { role: 'user', content: text }
+    ],
+    temperature: 0.2,
+    maxTokens: 800
+  });
 };
 
 const requestOpenAILogic = async ({
@@ -1359,7 +1422,11 @@ export default function App() {
   });
   const [expandedHighlightIds, setExpandedHighlightIds] = useState(() => new Set());
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsForm, setSettingsForm] = useState({ apiKey: '', baseUrl: '' });
+  const [settingsForm, setSettingsForm] = useState({
+    apiKey: '',
+    baseUrl: '',
+    model: MODEL_OPTIONS[0].value
+  });
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const tabListRef = useRef(null);
@@ -1833,7 +1900,8 @@ export default function App() {
     const data = await window.electronAPI.settingsGet();
     setSettingsForm({
       apiKey: data?.apiKey || '',
-      baseUrl: data?.baseUrl || ''
+      baseUrl: data?.baseUrl || '',
+      model: data?.model || MODEL_OPTIONS[0].value
     });
   };
 
@@ -1860,7 +1928,8 @@ export default function App() {
     try {
       const response = await window.electronAPI.settingsSet({
         apiKey: settingsForm.apiKey,
-        baseUrl: settingsForm.baseUrl
+        baseUrl: settingsForm.baseUrl,
+        model: settingsForm.model
       });
       if (!response?.ok) {
         throw new Error(response?.error || '保存失败');
@@ -2443,15 +2512,12 @@ export default function App() {
     setTranslationResult('正在翻译...');
 
     const run = async () => {
+      if (translateRequestRef.current !== requestId) {
+        pendingTranslationRef.current.delete(requestId);
+        return;
+      }
       try {
-        const content = await requestOpenAI({
-          messages: [
-            { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
-            { role: 'user', content: source }
-          ],
-          temperature: 0.2,
-          maxTokens: 800
-        });
+        const content = await requestTranslation(source);
         const result = String(content || '').trim();
         const finalText = result || '未返回翻译结果';
         const pending = pendingTranslationRef.current.get(requestId);
@@ -2466,14 +2532,18 @@ export default function App() {
         if (translateRequestRef.current === requestId) {
           setTranslationResult(finalText);
         }
-      } catch (error) {
-        if (translateRequestRef.current === requestId) {
-          setTranslationResult('翻译失败');
-        }
-      } finally {
         pendingTranslationRef.current.delete(requestId);
         if (translateRequestRef.current === requestId) {
           setIsTranslating(false);
+        }
+      } catch (error) {
+        if (translateRequestRef.current === requestId) {
+          setTranslationResult('正在翻译...');
+          setTimeout(() => {
+            if (translateRequestRef.current === requestId) {
+              run();
+            }
+          }, 1000);
         }
       }
     };
@@ -4437,23 +4507,13 @@ export default function App() {
     );
   };
 
-  const renderOutlineNodes = (nodes, depth = 0, prefix = []) => {
-    let seq = 0;
+  const renderOutlineNodes = (nodes, depth = 0) => {
     return nodes.map((node) => {
       const notes = highlightsByChapter.get(node.id) || [];
       const hasChildren = Boolean(node.items?.length || notes.length);
       const isExpanded = isOutlineExpanded(node.id, node.isRoot ? true : false);
       const baseOffset = 3 + depth * 14;
       const titleOffset = baseOffset + 17;
-      const isCustom = Boolean(node.isCustom);
-      const isRoot = Boolean(node.isRoot);
-      let numberLabel = null;
-      let nextPrefix = prefix;
-      if (!isCustom && !isRoot) {
-        seq += 1;
-        nextPrefix = [...prefix, seq];
-        numberLabel = nextPrefix.join('.');
-      }
       return (
         <div key={node.id} className="outline-node">
           <div
@@ -4479,7 +4539,7 @@ export default function App() {
               onClick={() => jumpToPage(node.pageIndex, node.top, node.topRatio)}
               disabled={node.pageIndex == null}
             >
-              {numberLabel ? `${numberLabel} ${node.title}` : node.title}
+              {node.title}
             </button>
           </div>
           {hasChildren && isExpanded ? (
@@ -4508,7 +4568,7 @@ export default function App() {
                   ))}
                 </div>
               ) : null}
-              {node.items?.length ? renderOutlineNodes(node.items, depth + 1, nextPrefix) : null}
+              {node.items?.length ? renderOutlineNodes(node.items, depth + 1) : null}
             </div>
           ) : null}
         </div>
@@ -5781,6 +5841,25 @@ export default function App() {
                 placeholder="https://api.openai.com/v1"
               />
             </div>
+            <div className="settings-field">
+              <label className="settings-label" htmlFor="settings-model">
+                模型
+              </label>
+              <select
+                id="settings-model"
+                className="dialog-select"
+                value={settingsForm.model}
+                onChange={(event) =>
+                  setSettingsForm((prev) => ({ ...prev, model: event.target.value }))
+                }
+              >
+                {MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
             {settingsError ? <div className="dialog-error">{settingsError}</div> : null}
             <div className="dialog-actions">
               <button
@@ -5850,7 +5929,7 @@ export default function App() {
             </button>
           </div>
           <div className="translation-box">
-            {isTranslating && !translationResult ? '正在翻译...' : translationResult}
+            {translationResult}
           </div>
         </div>
       ) : null}

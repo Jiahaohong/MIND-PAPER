@@ -726,6 +726,14 @@ button {
   font-size: 0.9rem;
 }
 
+.dialog-select {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(31, 42, 55, 0.2);
+  background: #fff;
+  font-size: 0.9rem;
+}
+
 .dialog-error {
   color: #b42318;
   font-size: 0.78rem;
@@ -1439,6 +1447,7 @@ button {
   position: sticky;
   top: 0;
   z-index: 10;
+  overflow: visible;
 }
 
 body.mac-titlebar .app-tabs {
@@ -1502,12 +1511,17 @@ body.mac-titlebar .app-tab-actions {
   height: 32px;
   padding: 0;
   border-radius: 10px;
-  background: #f7f7f7;
+  background: transparent;
   color: var(--ink-soft);
-  border: 1px solid rgba(31, 42, 55, 0.12);
+  border: 1px solid transparent;
   transition: background 0.2s ease;
   display: inline-flex;
   align-items: center;
+  box-shadow: 0 6px 18px -14px rgba(15, 23, 42, 0.45), 0 3px 6px rgba(15, 23, 42, 0.08);
+}
+
+.app-tab:not(.active):hover {
+  background: rgba(31, 42, 55, 0.12);
 }
 
 .app-tab:not(.active) .app-tab-title {
@@ -1521,7 +1535,12 @@ body.mac-titlebar .app-tab-actions {
 .app-tab.active {
   background: #ffffff;
   color: var(--ink);
-  border-color: rgba(31, 42, 55, 0.12);
+  border-color: transparent;
+  box-shadow: 0 8px 22px -14px rgba(15, 23, 42, 0.45), 0 3px 8px rgba(15, 23, 42, 0.08);
+}
+
+.app-tab.active:hover {
+  background: #ffffff;
 }
 
 .app-tab.home {
@@ -1604,8 +1623,10 @@ body.mac-titlebar .app-tab-actions {
   flex: 1 1 auto;
   min-width: 0;
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: visible;
   scrollbar-width: none;
+  padding: 4px 2px;
+  margin: -4px 0;
 }
 
 
@@ -1623,6 +1644,7 @@ body.mac-titlebar .app-tab-actions {
   display: grid;
   place-items: center;
   font-size: 1.1rem;
+  box-shadow: 0 6px 18px -14px rgba(15, 23, 42, 0.45), 0 3px 6px rgba(15, 23, 42, 0.08);
 }
 
 .app-tab-settings:hover {

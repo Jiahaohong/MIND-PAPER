@@ -37,11 +37,11 @@ You can highlght any text in the pdf, or make it a subtitle. And all your highli
 ### v0.1.2
 
 #### New Function
-- [ ] Add regular translation API
-- [ ] Add model selection
+- [x] Add regular translation API
+- [x] Add model selection
 
 #### Bug Fix
-- [ ] Fix PDF Outline Recognition Issue
+- [x] Fix PDF Outline Recognition Issue
 - [ ] Fix for abnormal display of some images in PDF on Windows platform
 
 ### v0.1.1

@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs/promises');
 const fsSync = require('fs');
+const crypto = require('crypto');
 
 require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
@@ -18,6 +19,13 @@ const resolveIconPath = () => {
 const ICON_PATH = resolveIconPath();
 const DEFAULT_BASE_URL = 'https://api.chatanywhere.tech/v1';
 const DEFAULT_MODEL = 'gpt-3.5-turbo';
+const TRANSLATE_SYSTEM_PROMPT =
+  '你是翻译引擎。请将用户提供的文本翻译成中文，只输出翻译结果，不要添加解释。';
+const CNKI_TOKEN_URL = 'https://dict.cnki.net/fyzs-front-api/getToken';
+const CNKI_TRANSLATE_URL = 'https://dict.cnki.net/fyzs-front-api/translate/literaltranslation';
+const CNKI_REGEX = /(查看名企职位.+?https:\/\/dict\.cnki\.net[a-zA-Z./]+.html?)/g;
+const CNKI_AES_KEY = '4e87183cfd3a45fe';
+const CNKI_TOKEN_TTL = 300 * 1000;
 const LOGIC_SYSTEM_PROMPT = `You are a strict academic-logic analysis engine.
 
 Your task is NOT to summarize, explain, or paraphrase.
@@ -43,12 +51,16 @@ const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
 let settingsLoaded = false;
 let runtimeSettings = {
   apiKey: '',
-  baseUrl: ''
+  baseUrl: '',
+  model: ''
 };
+
+let cnkiTokenCache = { token: '', t: 0 };
 
 const sanitizeSettings = (payload = {}) => ({
   apiKey: String(payload.apiKey || '').trim(),
-  baseUrl: String(payload.baseUrl || '').trim()
+  baseUrl: String(payload.baseUrl || '').trim(),
+  model: String(payload.model || '').trim()
 });
 
 const loadSettings = async () => {
@@ -78,6 +90,111 @@ const buildOpenAIUrl = (baseUrl) => {
   return resolved.endsWith('/chat/completions')
     ? resolved
     : `${resolved.replace(/\/$/, '')}/chat/completions`;
+};
+
+const getCnkiToken = async (forceRefresh = false) => {
+  const now = Date.now();
+  if (!forceRefresh && cnkiTokenCache.token && now - cnkiTokenCache.t < CNKI_TOKEN_TTL) {
+    return cnkiTokenCache.token;
+  }
+  const response = await fetch(CNKI_TOKEN_URL, { method: 'GET' });
+  const data = await response.json();
+  if (!response.ok || (typeof data?.code === 'number' && data.code !== 200)) {
+    throw new Error(data?.message || data?.msg || 'CNKI获取Token失败');
+  }
+  const token =
+    data?.data?.token ||
+    data?.data ||
+    data?.token ||
+    data?.result?.token ||
+    data?.result ||
+    '';
+  if (!token) {
+    throw new Error('CNKI返回Token为空');
+  }
+  cnkiTokenCache = { token, t: now };
+  return token;
+};
+
+const getCnkiWord = (text) => {
+  const cipher = crypto.createCipheriv('aes-128-ecb', Buffer.from(CNKI_AES_KEY, 'utf8'), null);
+  cipher.setAutoPadding(true);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return encrypted.toString('base64').replace(/\//g, '_').replace(/\+/g, '-');
+};
+
+const splitCnkiText = (text, maxLen = 800) => {
+  const clean = String(text || '').trim();
+  if (!clean) return [];
+  if (clean.length <= maxLen) return [clean];
+  const sentences = clean
+    .split(/[.?!]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (!sentences.length) return [clean.slice(0, maxLen)];
+  const chunks = [];
+  let current = '';
+  sentences.forEach((sentence) => {
+    const sentenceWithDot = `${sentence}. `;
+    if (current.length + sentenceWithDot.length > maxLen) {
+      if (current) chunks.push(current.trim());
+      current = sentenceWithDot;
+    } else {
+      current += sentenceWithDot;
+    }
+  });
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length ? chunks : [clean.slice(0, maxLen)];
+};
+
+const cnkiTranslate = async (text) => {
+  const chunks = splitCnkiText(text, 800);
+  let translated = '';
+  for (const chunk of chunks) {
+    let token = await getCnkiToken();
+    let data;
+    let response;
+    const request = async () => {
+      response = await fetch(CNKI_TRANSLATE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json;charset=UTF-8',
+          Token: token
+        },
+        body: JSON.stringify({
+          words: getCnkiWord(chunk),
+          translateType: null
+        })
+      });
+      data = await response.json();
+    };
+
+    await request();
+    const code = typeof data?.code === 'number' ? data.code : null;
+    const mResult = data?.data?.mResult || data?.mResult || '';
+
+    if (!response.ok || (code !== null && code !== 200) || !mResult) {
+      token = await getCnkiToken(true);
+      await request();
+    }
+
+    if (!response.ok) {
+      throw new Error(data?.message || data?.msg || 'CNKI翻译失败');
+    }
+    if (typeof data?.code === 'number' && data.code !== 200) {
+      throw new Error(data?.message || data?.msg || 'CNKI翻译失败');
+    }
+    if (data?.data?.isInputVerificationCode) {
+      throw new Error('CNKI翻译需要人工验证，请稍后重试');
+    }
+    const raw = data?.data?.mResult || data?.mResult || '';
+    if (!raw) {
+      throw new Error('CNKI返回翻译为空');
+    }
+    const cleaned = String(raw).replace(CNKI_REGEX, '').trim();
+    translated += `${cleaned} `;
+  }
+  return translated.trim();
 };
 
 const createWindow = () => {
@@ -150,7 +267,7 @@ ipcMain.handle('openai-chat', async (_event, payload = {}) => {
     return { ok: false, error: 'messages不能为空' };
   }
 
-  const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
+  const model = settings.model || process.env.OPENAI_MODEL || DEFAULT_MODEL;
   const temperature = Number.isFinite(payload.temperature) ? payload.temperature : 0.3;
   const maxTokens = Number.isFinite(payload.maxTokens) ? payload.maxTokens : 600;
 
@@ -197,6 +314,64 @@ ipcMain.handle('openai-chat', async (_event, payload = {}) => {
   }
 });
 
+ipcMain.handle('translate-text', async (_event, payload = {}) => {
+  const text = String(payload.text || '').trim();
+  if (!text) return { ok: false, error: '缺少文本' };
+
+  const settings = await loadSettings();
+  const apiKey = settings.apiKey;
+  const baseUrl = settings.baseUrl;
+
+  if (!apiKey || !baseUrl) {
+    try {
+      const content = await cnkiTranslate(text);
+      return { ok: true, content, engine: 'cnki' };
+    } catch (error) {
+      return { ok: false, error: error?.message || 'CNKI翻译失败', engine: 'cnki' };
+    }
+  }
+
+  const model = settings.model || process.env.OPENAI_MODEL || DEFAULT_MODEL;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(buildOpenAIUrl(baseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.2,
+        max_tokens: 800
+      }),
+      signal: controller.signal
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return { ok: false, error: data?.error?.message || 'OpenAI翻译失败', engine: 'openai' };
+    }
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) {
+      return { ok: false, error: 'OpenAI返回内容为空', engine: 'openai' };
+    }
+    return { ok: true, content: content.trim(), engine: 'openai', usage: data?.usage || null };
+  } catch (error) {
+    const baseMessage =
+      error?.name === 'AbortError' ? 'OpenAI请求超时' : error?.message || 'OpenAI翻译失败';
+    return { ok: false, error: baseMessage, engine: 'openai' };
+  } finally {
+    clearTimeout(timeout);
+  }
+});
+
 ipcMain.handle('openai-logic', async (_event, payload = {}) => {
   const settings = await loadSettings();
   const apiKey = settings.apiKey;
@@ -217,7 +392,7 @@ ipcMain.handle('openai-logic', async (_event, payload = {}) => {
     return { ok: false, error: '缺少全文或选中文本' };
   }
 
-  const model = process.env.OPENAI_MODEL || DEFAULT_MODEL;
+  const model = settings.model || process.env.OPENAI_MODEL || DEFAULT_MODEL;
   const temperature = Number.isFinite(payload.temperature) ? payload.temperature : 0.2;
   const maxTokens = Number.isFinite(payload.maxTokens) ? payload.maxTokens : 900;
 
