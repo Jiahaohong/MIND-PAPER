@@ -1,0 +1,5 @@
+{
+  "name": "Mind Paper",
+  "description": "A macOS-inspired research paper management and reading tool powered by Gemini.",
+  "requestFramePermissions": []
+}

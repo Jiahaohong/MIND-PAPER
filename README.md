@@ -1,0 +1,46 @@
+# Reconstructing high-dimensional ideas from low-dimensional papers
+
+# News！
+The brand new v1.0.0 version is here! 
+
+More refined interface!
+
+Smoother operation!
+
+More immersive reading experience!
+
+# AI API Settings
+
+Click setting buttons on the top right of the screen, add your own api key and api base url to start using the app.
+
+# Translator
+
+Default: Use CNKI as default translator
+
+
+# Usage
+
+You can highlght any text in the pdf, or make it a subtitle. And all your highlight note will transfer into the mind map node automatically.
+
+All vedio tutorials will coming soon!
+
+## Paper Outline
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1.outline-usage.mov" controls width="800"></video>
+
+
+## Highlight Text
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-highlight-usage.mov" controls width="800"></video>
+
+
+## Add Subtitle
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-add-subtitle.mov" controls width="800"></video>
+
+
+## Related to Problem
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-related-problem.mov" controls width="800"></video>
+
+
+## Mind Map
+<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
+
+
