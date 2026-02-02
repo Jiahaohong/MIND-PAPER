@@ -397,7 +397,11 @@ export const MindMap: React.FC<MindMapProps> = ({
                     x={MINDMAP_PADDING_X}
                     y={MINDMAP_PADDING_Y}
                     dominantBaseline="hanging"
-                    style={{ fontSize: node.fontSize, fill: '#111827', userSelect: 'none' }}
+                    style={{
+                      fontSize: node.fontSize,
+                      fill: node.kind === 'note' ? '#4b5563' : '#111827',
+                      userSelect: 'none'
+                    }}
                     pointerEvents="none"
                   >
                     {node.lines.map((line, index) => (

@@ -302,6 +302,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const hasInitWidthsRef = useRef(false);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
   const selectionToolbarRef = useRef<HTMLDivElement>(null);
+  const questionPickerRef = useRef<HTMLDivElement>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
   const paperContextCacheRef = useRef<Map<string, Promise<string>>>(new Map());
   const activeChat = useMemo(
@@ -1099,6 +1100,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     clearSelection();
   };
 
+  const isPointInNativeSelection = (clientX: number, clientY: number) => {
+    if (typeof window === 'undefined') return false;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    const rects = Array.from(range.getClientRects());
+    if (!rects.length) {
+      const rect = range.getBoundingClientRect();
+      return (
+        clientX >= rect.left &&
+        clientX <= rect.right &&
+        clientY >= rect.top &&
+        clientY <= rect.bottom
+      );
+    }
+    return rects.some(
+      (rect) =>
+        clientX >= rect.left &&
+        clientX <= rect.right &&
+        clientY >= rect.top &&
+        clientY <= rect.bottom
+    );
+  };
+
   const updateSelectionFromWindow = () => {
     if (typeof window === 'undefined') return;
     const selection = window.getSelection();
@@ -1144,7 +1169,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     });
     setActiveHighlightId(null);
     setActiveHighlightColor(null);
-    clearNativeSelection();
   };
 
   const getHighlightAtPoint = (clientX: number, clientY: number) => {
@@ -1167,20 +1191,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
 
   const handleHighlightClick = (event: React.MouseEvent<HTMLDivElement>) => {
     if (viewMode !== ReaderMode.PDF) return;
-    if (selectionRect && selectionText) {
-      const { left, right, top, bottom } = selectionRect;
-      if (
-        event.clientX >= left &&
-        event.clientX <= right &&
-        event.clientY >= top &&
-        event.clientY <= bottom
-      ) {
-        return;
-      }
+    if (isPointInNativeSelection(event.clientX, event.clientY)) {
+      return;
     }
     const target = getHighlightAtPoint(event.clientX, event.clientY);
     if (!target) {
       clearSelection();
+      clearNativeSelection();
       return;
     }
     const { highlight, rect, pageRect } = target;
@@ -1199,6 +1216,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       bottom: pageRect.top + (rect.y + rect.h) * pageRect.height
     });
   };
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (!selectionText || !selectionRect) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (target && selectionToolbarRef.current?.contains(target)) return;
+      if (target && questionPickerRef.current?.contains(target)) return;
+      if (isPointInNativeSelection(event.clientX, event.clientY)) return;
+      if (getHighlightAtPoint(event.clientX, event.clientY)) return;
+      clearSelection();
+      clearNativeSelection();
+    };
+    window.addEventListener('mousedown', handleMouseDown);
+    return () => window.removeEventListener('mousedown', handleMouseDown);
+  }, [viewMode, selectionText, selectionRect, highlights]);
 
   const toolbarStyle = useMemo(() => {
     if (!selectionRect || typeof window === 'undefined') return null;
@@ -2021,17 +2054,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     return map;
   }, [highlights]);
 
-  const selectionRectsByPage = useMemo(() => {
-    const map = new Map<number, HighlightRect[]>();
-    if (!selectionInfo?.rects?.length || activeHighlightId) return map;
-    selectionInfo.rects.forEach((rect) => {
-      const list = map.get(rect.pageIndex) || [];
-      list.push(rect);
-      map.set(rect.pageIndex, list);
-    });
-    return map;
-  }, [selectionInfo, activeHighlightId]);
-
   useEffect(() => {
     let cancelled = false;
     paperStateLoadedRef.current = false;
@@ -2315,8 +2337,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     );
   };
 
-  const selectionOverlayColor = 'rgba(59, 130, 246, 0.25)';
-
   return (
     <div ref={containerRef} className="flex h-[calc(100vh-40px)] bg-white overflow-hidden">
       
@@ -2445,24 +2465,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                           })}
                         </div>
                       ) : null}
-                      {selectionRectsByPage.get(index)?.length ? (
-                        <div className="absolute inset-0 pointer-events-none">
-                          {selectionRectsByPage.get(index)!.map((rect, rectIndex) => (
-                            <div
-                              key={`selection-${index}-${rectIndex}`}
-                              className="absolute"
-                              style={{
-                                top: `${rect.y * 100}%`,
-                                left: `${rect.x * 100}%`,
-                                width: `${rect.w * 100}%`,
-                                height: `${rect.h * 100}%`,
-                                background: selectionOverlayColor,
-                                borderRadius: '4px'
-                              }}
-                            />
-                          ))}
-                        </div>
-                      ) : null}
                     </div>
                   ))}
                 </Document>
@@ -2578,7 +2580,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
 
       {/* SECTION F: Assistant Panel */}
       <div
-        className="bg-white border-l border-gray-200 flex flex-col shadow-xl z-20"
+        className="bg-white border-l border-gray-200 flex flex-col z-20"
         style={{ width: rightWidth }}
       >
         {/* Tabs: Matches App Title Bar Height (h-10) */}
@@ -2989,6 +2991,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
 
       {questionPicker.open && questionPickerStyle ? (
         <div
+          ref={questionPickerRef}
           className="fixed z-30"
           style={questionPickerStyle}
           onMouseDown={(event) => {
