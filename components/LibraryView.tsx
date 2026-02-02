@@ -201,7 +201,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onMovePaperToTrash,
   onRestorePaper
 }) => {
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(SYSTEM_FOLDER_ALL_ID);
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['root-1']));
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
@@ -450,16 +450,16 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <Tooltip label="清空回收站">
               <button
                 onClick={onEmptyTrash}
-                className="p-1.5 rounded-md hover:bg-gray-100 text-gray-500"
+                className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
               >
                 <Trash2 size={14} />
               </button>
             </Tooltip>
           ) : (
-            <Tooltip label="Add PDF">
+            <Tooltip label="添加文档">
               <button
                 onClick={handleAddClick}
-                className="p-1.5 rounded-md hover:bg-gray-100 text-gray-500"
+                className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
               >
                 <Plus size={14} />
               </button>
@@ -473,7 +473,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                  key={paper.id}
                  onClick={() => setSelectedPaperId(paper.id)}
                  onDoubleClick={() => onOpenPaper(paper)}
-                 className={`group px-4 py-3 border-b border-gray-100 cursor-pointer 
+                 className={`group px-3 py-3 border-b border-gray-100 cursor-pointer 
                     ${selectedPaperId === paper.id ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
                >
                  <div className="flex items-start justify-between gap-3">
