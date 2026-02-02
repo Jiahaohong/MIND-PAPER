@@ -82,15 +82,20 @@ const App: React.FC = () => {
       window.alert('请上传PDF格式文件。');
       return;
     }
+    if (!folderId) {
+      window.alert('请先在左侧选择一个文件夹，再添加文档。');
+      return;
+    }
+    if (folderId === SYSTEM_FOLDER_TRASH_ID) {
+      window.alert('回收站中不能添加文档。');
+      return;
+    }
 
     const fileData = await file.arrayBuffer();
     const id = `p-${Date.now()}`;
     const title = file.name.replace(/\.pdf$/i, '');
-    const fallbackFolder = folders.find((folder) => !isSystemFolderId(folder.id));
     const assignedFolderId =
-      folderId && !isSystemFolderId(folderId)
-        ? folderId
-        : fallbackFolder?.id || SYSTEM_FOLDER_ALL_ID;
+      folderId === SYSTEM_FOLDER_ALL_ID ? SYSTEM_FOLDER_ALL_ID : folderId;
     let filePath: string | undefined;
     if (typeof window !== 'undefined' && window.electronAPI?.library?.savePdf) {
       const response = await window.electronAPI.library.savePdf({ paperId: id, data: fileData });
@@ -215,6 +220,29 @@ const App: React.FC = () => {
           ? { ...paper, folderId: SYSTEM_FOLDER_TRASH_ID, previousFolderId: paper.folderId }
           : paper
       )
+    );
+  };
+
+  const handleMovePaperToFolder = (paperId: string, targetFolderId: string) => {
+    if (!paperId || !targetFolderId || targetFolderId === SYSTEM_FOLDER_ALL_ID) return;
+    setPapers((prev) =>
+      prev.map((paper) => {
+        if (paper.id !== paperId) return paper;
+        if (targetFolderId === SYSTEM_FOLDER_TRASH_ID) {
+          const previousFolderId =
+            paper.folderId === SYSTEM_FOLDER_TRASH_ID ? paper.previousFolderId : paper.folderId;
+          return {
+            ...paper,
+            folderId: SYSTEM_FOLDER_TRASH_ID,
+            previousFolderId
+          };
+        }
+        return {
+          ...paper,
+          folderId: targetFolderId,
+          previousFolderId: undefined
+        };
+      })
     );
   };
 
@@ -401,6 +429,7 @@ const App: React.FC = () => {
             onEmptyTrash={handleEmptyTrash}
             onMovePapersToTrash={handleMovePapersToTrash}
             onMovePaperToTrash={handleMovePaperToTrash}
+            onMovePaperToFolder={handleMovePaperToFolder}
             onRestorePaper={handleRestorePaper}
           />
         </div>

@@ -19,6 +19,7 @@ interface FolderItemProps {
   level: number;
   expandedFolders: Set<string>;
   selectedFolderId: string | null;
+  dragOverFolderId: string | null;
   editingFolderId: string | null;
   folderDraft: string;
   folderInputRef: React.RefObject<HTMLInputElement>;
@@ -30,6 +31,9 @@ interface FolderItemProps {
   onDraftChange: (value: string) => void;
   onFinalizeEdit: (id: string) => void;
   onCancelEdit: () => void;
+  onFolderDragOver: (event: React.DragEvent<HTMLDivElement>, id: string) => void;
+  onFolderDragLeave: (event: React.DragEvent<HTMLDivElement>, id: string) => void;
+  onFolderDrop: (event: React.DragEvent<HTMLDivElement>, id: string) => void;
 }
 
 const FolderItem: React.FC<FolderItemProps> = ({
@@ -37,6 +41,7 @@ const FolderItem: React.FC<FolderItemProps> = ({
   level,
   expandedFolders,
   selectedFolderId,
+  dragOverFolderId,
   editingFolderId,
   folderDraft,
   folderInputRef,
@@ -47,10 +52,14 @@ const FolderItem: React.FC<FolderItemProps> = ({
   onDeleteFolder,
   onDraftChange,
   onFinalizeEdit,
-  onCancelEdit
+  onCancelEdit,
+  onFolderDragOver,
+  onFolderDragLeave,
+  onFolderDrop
 }) => {
   const isExpanded = expandedFolders.has(folder.id);
   const isSelected = selectedFolderId === folder.id;
+  const isDragOver = dragOverFolderId === folder.id;
   const isEditing = editingFolderId === folder.id;
   const isSystemFolder = folder.id === SYSTEM_FOLDER_ALL_ID || folder.id === SYSTEM_FOLDER_TRASH_ID;
 
@@ -58,13 +67,17 @@ const FolderItem: React.FC<FolderItemProps> = ({
     <div>
       <div
         data-folder-id={folder.id}
+        onDragOver={(event) => onFolderDragOver(event, folder.id)}
+        onDragLeave={(event) => onFolderDragLeave(event, folder.id)}
+        onDrop={(event) => onFolderDrop(event, folder.id)}
         onClick={() => {
           if (isEditing) return;
           onSelectFolder(folder.id);
           if (!isExpanded) onToggleFolder(folder.id);
         }}
         className={`group flex items-center px-2 py-1.5 text-sm cursor-pointer rounded-md select-none mx-2 mb-0.5
-          ${isSelected ? 'bg-blue-500 text-white' : 'text-gray-700 hover:bg-gray-200'}`}
+          ${isSelected ? 'bg-blue-500 text-white' : 'text-gray-700 hover:bg-gray-200'}
+          ${isDragOver ? 'bg-blue-100 ring-1 ring-blue-300 text-gray-800' : ''}`}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
       >
         <button
@@ -161,6 +174,7 @@ const FolderItem: React.FC<FolderItemProps> = ({
           level={level + 1}
           expandedFolders={expandedFolders}
           selectedFolderId={selectedFolderId}
+          dragOverFolderId={dragOverFolderId}
           editingFolderId={editingFolderId}
           folderDraft={folderDraft}
           folderInputRef={folderInputRef}
@@ -172,6 +186,9 @@ const FolderItem: React.FC<FolderItemProps> = ({
           onDraftChange={onDraftChange}
           onFinalizeEdit={onFinalizeEdit}
           onCancelEdit={onCancelEdit}
+          onFolderDragOver={onFolderDragOver}
+          onFolderDragLeave={onFolderDragLeave}
+          onFolderDrop={onFolderDrop}
         />
       ))}
     </div>
@@ -187,6 +204,7 @@ interface LibraryViewProps {
   onEmptyTrash: () => void;
   onMovePapersToTrash: (folderIds: string[]) => void;
   onMovePaperToTrash: (paperId: string) => void;
+  onMovePaperToFolder: (paperId: string, folderId: string) => void;
   onRestorePaper: (paperId: string) => void;
 }
 
@@ -199,10 +217,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onEmptyTrash,
   onMovePapersToTrash,
   onMovePaperToTrash,
+  onMovePaperToFolder,
   onRestorePaper
 }) => {
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(SYSTEM_FOLDER_ALL_ID);
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
+  const [draggingPaperId, setDraggingPaperId] = useState<string | null>(null);
+  const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['root-1']));
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const [folderDraft, setFolderDraft] = useState('');
@@ -371,6 +392,27 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     event.preventDefault();
   };
 
+  const handleFolderDragOver = (event: React.DragEvent<HTMLDivElement>, folderId: string) => {
+    if (!draggingPaperId || folderId === SYSTEM_FOLDER_ALL_ID) return;
+    event.preventDefault();
+    setDragOverFolderId(folderId);
+  };
+
+  const handleFolderDragLeave = (_event: React.DragEvent<HTMLDivElement>, folderId: string) => {
+    setDragOverFolderId((prev) => (prev === folderId ? null : prev));
+  };
+
+  const handleFolderDrop = (event: React.DragEvent<HTMLDivElement>, folderId: string) => {
+    event.preventDefault();
+    const paperIdFromData = event.dataTransfer.getData('application/x-mind-paper-paper-id');
+    const paperId = paperIdFromData || draggingPaperId;
+    setDragOverFolderId(null);
+    setDraggingPaperId(null);
+    if (!paperId || folderId === SYSTEM_FOLDER_ALL_ID) return;
+    onMovePaperToFolder(paperId, folderId);
+    setSelectedFolderId(folderId);
+  };
+
   useEffect(() => {
     if (!editingFolderId) return;
     folderInputRef.current?.focus?.();
@@ -402,6 +444,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               level={0}
               expandedFolders={expandedFolders}
               selectedFolderId={selectedFolderId}
+              dragOverFolderId={dragOverFolderId}
               editingFolderId={editingFolderId}
               folderDraft={folderDraft}
               folderInputRef={folderInputRef}
@@ -413,6 +456,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               onDraftChange={setFolderDraft}
               onFinalizeEdit={finalizeFolderEdit}
               onCancelEdit={cancelFolderEdit}
+              onFolderDragOver={handleFolderDragOver}
+              onFolderDragLeave={handleFolderDragLeave}
+              onFolderDrop={handleFolderDrop}
             />
           ))}
         </div>
@@ -473,6 +519,20 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                  key={paper.id}
                  onClick={() => setSelectedPaperId(paper.id)}
                  onDoubleClick={() => onOpenPaper(paper)}
+                 draggable={selectedFolderId !== SYSTEM_FOLDER_TRASH_ID}
+                 onDragStart={(event) => {
+                   if (selectedFolderId === SYSTEM_FOLDER_TRASH_ID) {
+                     event.preventDefault();
+                     return;
+                   }
+                   event.dataTransfer.effectAllowed = 'move';
+                   event.dataTransfer.setData('application/x-mind-paper-paper-id', paper.id);
+                   setDraggingPaperId(paper.id);
+                 }}
+                 onDragEnd={() => {
+                   setDraggingPaperId(null);
+                   setDragOverFolderId(null);
+                 }}
                  className={`group px-3 py-3 border-b border-gray-100 cursor-pointer 
                     ${selectedPaperId === paper.id ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
                >

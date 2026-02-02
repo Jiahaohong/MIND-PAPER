@@ -236,6 +236,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [draggingChapterId, setDraggingChapterId] = useState<string | null>(null);
   const [dragOverMindmapId, setDragOverMindmapId] = useState<string | null>(null);
+  const [draggingTocNoteId, setDraggingTocNoteId] = useState<string | null>(null);
+  const [draggingTocChapterId, setDraggingTocChapterId] = useState<string | null>(null);
+  const [dragOverTocId, setDragOverTocId] = useState<string | null>(null);
   const [dragGhost, setDragGhost] = useState<{
     id: string;
     text: string;
@@ -298,6 +301,37 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     lineHeight?: number;
   } | null>(null);
   const dragChapterTriggeredRef = useRef(false);
+  const tocDragNoteTimerRef = useRef<number | null>(null);
+  const tocDragNoteRef = useRef<{
+    id: string;
+    chapterId: string;
+    text: string;
+    color?: string;
+    offsetX: number;
+    offsetY: number;
+    width: number;
+    height: number;
+    lines?: string[];
+    fontSize?: number;
+    lineHeight?: number;
+  } | null>(null);
+  const tocDragNoteTriggeredRef = useRef(false);
+  const tocDragChapterTimerRef = useRef<number | null>(null);
+  const tocDragChapterRef = useRef<{
+    id: string;
+    parentId: string | null;
+    text: string;
+    offsetX: number;
+    offsetY: number;
+    width: number;
+    height: number;
+    lines?: string[];
+    fontSize?: number;
+    lineHeight?: number;
+  } | null>(null);
+  const tocDragChapterTriggeredRef = useRef(false);
+  const tocSuppressClickUntilRef = useRef(0);
+  const tocParentMapRef = useRef<Map<string, string | null>>(new Map());
   const dragStateRef = useRef<{ side: 'left' | 'right'; startX: number; start: number } | null>(null);
   const hasInitWidthsRef = useRef(false);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
@@ -1556,6 +1590,240 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     }
   };
 
+  const handleTOCNoteMouseDown = (
+    note: HighlightItem,
+    event: React.MouseEvent<HTMLButtonElement>
+  ) => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    const rect = target.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    tocDragNoteTriggeredRef.current = false;
+    tocDragNoteRef.current = {
+      id: note.id,
+      chapterId: note.chapterId,
+      text: note.text,
+      color: note.color,
+      offsetX,
+      offsetY,
+      width: rect.width,
+      height: rect.height
+    };
+    setDragOverTocId(null);
+    if (tocDragNoteTimerRef.current) {
+      window.clearTimeout(tocDragNoteTimerRef.current);
+    }
+    tocDragNoteTimerRef.current = window.setTimeout(() => {
+      tocDragNoteTriggeredRef.current = true;
+      setDraggingTocNoteId(note.id);
+      setDragGhost({
+        id: note.id,
+        text: note.text,
+        color: note.color,
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height
+      });
+    }, 220);
+  };
+
+  const handleTOCChapterMouseDown = (
+    item: OutlineNode,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (event.button !== 0) return;
+    if (item.isRoot) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    const rect = target.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    tocDragChapterTriggeredRef.current = false;
+    tocDragChapterRef.current = {
+        id: item.id,
+        parentId: tocParentMapRef.current.get(item.id) || null,
+        text: item.title,
+        offsetX,
+        offsetY,
+      width: rect.width,
+      height: rect.height
+    };
+    setDragOverTocId(null);
+    if (tocDragChapterTimerRef.current) {
+      window.clearTimeout(tocDragChapterTimerRef.current);
+    }
+    tocDragChapterTimerRef.current = window.setTimeout(() => {
+      tocDragChapterTriggeredRef.current = true;
+      setDraggingTocChapterId(item.id);
+      setDragGhost({
+        id: item.id,
+        text: item.title,
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height
+      });
+    }, 220);
+  };
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (!draggingTocNoteId) return undefined;
+    if (tocDragNoteTimerRef.current) {
+      window.clearTimeout(tocDragNoteTimerRef.current);
+      tocDragNoteTimerRef.current = null;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+      const tocNode = target?.closest?.('[data-toc-id]');
+      const tocKind = tocNode?.getAttribute('data-toc-kind') || null;
+      const tocId = tocKind === 'chapter' ? tocNode?.getAttribute('data-toc-id') || null : null;
+      setDragOverTocId(tocId);
+      const dragInfo = tocDragNoteRef.current;
+      if (dragInfo) {
+        setDragGhost((prev) => ({
+          ...(prev || {}),
+          id: dragInfo.id,
+          text: dragInfo.text || prev?.text || '',
+          color: dragInfo.color || prev?.color,
+          width: dragInfo.width || prev?.width || 0,
+          height: dragInfo.height || prev?.height || 0,
+          x: event.clientX - (dragInfo.offsetX || 0),
+          y: event.clientY - (dragInfo.offsetY || 0)
+        }));
+      }
+    };
+    const handleUp = () => {
+      const dragInfo = tocDragNoteRef.current;
+      const targetId = dragOverTocId;
+      if (dragInfo && targetId && targetId !== dragInfo.chapterId) {
+        setHighlights((prev) =>
+          prev.map((item) =>
+            item.id === dragInfo.id ? { ...item, chapterId: targetId } : item
+          )
+        );
+        setExpandedTOC((prev) => {
+          const next = new Set(prev);
+          next.add(targetId);
+          return next;
+        });
+      }
+      tocSuppressClickUntilRef.current = Date.now() + 180;
+      setDraggingTocNoteId(null);
+      setDragOverTocId(null);
+      setDragGhost(null);
+      tocDragNoteTriggeredRef.current = false;
+      tocDragNoteRef.current = null;
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    document.body.style.cursor = 'grabbing';
+    document.body.style.userSelect = 'none';
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [draggingTocNoteId, dragOverTocId, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (!draggingTocChapterId) return undefined;
+    if (tocDragChapterTimerRef.current) {
+      window.clearTimeout(tocDragChapterTimerRef.current);
+      tocDragChapterTimerRef.current = null;
+    }
+    const handleMove = (event: MouseEvent) => {
+      const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+      const tocNode = target?.closest?.('[data-toc-id]');
+      const tocKind = tocNode?.getAttribute('data-toc-kind') || null;
+      const tocId = tocKind === 'chapter' ? tocNode?.getAttribute('data-toc-id') || null : null;
+      setDragOverTocId(tocId);
+      const dragInfo = tocDragChapterRef.current;
+      if (dragInfo) {
+        setDragGhost((prev) => ({
+          ...(prev || {}),
+          id: dragInfo.id,
+          text: dragInfo.text || prev?.text || '',
+          width: dragInfo.width || prev?.width || 0,
+          height: dragInfo.height || prev?.height || 0,
+          x: event.clientX - (dragInfo.offsetX || 0),
+          y: event.clientY - (dragInfo.offsetY || 0)
+        }));
+      }
+    };
+    const handleUp = () => {
+      const dragInfo = tocDragChapterRef.current;
+      const targetId = dragOverTocId;
+      if (dragInfo && targetId && targetId !== dragInfo.id) {
+        const isDescendant = (() => {
+          let current = tocParentMapRef.current.get(targetId) || null;
+          while (current) {
+            if (current === dragInfo.id) return true;
+            current = tocParentMapRef.current.get(current) || null;
+          }
+          return false;
+        })();
+        if (!isDescendant) {
+          setChapterParentOverrides((prev) => ({
+            ...prev,
+            [dragInfo.id]: targetId
+          }));
+          setExpandedTOC((prev) => {
+            const next = new Set(prev);
+            next.add(targetId);
+            return next;
+          });
+        }
+      }
+      tocSuppressClickUntilRef.current = Date.now() + 180;
+      setDraggingTocChapterId(null);
+      setDragOverTocId(null);
+      setDragGhost(null);
+      tocDragChapterTriggeredRef.current = false;
+      tocDragChapterRef.current = null;
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    document.body.style.cursor = 'grabbing';
+    document.body.style.userSelect = 'none';
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [draggingTocChapterId, dragOverTocId, viewMode]);
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    const handleUp = () => {
+      if (draggingTocNoteId || draggingTocChapterId) return;
+      if (tocDragNoteTimerRef.current) {
+        window.clearTimeout(tocDragNoteTimerRef.current);
+        tocDragNoteTimerRef.current = null;
+      }
+      if (tocDragChapterTimerRef.current) {
+        window.clearTimeout(tocDragChapterTimerRef.current);
+        tocDragChapterTimerRef.current = null;
+      }
+      tocDragNoteTriggeredRef.current = false;
+      tocDragChapterTriggeredRef.current = false;
+      tocDragNoteRef.current = null;
+      tocDragChapterRef.current = null;
+      setDragOverTocId(null);
+      setDragGhost(null);
+    };
+    window.addEventListener('mouseup', handleUp);
+    return () => window.removeEventListener('mouseup', handleUp);
+  }, [draggingTocNoteId, draggingTocChapterId, viewMode]);
+
   const fallbackOutline = useMemo<OutlineNode[]>(() => {
     const convert = (items: TOCItem[], parentId = 'mock') =>
       items.map((item, index) => {
@@ -1740,6 +2008,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlatOutline, outlineRootId);
     return applyParentOverrides(merged, chapterParentOverrides);
   }, [baseOutline, customChapters, baseFlatOutline, outlineRootId, chapterParentOverrides]);
+
+  useEffect(() => {
+    const map = new Map<string, string | null>();
+    const walk = (nodes: OutlineNode[], parentId: string | null) => {
+      nodes.forEach((node) => {
+        map.set(node.id, parentId);
+        if (node.items?.length) {
+          walk(node.items, node.id);
+        }
+      });
+    };
+    walk(outlineDisplay, null);
+    tocParentMapRef.current = map;
+  }, [outlineDisplay]);
 
   const flatOutline = useMemo(
     () => getFlatOutlineByPosition(outlineDisplay),
@@ -2075,6 +2357,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     setDraggingNoteId(null);
     setDraggingChapterId(null);
     setDragOverMindmapId(null);
+    setDraggingTocNoteId(null);
+    setDraggingTocChapterId(null);
+    setDragOverTocId(null);
     setDragGhost(null);
     setChapterParentOverrides({});
     setChatThreads([]);
@@ -2088,6 +2373,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       if (dragChapterTimerRef.current) {
         window.clearTimeout(dragChapterTimerRef.current);
       }
+      if (tocDragNoteTimerRef.current) {
+        window.clearTimeout(tocDragNoteTimerRef.current);
+      }
+      if (tocDragChapterTimerRef.current) {
+        window.clearTimeout(tocDragChapterTimerRef.current);
+      }
     }
     dragNoteTimerRef.current = null;
     dragChapterTimerRef.current = null;
@@ -2095,6 +2386,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     dragNoteTriggeredRef.current = false;
     dragChapterRef.current = null;
     dragChapterTriggeredRef.current = false;
+    tocDragNoteTimerRef.current = null;
+    tocDragChapterTimerRef.current = null;
+    tocDragNoteRef.current = null;
+    tocDragNoteTriggeredRef.current = false;
+    tocDragChapterRef.current = null;
+    tocDragChapterTriggeredRef.current = false;
     mindmapLayoutRef.current = null;
     mindmapAnchorRef.current = null;
     mindmapPanRef.current = null;
@@ -2196,6 +2493,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     const notes = highlightsByChapter.get(item.id) || [];
     const hasChildren = (item.items && item.items.length > 0) || notes.length > 0;
     const isExpanded = expandedTOC.has(item.id);
+    const isDropTarget =
+      dragOverTocId === item.id && (Boolean(draggingTocNoteId) || Boolean(draggingTocChapterId));
     const combinedItems = [
       ...((item.items || []).map((node) => ({
         type: 'node' as const,
@@ -2232,9 +2531,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     return (
       <div className="select-none">
         <div 
-          className="group flex items-center py-1 px-2 hover:bg-gray-200 cursor-pointer text-sm text-gray-700 rounded my-0.5"
+          data-toc-id={item.id}
+          data-toc-kind="chapter"
+          className={`group flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 ${
+            isDropTarget ? 'bg-gray-200' : 'hover:bg-gray-200'
+          }`}
           style={{ paddingLeft: `${level * 12 + 8}px` }}
+          onMouseDown={(event) => {
+            handleTOCChapterMouseDown(item, event);
+          }}
           onClick={() => {
+            if (Date.now() < tocSuppressClickUntilRef.current) return;
+            if (tocDragChapterTriggeredRef.current) return;
             if (typeof item.pageIndex === 'number') {
               const target = pageRefs.current[item.pageIndex];
               const container = contentAreaRef.current;
@@ -2250,6 +2558,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
            <button
              type="button"
              className="w-4 h-4 mr-1 flex items-center justify-center text-gray-400"
+             onMouseDown={(event) => event.stopPropagation()}
              onClick={(event) => {
                event.stopPropagation();
                if (hasChildren) toggleTOC(item.id);
@@ -2265,6 +2574,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
              <Tooltip label="取消自定义章节">
                <button
                  type="button"
+                 onMouseDown={(event) => event.stopPropagation()}
                  onClick={(event) => {
                    event.stopPropagation();
                    removeCustomChapter(item.id);
@@ -2296,17 +2606,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                         return (
                       <button
                         type="button"
-                        onClick={() => jumpToHighlight(entry.note)}
+                        data-toc-id={entry.note.id}
+                        data-toc-kind="note"
+                        onMouseDown={(event) => {
+                          handleTOCNoteMouseDown(entry.note, event);
+                        }}
+                        onClick={() => {
+                          if (Date.now() < tocSuppressClickUntilRef.current) return;
+                          if (tocDragNoteTriggeredRef.current) return;
+                          jumpToHighlight(entry.note);
+                        }}
                         onDoubleClick={() =>
-                          setExpandedHighlightIds((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(entry.note.id)) {
-                              next.delete(entry.note.id);
-                            } else {
-                              next.add(entry.note.id);
-                            }
-                            return next;
-                          })
+                          {
+                            if (Date.now() < tocSuppressClickUntilRef.current) return;
+                            setExpandedHighlightIds((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(entry.note.id)) {
+                                next.delete(entry.note.id);
+                              } else {
+                                next.add(entry.note.id);
+                              }
+                              return next;
+                            });
+                          }
                         }
                         className={`w-full text-left text-xs rounded px-2 py-1 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
                           entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
@@ -2924,6 +3246,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
 
         </div>
       </div>
+
+      {viewMode === ReaderMode.PDF && dragGhost ? (
+        <div
+          className="fixed z-40 pointer-events-none"
+          style={{
+            left: dragGhost.x,
+            top: dragGhost.y,
+            width: dragGhost.width,
+            height: dragGhost.height,
+            background: 'rgba(255,255,255,0.9)',
+            border: '1px solid rgba(148, 163, 184, 0.7)',
+            borderRadius: 8,
+            boxShadow: '0 8px 16px rgba(15, 23, 42, 0.15)',
+            opacity: 0.7,
+            padding: '6px 8px'
+          }}
+        >
+          {(dragGhost.lines && dragGhost.lines.length ? dragGhost.lines : [dragGhost.text]).map(
+            (line, index) => (
+              <div
+                key={`${dragGhost.id}-pdf-line-${index}`}
+                style={{
+                  fontSize: dragGhost.fontSize ? `${dragGhost.fontSize}px` : '12px',
+                  lineHeight: dragGhost.lineHeight ? `${dragGhost.lineHeight}px` : '14px',
+                  color: '#111827'
+                }}
+              >
+                {line}
+              </div>
+            )
+          )}
+        </div>
+      ) : null}
 
       {viewMode === ReaderMode.PDF && selectionRect && selectionText ? (
         <div
