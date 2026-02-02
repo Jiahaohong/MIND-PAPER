@@ -63,6 +63,49 @@ const buildOpenAIUrl = (baseUrl) => {
     : `${resolved.replace(/\/$/, '')}/chat/completions`;
 };
 
+const openaiChatCompletion = async (
+  messages,
+  settings,
+  options = { temperature: 0.3, maxTokens: 1200 }
+) => {
+  const apiKey = settings.apiKey;
+  const baseUrl = settings.baseUrl || DEFAULT_BASE_URL;
+  if (!apiKey || !baseUrl) {
+    throw new Error('请在设置中填写 API Key 和 Base URL');
+  }
+  const model = settings.model || DEFAULT_MODEL;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch(buildOpenAIUrl(baseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: options.temperature,
+        max_tokens: options.maxTokens
+      }),
+      signal: controller.signal
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error?.message || 'AI请求失败');
+    }
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('AI返回内容为空');
+    }
+    return String(content).trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const getCnkiToken = async (forceRefresh = false) => {
   const now = Date.now();
   if (!forceRefresh && cnkiTokenCache.token && now - cnkiTokenCache.t < CNKI_TOKEN_TTL) {
@@ -216,45 +259,14 @@ const writeJsonFile = async (filePath, data) => {
 };
 
 const openaiTranslate = async (text, settings) => {
-  const apiKey = settings.apiKey;
-  const baseUrl = settings.baseUrl || DEFAULT_BASE_URL;
-  if (!apiKey || !baseUrl) {
-    throw new Error('请在设置中填写 OpenAI 的 API Key 和 Base URL');
-  }
-  const model = settings.model || DEFAULT_MODEL;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-  try {
-    const response = await fetch(buildOpenAIUrl(baseUrl), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
-          { role: 'user', content: text }
-        ],
-        temperature: 0.2,
-        max_tokens: 800
-      }),
-      signal: controller.signal
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data?.error?.message || 'OpenAI翻译失败');
-    }
-    const content = data?.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error('OpenAI返回内容为空');
-    }
-    return String(content).trim();
-  } finally {
-    clearTimeout(timeout);
-  }
+  return openaiChatCompletion(
+    [
+      { role: 'system', content: TRANSLATE_SYSTEM_PROMPT },
+      { role: 'user', content: text }
+    ],
+    settings,
+    { temperature: 0.2, maxTokens: 800 }
+  );
 };
 
 ipcMain.handle('settings-get', async () => loadSettings());
@@ -275,6 +287,37 @@ ipcMain.handle('translate-text', async (_event, payload = {}) => {
     return { ok: true, content, engine: 'cnki' };
   } catch (error) {
     return { ok: false, error: error?.message || '翻译失败' };
+  }
+});
+
+ipcMain.handle('ask-ai', async (_event, payload = {}) => {
+  const prompt = String(payload.prompt || '').trim();
+  const incomingMessages = Array.isArray(payload.messages) ? payload.messages : [];
+  if (!prompt) return { ok: false, error: '缺少问题内容' };
+  try {
+    const settings = await loadSettings();
+    const history = incomingMessages
+      .filter((item) => item && typeof item.text === 'string' && item.text.trim())
+      .map((item) => ({
+        role: item.role === 'model' ? 'assistant' : 'user',
+        content: String(item.text || '').trim()
+      }));
+    const messages = [
+      {
+        role: 'system',
+        content:
+          '你是一个学术论文阅读助手。回答要准确、简洁、有条理。若信息不足，请明确指出。'
+      },
+      ...history,
+      { role: 'user', content: prompt }
+    ];
+    const content = await openaiChatCompletion(messages, settings, {
+      temperature: 0.3,
+      maxTokens: 2000
+    });
+    return { ok: true, content };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'AI请求失败' };
   }
 });
 

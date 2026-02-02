@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('electron', {
 
 contextBridge.exposeInMainWorld('electronAPI', {
   translateText: (payload) => ipcRenderer.invoke('translate-text', payload),
+  askAI: (payload) => ipcRenderer.invoke('ask-ai', payload),
   settingsGet: () => ipcRenderer.invoke('settings-get'),
   settingsSet: (payload) => ipcRenderer.invoke('settings-set', payload),
   library: {

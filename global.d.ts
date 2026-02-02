@@ -12,6 +12,14 @@ declare global {
         error?: string;
         engine?: string;
       }>;
+      askAI?: (payload: {
+        prompt: string;
+        messages?: Array<{ role: 'user' | 'model'; text: string }>;
+      }) => Promise<{
+        ok: boolean;
+        content?: string;
+        error?: string;
+      }>;
       settingsGet?: () => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;

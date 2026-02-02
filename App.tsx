@@ -330,11 +330,11 @@ const App: React.FC = () => {
       <div className="h-10 bg-white/80 backdrop-blur flex items-center border-b border-gray-200 select-none px-3 py-[4px] gap-4">
          
          {/* Library / Home Button */}
-         <div className="py-1 shrink-0">
+         <div className="p-1 shrink-0">
            <Tooltip label="主界面">
              <button 
                onClick={switchToLibrary}
-               className={`p-1 rounded-md transition-colors 
+               className={`p-1.5 rounded-md transition-colors 
                  ${activePaperId === null ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:bg-gray-200'}`}
              >
                <LayoutGrid size={16} />
@@ -352,7 +352,7 @@ const App: React.FC = () => {
                    key={paper.id}
                    onClick={() => setActivePaperId(paper.id)}
                    className={`
-                     group relative flex items-center min-w-[120px] max-w-[200px] px-3 py-1 rounded-md cursor-pointer text-xs font-medium transition-all
+                     group relative flex items-center min-w-[120px] max-w-[200px] px-2 py-1.5 rounded-md cursor-pointer text-xs font-medium transition-all
                      ${isActive 
                        ? 'bg-white shadow-sm text-gray-900' 
                        : 'text-gray-500 hover:text-gray-900 hover:bg-gray-200'}
@@ -379,7 +379,7 @@ const App: React.FC = () => {
          <div className="py-1 shrink-0">
            <Tooltip label="设置">
              <button
-               className="p-1 text-gray-500 hover:bg-gray-200 rounded-md"
+               className="p-1.5 text-gray-500 hover:bg-gray-200 rounded-md"
                onClick={() => setSettingsOpen(true)}
              >
                <Settings size={16} />

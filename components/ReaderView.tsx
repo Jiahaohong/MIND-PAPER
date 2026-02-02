@@ -26,8 +26,6 @@ import { Tooltip } from './Tooltip';
 const LazyMindMap = React.lazy(() =>
   import('./MindMap').then((mod) => ({ default: mod.MindMap }))
 );
-import { createChatSession, generateAnswer } from '../services/geminiService';
-import { Chat, GenerateContentResponse } from "@google/genai";
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
@@ -65,8 +63,15 @@ type HighlightItem = {
   isChapterTitle: boolean;
   chapterNodeId?: string | null;
   translation?: string;
-  questionId?: string | null;
-  questionText?: string | null;
+  questionIds?: string[];
+};
+
+type ChatThread = {
+  id: string;
+  title: string;
+  messages: Message[];
+  createdAt: number;
+  updatedAt: number;
 };
 
 const HIGHLIGHT_COLORS = [
@@ -220,10 +225,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   });
   
   // Chat State
-  const [chatSession, setChatSession] = useState<Chat | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [chatThreads, setChatThreads] = useState<ChatThread[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
+  const [askPaperEnabled, setAskPaperEnabled] = useState(true);
   const [collapsedMindmapIds, setCollapsedMindmapIds] = useState<Set<string>>(new Set());
   const [mindmapOffset, setMindmapOffset] = useState({ x: 0, y: 0 });
   const [isMindmapPanning, setIsMindmapPanning] = useState(false);
@@ -296,21 +302,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const hasInitWidthsRef = useRef(false);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
   const selectionToolbarRef = useRef<HTMLDivElement>(null);
-
-  // Initialize Chat
-  useEffect(() => {
-    try {
-      const session = createChatSession();
-      setChatSession(session);
-    } catch (e) {
-      console.error("Failed to init chat", e);
-    }
-  }, []);
+  const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
+  const paperContextCacheRef = useRef<Map<string, Promise<string>>>(new Map());
+  const activeChat = useMemo(
+    () => chatThreads.find((thread) => thread.id === activeChatId) || null,
+    [chatThreads, activeChatId]
+  );
+  const sortedChatThreads = useMemo(
+    () => [...chatThreads].sort((a, b) => b.updatedAt - a.updatedAt),
+    [chatThreads]
+  );
 
   // Scroll to bottom of chat
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [activeChat?.messages]);
 
   useEffect(() => {
     if (hasInitWidthsRef.current) return;
@@ -438,39 +444,143 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     setExpandedTOC(next);
   };
 
+  const createNewChat = () => {
+    const now = Date.now();
+    const nextId = `chat-${now}-${Math.random().toString(16).slice(2)}`;
+    const nextThread: ChatThread = {
+      id: nextId,
+      title: '新对话',
+      messages: [],
+      createdAt: now,
+      updatedAt: now
+    };
+    setChatThreads((prev) => [nextThread, ...prev]);
+    setActiveChatId(nextId);
+    setInput('');
+    return nextId;
+  };
+
+  const deleteChat = (chatId: string) => {
+    setChatThreads((prev) => prev.filter((item) => item.id !== chatId));
+    setActiveChatId((prev) => (prev === chatId ? null : prev));
+    setInput('');
+  };
+
   const handleSendMessage = async () => {
-    if (!input.trim() || !chatSession) return;
-    
-    const userMsg: Message = { role: 'user', text: input };
-    setMessages(prev => [...prev, userMsg]);
+    if (!input.trim()) return;
+    const userText = input.trim();
+    const userMsg: Message = { role: 'user', text: userText };
+    const targetChatId = activeChatId || createNewChat();
+    const existingMessages =
+      chatThreads.find((thread) => thread.id === targetChatId)?.messages || [];
+    setChatThreads((prev) =>
+      prev.map((thread) => {
+        if (thread.id !== targetChatId) return thread;
+        return {
+          ...thread,
+          title: thread.messages.length ? thread.title : userText.slice(0, 40),
+          messages: [...thread.messages, userMsg],
+          updatedAt: Date.now()
+        };
+      })
+    );
     setInput('');
     setIsTyping(true);
 
     try {
-      const responseStream = await generateAnswer(chatSession, userMsg.text);
-      
-      let botResponseText = '';
-      // Create a placeholder message for the bot
-      setMessages(prev => [...prev, { role: 'model', text: '' }]);
-      
-      for await (const chunk of responseStream) {
-         const c = chunk as GenerateContentResponse;
-         if (c.text) {
-             botResponseText += c.text;
-             // Update the last message
-             setMessages(prev => {
-                const newArr = [...prev];
-                newArr[newArr.length - 1] = { role: 'model', text: botResponseText };
-                return newArr;
-             });
-         }
+      let finalPrompt = userText;
+      if (askPaperEnabled) {
+        const getPaperContext = async () => {
+          const cachedTask = paperContextCacheRef.current.get(paper.id);
+          if (cachedTask) return cachedTask;
+          const task = (async () => {
+            const doc = pdfDocRef.current;
+            if (doc) {
+              const pages: string[] = [];
+              for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
+                const page = await doc.getPage(pageNumber);
+                const textContent = await page.getTextContent();
+                const pageText = textContent.items
+                  .map((item: any) => (typeof item?.str === 'string' ? item.str : ''))
+                  .join(' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                if (pageText) {
+                  pages.push(`[Page ${pageNumber}] ${pageText}`);
+                }
+              }
+              const fullText = pages.join('\n\n');
+              if (fullText) return fullText.slice(0, 120000);
+            }
+            const fallback = [paper.title, paper.summary, paper.content]
+              .filter(Boolean)
+              .join('\n\n')
+              .trim();
+            return fallback.slice(0, 120000);
+          })();
+          paperContextCacheRef.current.set(paper.id, task);
+          return task;
+        };
+        const paperContext = await getPaperContext();
+        finalPrompt = paperContext
+          ? [
+              '你将收到一篇论文内容和用户问题。',
+              '请优先依据论文内容回答；若论文内容不足，可补充你自身知识并明确说明。',
+              '',
+              '【论文内容】',
+              paperContext,
+              '',
+              '【用户问题】',
+              userText
+            ].join('\n')
+          : userText;
       }
+
+      if (typeof window === 'undefined' || !window.electronAPI?.askAI) {
+        throw new Error('AI功能仅支持桌面端，请检查预加载配置。');
+      }
+      const contextMessages = [...existingMessages, userMsg].map((item) => ({
+        role: item.role,
+        text: item.text
+      }));
+      const aiResponse = await window.electronAPI.askAI({
+        prompt: finalPrompt,
+        messages: contextMessages
+      });
+      if (!aiResponse?.ok) {
+        throw new Error(aiResponse?.error || 'AI请求失败');
+      }
+      const content = String(aiResponse.content || '').trim();
+      setChatThreads((prev) =>
+        prev.map((thread) => {
+          if (thread.id !== targetChatId) return thread;
+          return {
+            ...thread,
+            messages: [...thread.messages, { role: 'model', text: content || 'AI 未返回内容。' }],
+            updatedAt: Date.now()
+          };
+        })
+      );
     } catch (e) {
-      setMessages(prev => [...prev, { role: 'model', text: "Sorry, I encountered an error." }]);
+      const errorText = e instanceof Error ? e.message : 'AI请求失败';
+      setChatThreads((prev) =>
+        prev.map((thread) => {
+          if (thread.id !== targetChatId) return thread;
+          return {
+            ...thread,
+            messages: [...thread.messages, { role: 'model', text: `请求失败：${errorText}` }],
+            updatedAt: Date.now()
+          };
+        })
+      );
     } finally {
       setIsTyping(false);
     }
   };
+
+  useEffect(() => {
+    pdfDocRef.current = null;
+  }, [paper.id]);
 
   const clearSelection = () => {
     setSelectionText('');
@@ -782,6 +892,26 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     startQuestionEdit(question, false);
   };
 
+  const handleDeleteQuestion = (questionId: string) => {
+    setQuestions((prev) => prev.filter((item) => item.id !== questionId));
+    setHighlights((prev) =>
+      prev.map((item) => ({
+        ...item,
+        questionIds: (item.questionIds || []).filter((id) => id !== questionId)
+      }))
+    );
+    setExpandedQuestions((prev) => {
+      const next = { ...prev };
+      delete next[questionId];
+      return next;
+    });
+    if (editingQuestionId === questionId) {
+      setEditingQuestionId(null);
+      setQuestionDraft('');
+      questionEditRef.current = { id: null, originalText: '', isNew: false };
+    }
+  };
+
   const finalizeQuestionEdit = (questionId: string | null) => {
     if (!questionId) return;
     const trimmed = questionDraft.trim();
@@ -801,11 +931,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     }
     setQuestions((prev) =>
       prev.map((item) => (item.id === questionId ? { ...item, text: trimmed } : item))
-    );
-    setHighlights((prev) =>
-      prev.map((item) =>
-        item.questionId === questionId ? { ...item, questionText: trimmed } : item
-      )
     );
     setEditingQuestionId(null);
     setQuestionDraft('');
@@ -835,7 +960,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       setHighlights((prev) =>
         prev.map((item) =>
           item.id === questionPicker.highlightId
-            ? { ...item, questionId: question.id, questionText: question.text }
+            ? {
+                ...item,
+                questionIds: Array.from(
+                  new Set([...(item.questionIds || []), question.id])
+                )
+              }
             : item
         )
       );
@@ -847,7 +977,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       defaultColor,
       questionPicker.selectionInfo,
       questionPicker.selectionText,
-      { questionId: question.id, questionText: question.text }
+      { questionIds: [question.id] }
     );
     if (!nextHighlight) {
       setQuestionPicker({ open: false, highlightId: null, selectionInfo: null, selectionText: '' });
@@ -1613,10 +1743,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const highlightsByQuestion = useMemo(() => {
     const map = new Map<string, HighlightItem[]>();
     highlights.forEach((item) => {
-      if (!item.questionId) return;
-      const list = map.get(item.questionId) || [];
-      list.push(item);
-      map.set(item.questionId, list);
+      const ids = Array.isArray(item.questionIds) ? item.questionIds : [];
+      ids.forEach((id) => {
+        if (!id) return;
+        const list = map.get(id) || [];
+        list.push(item);
+        map.set(id, list);
+      });
     });
     return map;
   }, [highlights]);
@@ -1632,7 +1765,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       window.electronAPI?.library?.savePaperState?.(paper.id, {
         highlights,
         customChapters,
-        questions
+        questions,
+        aiConversations: chatThreads,
+        activeChatId
       });
     }, 400);
     return () => {
@@ -1640,7 +1775,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
         window.clearTimeout(saveStateTimerRef.current);
       }
     };
-  }, [paper?.id, highlights, customChapters, questions]);
+  }, [paper?.id, highlights, customChapters, questions, chatThreads, activeChatId]);
 
   const buildMindmapRoot = useCallback((): MindMapNode | null => {
     if (!outlineDisplay.length) return null;
@@ -1920,6 +2055,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     setDragOverMindmapId(null);
     setDragGhost(null);
     setChapterParentOverrides({});
+    setChatThreads([]);
+    setActiveChatId(null);
+    setInput('');
+    setIsTyping(false);
     if (typeof window !== 'undefined') {
       if (dragNoteTimerRef.current) {
         window.clearTimeout(dragNoteTimerRef.current);
@@ -1947,14 +2086,56 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       const saved = await window.electronAPI.library.getPaperState?.(paper.id);
       if (cancelled) return;
       if (saved && typeof saved === 'object') {
-        setHighlights(Array.isArray(saved.highlights) ? saved.highlights : []);
+        const normalizedHighlights = Array.isArray(saved.highlights)
+          ? saved.highlights.map((item: any) => {
+              const ids = Array.isArray(item.questionIds)
+                ? item.questionIds.filter(Boolean)
+                : [];
+              const legacyId = item.questionId;
+              if (legacyId && !ids.includes(legacyId)) {
+                ids.push(legacyId);
+              }
+              const next = { ...item, questionIds: ids };
+              delete (next as any).questionId;
+              delete (next as any).questionText;
+              return next;
+            })
+          : [];
+        setHighlights(normalizedHighlights);
         setCustomChapters(Array.isArray(saved.customChapters) ? saved.customChapters : []);
         const savedQuestions = Array.isArray(saved.questions) ? saved.questions : [];
         setQuestions(savedQuestions.length ? savedQuestions : DEFAULT_QUESTIONS);
+        const savedChats = Array.isArray(saved.aiConversations)
+          ? saved.aiConversations
+              .map((item: any) => ({
+                id: String(item?.id || ''),
+                title: String(item?.title || '新对话'),
+                messages: Array.isArray(item?.messages)
+                  ? item.messages
+                      .filter((msg: any) => msg && (msg.role === 'user' || msg.role === 'model'))
+                      .map((msg: any) => ({
+                        role: msg.role,
+                        text: String(msg.text || '')
+                      }))
+                  : [],
+                createdAt: Number(item?.createdAt || Date.now()),
+                updatedAt: Number(item?.updatedAt || Date.now())
+              }))
+              .filter((item: ChatThread) => item.id)
+          : [];
+        setChatThreads(savedChats);
+        const savedActiveId =
+          typeof saved.activeChatId === 'string' &&
+          savedChats.some((item: ChatThread) => item.id === saved.activeChatId)
+            ? saved.activeChatId
+            : null;
+        setActiveChatId(savedActiveId);
         paperStateLoadedRef.current = true;
         return;
       }
       setQuestions(DEFAULT_QUESTIONS);
+      setChatThreads([]);
+      setActiveChatId(null);
       paperStateLoadedRef.current = true;
     };
     loadState();
@@ -1964,6 +2145,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   }, [paper.id]);
 
   const handleDocumentLoad = async (doc: PDFDocumentProxy) => {
+    pdfDocRef.current = doc;
     setNumPages(doc.numPages);
     try {
       const outline = await doc.getOutline();
@@ -2071,9 +2253,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                </button>
              </Tooltip>
            ) : null}
-           <span className="text-xs text-gray-400 ml-2">
-             {typeof item.pageIndex === 'number' ? item.pageIndex + 1 : ''}
-           </span>
         </div>
         {isExpanded && (
           <div>
@@ -2435,8 +2614,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
           
           {/* Tab 1: Questions */}
           {activeTab === AssistantTab.QUESTIONS && (
-            <div className="p-4 overflow-y-auto h-full">
-              <div className="flex items-center justify-between pb-3 border-b border-gray-200">
+            <div className="h-full flex flex-col">
+              <div className="px-4 pt-4 pb-2 flex items-center justify-between">
                 <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">阅读问题</h3>
                 <Tooltip label="新增阅读问题">
                   <button
@@ -2448,9 +2627,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                   </button>
                 </Tooltip>
               </div>
-              <div className="divide-y divide-gray-150">
-                {questions.map((q, i) => {
+              <div className="flex-1 overflow-y-auto px-2 pb-2">
+                <div className="space-y-1 pt-1">
+                {questions.map((q) => {
                   const count = highlightsByQuestion.get(q.id)?.length || 0;
+                  const hasNotes = count > 0;
                   const notes = (highlightsByQuestion.get(q.id) || []).slice().sort((a, b) => {
                     const aKey = getHighlightSortKey(a);
                     const bKey = getHighlightSortKey(b);
@@ -2463,10 +2644,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                     <div key={q.id} className="space-y-2">
                       <div
                         data-question-id={q.id}
-                        className="group relative px-3 py-3 text-sm text-gray-700 cursor-pointer hover:bg-gray-200 transition-colors"
+                        className="group flex items-center py-1 px-2 hover:bg-gray-200 cursor-pointer text-sm text-gray-700 rounded my-0.5"
                         onClick={() => {
                           if (isEditing) return;
-                          toggleQuestionExpand(q.id);
+                          if (hasNotes) toggleQuestionExpand(q.id);
                         }}
                       >
                         {isEditing ? (
@@ -2480,32 +2661,46 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                                 finalizeQuestionEdit(q.id);
                               }
                             }}
-                            className="w-full text-sm bg-white border border-emerald-100 rounded-md px-2 py-1 outline-none focus:ring-2 focus:ring-emerald-100 resize-none"
+                            className="flex-1 min-w-0 text-sm bg-white border border-emerald-100 rounded-md px-2 py-1 outline-none focus:ring-2 focus:ring-emerald-100 resize-none"
                             placeholder="输入阅读问题..."
                             onClick={(event) => event.stopPropagation()}
                             rows={2}
                           />
                         ) : (
-                          <div className="pr-6">{q.text}</div>
+                          <span className="flex-1 break-words">{q.text}</span>
                         )}
                         {!isEditing ? (
-                          <Tooltip label="编辑问题" placement="top" wrapperClassName="absolute top-2 right-2">
-                            <button
-                              type="button"
-                              className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-600 hover:bg-gray-200"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleEditQuestion(q);
-                              }}
-                            >
-                              <Pencil size={12} />
-                            </button>
-                          </Tooltip>
-                        ) : null}
-                        {count > 0 ? (
-                          <span className="absolute bottom-2 right-2 w-5 text-center text-[10px] text-gray-500">
-                            {count}
-                          </span>
+                          <div className="ml-auto flex items-center gap-1">
+                            <Tooltip label="编辑问题" placement="top">
+                              <button
+                                type="button"
+                                className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-600 hover:bg-gray-200"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleEditQuestion(q);
+                                }}
+                              >
+                                <Pencil size={12} />
+                              </button>
+                            </Tooltip>
+                            <Tooltip label="删除问题" placement="top">
+                              <button
+                                type="button"
+                                className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-red-500"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleDeleteQuestion(q.id);
+                                }}
+                              >
+                                <X size={12} />
+                              </button>
+                            </Tooltip>
+                            {count > 0 ? (
+                              <span className="text-xs text-gray-400 ml-1">
+                                {count}
+                              </span>
+                            ) : null}
+                          </div>
                         ) : null}
                       </div>
                       {isExpanded && notes.length ? (
@@ -2560,6 +2755,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                     </div>
                   );
                 })}
+                </div>
               </div>
             </div>
           )}
@@ -2595,45 +2791,131 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
           {/* Tab 3: AI Chat */}
           {activeTab === AssistantTab.AI && (
             <div className="flex flex-col h-full">
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {messages.length === 0 && (
-                   <div className="text-center text-gray-400 mt-10 text-sm">
-                     <Sparkles size={32} className="mx-auto mb-2 opacity-50" />
-                     <p>随便问。</p>
-                   </div>
-                )}
-                {messages.map((msg, idx) => (
-                  <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                    <div className={`max-w-[85%] rounded-2xl px-4 py-2 text-sm shadow-sm
-                      ${msg.role === 'user' 
-                        ? 'bg-blue-500 text-white rounded-br-none' 
-                        : 'bg-white border border-gray-200 text-gray-700 rounded-bl-none'
-                      }`}>
-                      {msg.text}
+              {sortedChatThreads.length ? (
+                activeChat ? (
+                  <div className="border-b border-gray-200 bg-white px-2 py-1">
+                    <div className="flex items-center py-1 px-2 text-sm text-gray-700 rounded my-0.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveChatId(null);
+                          setInput('');
+                        }}
+                        className="mr-2 p-1 rounded-md text-gray-500 hover:bg-gray-200"
+                      >
+                        <ArrowLeft size={14} />
+                      </button>
+                      <span className="truncate flex-1">{activeChat.title}</span>
                     </div>
                   </div>
-                ))}
+                ) : (
+                  <div className="max-h-28 border-b border-gray-200 bg-white overflow-y-auto px-2 py-1">
+                    <div className="space-y-0.5">
+                      {sortedChatThreads.map((thread) => {
+                        const firstUserText =
+                          thread.messages.find((msg) => msg.role === 'user')?.text ||
+                          thread.messages[0]?.text ||
+                          thread.title;
+                        const firstSentence =
+                          firstUserText
+                            .split(/[\n。！？!?]/)
+                            .map((part) => part.trim())
+                            .find(Boolean) || '新对话';
+                        return (
+                          <div
+                            key={thread.id}
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => {
+                              setActiveChatId(thread.id);
+                              setInput('');
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                setActiveChatId(thread.id);
+                                setInput('');
+                              }
+                            }}
+                            className="w-full text-left group flex items-center py-1 px-2 hover:bg-gray-200 cursor-pointer text-sm text-gray-700 rounded my-0.5"
+                          >
+                            <span className="truncate flex-1">{firstSentence}</span>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                deleteChat(thread.id);
+                              }}
+                              className="ml-2 p-1 text-gray-400 opacity-0 group-hover:opacity-100 hover:text-red-500"
+                            >
+                              <X size={12} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )
+              ) : null}
+              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                {activeChat ? (
+                  activeChat.messages.map((msg, idx) => (
+                    <div key={`${activeChat.id}-${idx}`} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                      <div className={`max-w-[85%] rounded-2xl px-4 py-2 text-sm shadow-sm
+                        ${msg.role === 'user' 
+                          ? 'bg-violet-500 text-white rounded-br-none' 
+                          : 'bg-white border border-gray-200 text-gray-700 rounded-bl-none'
+                        }`}>
+                        {msg.text}
+                      </div>
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-center text-gray-400 mt-10 text-sm">
+                    <Sparkles size={32} className="mx-auto mb-2 opacity-50" />
+                    <p>输入问题可直接开始新对话。</p>
+                  </div>
+                )}
                 <div ref={messagesEndRef} />
               </div>
               <div className="p-3 border-t border-gray-200 bg-white">
-                 <div className="relative">
-                   <input
-                     type="text"
-                     value={input}
-                     onChange={(e) => setInput(e.target.value)}
-                     onKeyDown={(e) => e.key === 'Enter' && !isTyping && handleSendMessage()}
-                     placeholder="问问AI"
-                     disabled={isTyping}
-                     className="w-full bg-gray-100 border-0 rounded-full py-2.5 pl-4 pr-10 text-sm outline-none focus:ring-2 focus:ring-blue-200 transition-all"
-                   />
-                   <button 
-                    onClick={handleSendMessage}
-                    disabled={!input.trim() || isTyping}
-                    className="absolute right-1.5 top-1.5 p-1.5 bg-blue-500 text-white rounded-full disabled:opacity-50 hover:bg-blue-600 transition-colors"
-                   >
-                     <Send size={14} />
-                   </button>
-                 </div>
+                <div className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2">
+                  <textarea
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !isTyping) {
+                        e.preventDefault();
+                        handleSendMessage();
+                      }
+                    }}
+                    placeholder="问问AI"
+                    disabled={isTyping}
+                    rows={2}
+                    className="w-full resize-none bg-transparent text-sm outline-none placeholder:text-gray-400 leading-6 max-h-32 overflow-y-auto"
+                  />
+                  <div className="mt-1 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => setAskPaperEnabled((prev) => !prev)}
+                      className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                        askPaperEnabled
+                          ? 'bg-violet-100 text-violet-700'
+                          : 'bg-gray-200 text-gray-600'
+                      }`}
+                      aria-label="切换询问Paper模式"
+                    >
+                      询问文章
+                    </button>
+                    <button
+                      onClick={handleSendMessage}
+                      disabled={!input.trim() || isTyping}
+                      className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-violet-500 text-white disabled:opacity-50 hover:bg-violet-600 transition-colors"
+                    >
+                      <Send size={14} />
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}
