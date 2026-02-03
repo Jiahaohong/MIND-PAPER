@@ -435,7 +435,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       
       {/* SECTION A: Sidebar (Folders) */}
       <div className="w-64 bg-[#f6f5f4]/80 backdrop-blur-xl border-r border-gray-200 flex flex-col">
-        <div className="p-3 text-xs font-semibold text-gray-400 uppercase tracking-wider">Library</div>
+        <div className="p-3 text-xs font-semibold text-gray-400 uppercase tracking-wider">文库</div>
         <div className="flex-1 overflow-y-auto pt-2">
           {folders.map((folder) => (
             <FolderItem

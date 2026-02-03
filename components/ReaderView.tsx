@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { Paper, TOCItem, ReaderMode, AssistantTab, Message } from '../types';
-import { MOCK_TOC, SUGGESTED_QUESTIONS } from '../constants';
+import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
 
@@ -89,11 +89,6 @@ const toSolidColor = (fill: string) => {
   if (parts.length < 3) return fill;
   return `rgb(${parts[0]}, ${parts[1]}, ${parts[2]})`;
 };
-
-const DEFAULT_QUESTIONS = SUGGESTED_QUESTIONS.map((text, index) => ({
-  id: `q-${index + 1}`,
-  text
-}));
 
 const resolveOutlineDestination = async (
   doc: PDFDocumentProxy,
@@ -202,7 +197,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const [activeHighlightColor, setActiveHighlightColor] = useState<string | null>(null);
   const [translationResult, setTranslationResult] = useState('');
-  const [questions, setQuestions] = useState(() => DEFAULT_QUESTIONS);
+  const [questions, setQuestions] = useState<Array<{ id: string; text: string }>>([]);
+  const [isGeneratingQuestions, setIsGeneratingQuestions] = useState(false);
+  const [questionGenerateError, setQuestionGenerateError] = useState('');
   const [expandedQuestions, setExpandedQuestions] = useState<Record<string, boolean>>({});
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
   const [questionDraft, setQuestionDraft] = useState('');
@@ -501,6 +498,152 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     setInput('');
   };
 
+  const getPaperContext = useCallback(async () => {
+    const cachedTask = paperContextCacheRef.current.get(paper.id);
+    if (cachedTask) return cachedTask;
+    const task = (async () => {
+      const doc = pdfDocRef.current;
+      if (doc) {
+        const pages: string[] = [];
+        for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
+          const page = await doc.getPage(pageNumber);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items
+            .map((item: any) => (typeof item?.str === 'string' ? item.str : ''))
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (pageText) {
+            pages.push(`[Page ${pageNumber}] ${pageText}`);
+          }
+        }
+        const fullText = pages.join('\n\n');
+        if (fullText) return fullText.slice(0, 120000);
+      }
+      const fallback = [paper.title, paper.summary, paper.content]
+        .filter(Boolean)
+        .join('\n\n')
+        .trim();
+      return fallback.slice(0, 120000);
+    })();
+    paperContextCacheRef.current.set(paper.id, task);
+    return task;
+  }, [paper.content, paper.id, paper.summary, paper.title]);
+
+  const parseQuestionSuggestions = (raw: string) => {
+    const pickQuestionText = (item: unknown): string => {
+      if (typeof item === 'string') return item.trim();
+      if (!item || typeof item !== 'object') return '';
+      const obj = item as Record<string, unknown>;
+      const candidates = [obj.question, obj.text, obj.title, obj.q];
+      for (const value of candidates) {
+        const next = String(value || '').trim();
+        if (next) return next;
+      }
+      return '';
+    };
+
+    const toQuestions = (payload: unknown): string[] => {
+      if (Array.isArray(payload)) {
+        return payload.map(pickQuestionText).filter(Boolean).slice(0, 5);
+      }
+      if (payload && typeof payload === 'object') {
+        const obj = payload as Record<string, unknown>;
+        if (Array.isArray(obj.questions)) {
+          return obj.questions.map(pickQuestionText).filter(Boolean).slice(0, 5);
+        }
+        if (Array.isArray(obj.data)) {
+          return obj.data.map(pickQuestionText).filter(Boolean).slice(0, 5);
+        }
+      }
+      return [];
+    };
+
+    const extractJsonCandidate = (text: string) => {
+      const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      if (fencedMatch?.[1]) {
+        return fencedMatch[1].trim();
+      }
+      const firstArray = text.indexOf('[');
+      const lastArray = text.lastIndexOf(']');
+      if (firstArray !== -1 && lastArray > firstArray) {
+        return text.slice(firstArray, lastArray + 1).trim();
+      }
+      const firstObject = text.indexOf('{');
+      const lastObject = text.lastIndexOf('}');
+      if (firstObject !== -1 && lastObject > firstObject) {
+        return text.slice(firstObject, lastObject + 1).trim();
+      }
+      return text.trim();
+    };
+
+    const text = String(raw || '').trim();
+    if (!text) return [] as string[];
+
+    const jsonCandidate = extractJsonCandidate(text);
+    try {
+      const parsed = JSON.parse(jsonCandidate);
+      const fromJson = toQuestions(parsed);
+      if (fromJson.length) return fromJson;
+    } catch {
+      // fallback below
+    }
+
+    return text
+      .split('\n')
+      .map((line) => line.replace(/^\s*[-*\d.、)\]]+\s*/, '').trim())
+      .filter((line) => {
+        if (!line) return false;
+        if (/^[\[\]{},"']+$/.test(line)) return false;
+        if (/^(question|focus|method|title|text)\s*[:：]?\s*$/i.test(line)) return false;
+        return true;
+      })
+      .slice(0, 5);
+  };
+
+  const handleGenerateQuestions = async () => {
+    if (isGeneratingQuestions) return;
+    setQuestionGenerateError('');
+    setIsGeneratingQuestions(true);
+    try {
+      if (typeof window === 'undefined' || !window.electronAPI?.askAI) {
+        throw new Error('AI功能仅支持桌面端，请检查预加载配置。');
+      }
+      const paperContext = await getPaperContext();
+      const prompt = [
+        '你是论文阅读助手。',
+        '请基于下面论文内容，提出3到5个可以帮助读者理解论文的关键问题。',
+        '要求：',
+        '1. 问题具体、可回答；',
+        '2. 覆盖方法、贡献、实验或局限中的核心点；',
+        '3. 问题必须使用简体中文。',
+        '4. 仅返回JSON数组字符串，不要其他解释。',
+        '',
+        '【论文内容】',
+        paperContext || [paper.title, paper.summary, paper.content].filter(Boolean).join('\n\n')
+      ].join('\n');
+      const aiResponse = await window.electronAPI.askAI({ prompt, messages: [] });
+      if (!aiResponse?.ok) {
+        throw new Error(aiResponse?.error || 'AI提问生成失败');
+      }
+      const parsed = parseQuestionSuggestions(aiResponse.content || '');
+      if (!parsed.length) {
+        throw new Error('AI未返回有效问题，请重试');
+      }
+      const now = Date.now();
+      setQuestions(
+        parsed.map((text, index) => ({
+          id: `q-ai-${now}-${index}`,
+          text
+        }))
+      );
+    } catch (error: any) {
+      setQuestionGenerateError(error?.message || 'AI提问生成失败');
+    } finally {
+      setIsGeneratingQuestions(false);
+    }
+  };
+
   const handleSendMessage = async () => {
     if (!input.trim()) return;
     const userText = input.trim();
@@ -525,37 +668,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     try {
       let finalPrompt = userText;
       if (askPaperEnabled) {
-        const getPaperContext = async () => {
-          const cachedTask = paperContextCacheRef.current.get(paper.id);
-          if (cachedTask) return cachedTask;
-          const task = (async () => {
-            const doc = pdfDocRef.current;
-            if (doc) {
-              const pages: string[] = [];
-              for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
-                const page = await doc.getPage(pageNumber);
-                const textContent = await page.getTextContent();
-                const pageText = textContent.items
-                  .map((item: any) => (typeof item?.str === 'string' ? item.str : ''))
-                  .join(' ')
-                  .replace(/\s+/g, ' ')
-                  .trim();
-                if (pageText) {
-                  pages.push(`[Page ${pageNumber}] ${pageText}`);
-                }
-              }
-              const fullText = pages.join('\n\n');
-              if (fullText) return fullText.slice(0, 120000);
-            }
-            const fallback = [paper.title, paper.summary, paper.content]
-              .filter(Boolean)
-              .join('\n\n')
-              .trim();
-            return fallback.slice(0, 120000);
-          })();
-          paperContextCacheRef.current.set(paper.id, task);
-          return task;
-        };
         const paperContext = await getPaperContext();
         finalPrompt = paperContext
           ? [
@@ -2398,7 +2510,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     mindmapStateRef.current = null;
     const loadState = async () => {
       if (typeof window === 'undefined' || !window.electronAPI?.library) {
-        setQuestions(DEFAULT_QUESTIONS);
+        setQuestions([]);
         paperStateLoadedRef.current = true;
         return;
       }
@@ -2423,7 +2535,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
         setHighlights(normalizedHighlights);
         setCustomChapters(Array.isArray(saved.customChapters) ? saved.customChapters : []);
         const savedQuestions = Array.isArray(saved.questions) ? saved.questions : [];
-        setQuestions(savedQuestions.length ? savedQuestions : DEFAULT_QUESTIONS);
+        setQuestions(savedQuestions);
         const savedChats = Array.isArray(saved.aiConversations)
           ? saved.aiConversations
               .map((item: any) => ({
@@ -2452,7 +2564,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
         paperStateLoadedRef.current = true;
         return;
       }
-      setQuestions(DEFAULT_QUESTIONS);
+      setQuestions([]);
       setChatThreads([]);
       setActiveChatId(null);
       paperStateLoadedRef.current = true;
@@ -2952,134 +3064,151 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                 </Tooltip>
               </div>
               <div className="flex-1 overflow-y-auto px-2 pb-2">
-                <div className="space-y-1 pt-1">
-                {questions.map((q) => {
-                  const count = highlightsByQuestion.get(q.id)?.length || 0;
-                  const hasNotes = count > 0;
-                  const notes = (highlightsByQuestion.get(q.id) || []).slice().sort((a, b) => {
-                    const aKey = getHighlightSortKey(a);
-                    const bKey = getHighlightSortKey(b);
-                    if (aKey.pageIndex !== bKey.pageIndex) return aKey.pageIndex - bKey.pageIndex;
-                    return aKey.top - bKey.top;
-                  });
-                  const isExpanded = Boolean(expandedQuestions[q.id]);
-                  const isEditing = editingQuestionId === q.id;
-                  return (
-                    <div key={q.id} className="space-y-2">
-                      <div
-                        data-question-id={q.id}
-                        className="group flex items-center py-1 px-2 hover:bg-gray-200 cursor-pointer text-sm text-gray-700 rounded my-0.5"
-                        onClick={() => {
-                          if (isEditing) return;
-                          if (hasNotes) toggleQuestionExpand(q.id);
-                        }}
-                      >
-                        {isEditing ? (
-                          <textarea
-                            ref={questionInputRef}
-                            value={questionDraft}
-                            onChange={(event) => setQuestionDraft(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter') {
-                                event.preventDefault();
-                                finalizeQuestionEdit(q.id);
-                              }
+                {questions.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-start pt-16 gap-2 px-4">
+                    <button
+                      type="button"
+                      onClick={handleGenerateQuestions}
+                      disabled={isGeneratingQuestions}
+                      className="inline-flex items-center gap-2 px-3 py-2 rounded-md text-sm bg-emerald-500 text-white hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                      <Sparkles size={14} />
+                      {isGeneratingQuestions ? 'AI提问中...' : 'AI提问'}
+                    </button>
+                    {questionGenerateError ? (
+                      <div className="text-xs text-red-500 text-center">{questionGenerateError}</div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="space-y-1 pt-1">
+                    {questions.map((q) => {
+                      const count = highlightsByQuestion.get(q.id)?.length || 0;
+                      const hasNotes = count > 0;
+                      const notes = (highlightsByQuestion.get(q.id) || []).slice().sort((a, b) => {
+                        const aKey = getHighlightSortKey(a);
+                        const bKey = getHighlightSortKey(b);
+                        if (aKey.pageIndex !== bKey.pageIndex) return aKey.pageIndex - bKey.pageIndex;
+                        return aKey.top - bKey.top;
+                      });
+                      const isExpanded = Boolean(expandedQuestions[q.id]);
+                      const isEditing = editingQuestionId === q.id;
+                      return (
+                        <div key={q.id} className="space-y-2">
+                          <div
+                            data-question-id={q.id}
+                            className="group flex items-center py-1 px-2 hover:bg-gray-200 cursor-pointer text-sm text-gray-700 rounded my-0.5"
+                            onClick={() => {
+                              if (isEditing) return;
+                              if (hasNotes) toggleQuestionExpand(q.id);
                             }}
-                            className="flex-1 min-w-0 text-sm bg-white border border-emerald-100 rounded-md px-2 py-1 outline-none focus:ring-2 focus:ring-emerald-100 resize-none"
-                            placeholder="输入阅读问题..."
-                            onClick={(event) => event.stopPropagation()}
-                            rows={2}
-                          />
-                        ) : (
-                          <span className="flex-1 break-words">{q.text}</span>
-                        )}
-                        {!isEditing ? (
-                          <div className="ml-auto flex items-center gap-1">
-                            <Tooltip label="编辑问题" placement="top">
-                              <button
-                                type="button"
-                                className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-600 hover:bg-gray-200"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  handleEditQuestion(q);
+                          >
+                            {isEditing ? (
+                              <textarea
+                                ref={questionInputRef}
+                                value={questionDraft}
+                                onChange={(event) => setQuestionDraft(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') {
+                                    event.preventDefault();
+                                    finalizeQuestionEdit(q.id);
+                                  }
                                 }}
-                              >
-                                <Pencil size={12} />
-                              </button>
-                            </Tooltip>
-                            <Tooltip label="删除问题" placement="top">
-                              <button
-                                type="button"
-                                className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-red-500"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  handleDeleteQuestion(q.id);
-                                }}
-                              >
-                                <X size={12} />
-                              </button>
-                            </Tooltip>
-                            {count > 0 ? (
-                              <span className="text-xs text-gray-400 ml-1">
-                                {count}
-                              </span>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
-                      {isExpanded && notes.length ? (
-                        <div className="space-y-1">
-                          {notes.map((note) => {
-                            const noteExpanded = expandedHighlightIds.has(note.id);
-                            const clampStyle = noteExpanded
-                              ? { whiteSpace: 'pre-wrap' as const }
-                              : {
-                                  display: '-webkit-box',
-                                  WebkitLineClamp: 2,
-                                  WebkitBoxOrient: 'vertical',
-                                  overflow: 'hidden'
-                                };
-                            return (
-                              <button
-                                key={`question-note-${note.id}`}
-                                type="button"
-                                onClick={() => jumpToHighlight(note)}
-                                onDoubleClick={() =>
-                                  setExpandedHighlightIds((prev) => {
-                                    const next = new Set(prev);
-                                    if (next.has(note.id)) {
-                                      next.delete(note.id);
-                                    } else {
-                                      next.add(note.id);
-                                    }
-                                    return next;
-                                  })
-                                }
-                                className={`w-full text-left text-xs rounded px-2 py-1 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
-                                  note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
-                                }`}
-                                style={{ borderLeft: `3px solid ${note.color}` }}
-                              >
-                                <span className="leading-4 w-full" style={clampStyle}>
-                                  {note.text}
-                                </span>
-                                {!note.isChapterTitle && note.translation ? (
-                                  <span
-                                    className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
-                                    style={clampStyle}
+                                className="flex-1 min-w-0 text-sm bg-white border border-emerald-100 rounded-md px-2 py-1 outline-none focus:ring-2 focus:ring-emerald-100 resize-none"
+                                placeholder="输入阅读问题..."
+                                onClick={(event) => event.stopPropagation()}
+                                rows={2}
+                              />
+                            ) : (
+                              <span className="flex-1 break-words">{q.text}</span>
+                            )}
+                            {!isEditing ? (
+                              <div className="ml-auto flex items-center gap-1">
+                                <Tooltip label="编辑问题" placement="top">
+                                  <button
+                                    type="button"
+                                    className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-gray-600 hover:bg-gray-200"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      handleEditQuestion(q);
+                                    }}
                                   >
-                                    {note.translation}
+                                    <Pencil size={12} />
+                                  </button>
+                                </Tooltip>
+                                <Tooltip label="删除问题" placement="top">
+                                  <button
+                                    type="button"
+                                    className="w-5 h-5 flex items-center justify-center rounded-md text-gray-400 opacity-0 group-hover:opacity-100 hover:text-red-500"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      handleDeleteQuestion(q.id);
+                                    }}
+                                  >
+                                    <X size={12} />
+                                  </button>
+                                </Tooltip>
+                                {count > 0 ? (
+                                  <span className="text-xs text-gray-400 ml-1">
+                                    {count}
                                   </span>
                                 ) : null}
-                              </button>
-                            );
-                          })}
+                              </div>
+                            ) : null}
+                          </div>
+                          {isExpanded && notes.length ? (
+                            <div className="space-y-1">
+                              {notes.map((note) => {
+                                const noteExpanded = expandedHighlightIds.has(note.id);
+                                const clampStyle = noteExpanded
+                                  ? { whiteSpace: 'pre-wrap' as const }
+                                  : {
+                                      display: '-webkit-box',
+                                      WebkitLineClamp: 2,
+                                      WebkitBoxOrient: 'vertical',
+                                      overflow: 'hidden'
+                                    };
+                                return (
+                                  <button
+                                    key={`question-note-${note.id}`}
+                                    type="button"
+                                    onClick={() => jumpToHighlight(note)}
+                                    onDoubleClick={() =>
+                                      setExpandedHighlightIds((prev) => {
+                                        const next = new Set(prev);
+                                        if (next.has(note.id)) {
+                                          next.delete(note.id);
+                                        } else {
+                                          next.add(note.id);
+                                        }
+                                        return next;
+                                      })
+                                    }
+                                    className={`w-full text-left text-xs rounded px-2 py-1 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
+                                      note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
+                                    }`}
+                                    style={{ borderLeft: `3px solid ${note.color}` }}
+                                  >
+                                    <span className="leading-4 w-full" style={clampStyle}>
+                                      {note.text}
+                                    </span>
+                                    {!note.isChapterTitle && note.translation ? (
+                                      <span
+                                        className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                        style={clampStyle}
+                                      >
+                                        {note.translation}
+                                      </span>
+                                    ) : null}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : null}
                         </div>
-                      ) : null}
-                    </div>
-                  );
-                })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           )}
