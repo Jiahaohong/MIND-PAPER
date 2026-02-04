@@ -363,7 +363,7 @@ const App: React.FC = () => {
              <button 
                onClick={switchToLibrary}
                className={`p-1.5 rounded-md transition-colors 
-                 ${activePaperId === null ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:bg-gray-200'}`}
+                 ${activePaperId === null ? 'bg-white text-gray-900 shadow-md shadow-gray-350/70' : 'text-gray-500 hover:bg-gray-200'}`}
              >
                <LayoutGrid size={16} />
              </button>
@@ -382,7 +382,7 @@ const App: React.FC = () => {
                    className={`
                      group relative flex items-center min-w-[120px] max-w-[200px] px-2 py-1.5 rounded-md cursor-pointer text-xs font-medium transition-all
                      ${isActive 
-                       ? 'bg-white shadow-sm text-gray-900' 
+                       ? 'bg-white shadow-md shadow-gray-350/70 text-gray-900' 
                        : 'text-gray-500 hover:text-gray-900 hover:bg-gray-200'}
                    `}
                  >

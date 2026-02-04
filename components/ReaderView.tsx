@@ -589,6 +589,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       // fallback below
     }
 
+    // Handle malformed JSON-like output such as repeated `"问题": "..."` lines.
+    const questionMatches = Array.from(
+      text.matchAll(/"(?:问题|question|Question)"\s*:\s*"([^"]+)"/g)
+    )
+      .map((match) => String(match[1] || '').trim())
+      .filter(Boolean)
+      .slice(0, 5);
+    if (questionMatches.length) return questionMatches;
+
     return text
       .split('\n')
       .map((line) => line.replace(/^\s*[-*\d.、)\]]+\s*/, '').trim())
@@ -617,7 +626,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
         '1. 问题具体、可回答；',
         '2. 覆盖方法、贡献、实验或局限中的核心点；',
         '3. 问题必须使用简体中文。',
-        '4. 仅返回JSON数组字符串，不要其他解释。',
+        '4. 只返回严格JSON，不要Markdown代码块，不要```json前缀，不要解释。',
+        '5. 输出格式必须是：{"questions":["问题1","问题2","问题3"]}。',
         '',
         '【论文内容】',
         paperContext || [paper.title, paper.summary, paper.content].filter(Boolean).join('\n\n')
@@ -2704,7 +2714,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
               <div className="space-y-1">
                 {combinedItems.map((entry) =>
                   entry.type === 'note' ? (
-                    <div key={entry.note.id} style={{ paddingLeft: `${level * 12 + 8}px` }}>
+                    <div key={entry.note.id} style={{ paddingLeft: `${level * 12 + 14}px` }}>
                       {(() => {
                         const isExpanded = expandedHighlightIds.has(entry.note.id);
                         const clampStyle = isExpanded
@@ -3326,7 +3336,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                 ) : (
                   <div className="text-center text-gray-400 mt-10 text-sm">
                     <Sparkles size={32} className="mx-auto mb-2 opacity-50" />
-                    <p>输入问题可直接开始新对话。</p>
+                    <p>输入问题可直接开始新对话</p>
                   </div>
                 )}
                 <div ref={messagesEndRef} />
