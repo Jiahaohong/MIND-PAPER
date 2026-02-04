@@ -3361,7 +3361,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                     <button
                       type="button"
                       onClick={() => setAskPaperEnabled((prev) => !prev)}
-                      className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                      className={`inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs transition-colors ${
                         askPaperEnabled
                           ? 'bg-violet-100 text-violet-700'
                           : 'bg-gray-200 text-gray-600'
@@ -3373,7 +3373,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                     <button
                       onClick={handleSendMessage}
                       disabled={!input.trim() || isTyping}
-                      className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-violet-500 text-white disabled:opacity-50 hover:bg-violet-600 transition-colors"
+                      className="inline-flex items-center justify-center p-1 rounded-md bg-violet-500 text-white disabled:opacity-50 hover:bg-violet-600 transition-colors"
                     >
                       <Send size={14} />
                     </button>
