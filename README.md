@@ -9,38 +9,44 @@ Smoother operation!
 
 More immersive reading experience!
 
+
+# Main Functions
+
+You can highlght any text in the pdf, or make it a subtitle. And all your highlight note will transfer into the mind map node automatically.
+
+## Add PDF
+
+https://github.com/user-attachments/assets/e98cd7e1-49dd-458c-854f-d9679c903ae4
+
+## Add Note
+
+https://github.com/user-attachments/assets/23918295-c817-477d-b9df-214a9a58bb43
+
+## Add Subtitle
+
+https://github.com/user-attachments/assets/62e37758-771f-42e5-b457-ede1bbe8c4b4
+
+## See Mind Map
+
+https://github.com/user-attachments/assets/c290f172-9b79-427b-b9ed-adcd5792374e
+
+## AI Question
+
+https://github.com/user-attachments/assets/87e89e56-2a9c-43c6-97ff-c4804adc21be
+
+## Related Note To Question
+
+https://github.com/user-attachments/assets/f4169351-3bd6-4cda-96b4-41fd68b92fe8
+
+## Ask AI
+
+https://github.com/user-attachments/assets/57f7298e-1f5a-4c6f-b3ef-0edd81cf3bba
+
 # AI API Settings
 
-Click setting buttons on the top right of the screen, add your own api key and api base url to start using the app.
+Click setting buttons on the top right of the screen, add your own api key and api base url.
 
 # Translator
 
 Default: Use CNKI as default translator
-
-
-# Usage
-
-You can highlght any text in the pdf, or make it a subtitle. And all your highlight note will transfer into the mind map node automatically.
-
-All vedio tutorials will coming soon!
-
-## Paper Outline
-<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1.outline-usage.mov" controls width="800"></video>
-
-
-## Highlight Text
-<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-highlight-usage.mov" controls width="800"></video>
-
-
-## Add Subtitle
-<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-add-subtitle.mov" controls width="800"></video>
-
-
-## Related to Problem
-<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-related-problem.mov" controls width="800"></video>
-
-
-## Mind Map
-<video src="https://github.com/Jiahaohong/MIND-PAPER/releases/download/v0.1.1/v0.1.1-mind-map.mov" controls width="800"></video>
-
 
