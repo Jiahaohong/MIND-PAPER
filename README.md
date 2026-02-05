@@ -1,5 +1,7 @@
 # Reconstructing high-dimensional ideas from low-dimensional papers
 
+**Read this in other languages:  [中文](README_zh.md).**
+
 # News！
 The brand new v1.0.0 version is here! 
 
