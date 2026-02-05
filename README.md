@@ -14,6 +14,10 @@ More immersive reading experience!
 
 You can highlght any text in the pdf, or make it a subtitle. And all your highlight note will transfer into the mind map node automatically.
 
+## See Mind Map
+
+https://github.com/user-attachments/assets/c290f172-9b79-427b-b9ed-adcd5792374e
+
 ## Add Note
 
 https://github.com/user-attachments/assets/23918295-c817-477d-b9df-214a9a58bb43
@@ -21,10 +25,6 @@ https://github.com/user-attachments/assets/23918295-c817-477d-b9df-214a9a58bb43
 ## Add Subtitle
 
 https://github.com/user-attachments/assets/62e37758-771f-42e5-b457-ede1bbe8c4b4
-
-## See Mind Map
-
-https://github.com/user-attachments/assets/c290f172-9b79-427b-b9ed-adcd5792374e
 
 ## Raise Question
 
