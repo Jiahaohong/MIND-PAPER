@@ -183,7 +183,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   // State
   const [viewMode, setViewMode] = useState<ReaderMode>(ReaderMode.PDF);
   const [activeTab, setActiveTab] = useState<AssistantTab>(AssistantTab.QUESTIONS);
-  const [zoom, setZoom] = useState(100);
+  const [pdfZoom, setPdfZoom] = useState(100);
+  const [mindmapZoom, setMindmapZoom] = useState(100);
   const [expandedTOC, setExpandedTOC] = useState<Set<string>>(new Set(['1', '2']));
   const [leftWidth, setLeftWidth] = useState(200);
   const [rightWidth, setRightWidth] = useState(200);
@@ -250,6 +251,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   } | null>(null);
   const [chapterParentOverrides, setChapterParentOverrides] = useState<Record<string, string>>({});
   const [expandedHighlightIds, setExpandedHighlightIds] = useState<Set<string>>(new Set());
+  const mindmapZoomScale = mindmapZoom / 100;
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const contentAreaRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1451,8 +1453,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
         if (targetNode) {
           mindmapAnchorRef.current = {
             id: node.id,
-            x: targetNode.x + targetNode.width / 2 + layout.offset.x + mindmapOffset.x,
-            y: targetNode.y + targetNode.height / 2 + layout.offset.y + mindmapOffset.y
+            x:
+              (targetNode.x + targetNode.width / 2 + layout.offset.x) * mindmapZoomScale +
+              mindmapOffset.x,
+            y:
+              (targetNode.y + targetNode.height / 2 + layout.offset.y) * mindmapZoomScale +
+              mindmapOffset.y
           };
         }
       }
@@ -1489,8 +1495,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       return;
     }
     const nextOffset = {
-      x: anchor.x - (target.x + target.width / 2 + layout.offset.x),
-      y: anchor.y - (target.y + target.height / 2 + layout.offset.y)
+      x: anchor.x - (target.x + target.width / 2 + layout.offset.x) * mindmapZoomScale,
+      y: anchor.y - (target.y + target.height / 2 + layout.offset.y) * mindmapZoomScale
     };
     setMindmapOffset(nextOffset);
     mindmapAnchorRef.current = null;
@@ -2837,11 +2843,31 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
           </div>
 
           <div className="flex items-center gap-1 text-gray-500">
-            <button onClick={() => setZoom(z => Math.max(50, z - 10))} className="p-1 hover:bg-gray-100 rounded">
+            <button
+              onClick={() => {
+                if (viewMode === ReaderMode.PDF) {
+                  setPdfZoom((z) => Math.max(50, z - 10));
+                } else {
+                  setMindmapZoom((z) => Math.max(50, z - 10));
+                }
+              }}
+              className="p-1 hover:bg-gray-100 rounded"
+            >
               <ZoomOut size={14} />
             </button>
-            <span className="text-xs w-8 text-center">{zoom}%</span>
-            <button onClick={() => setZoom(z => Math.min(200, z + 10))} className="p-1 hover:bg-gray-100 rounded">
+            <span className="text-xs w-8 text-center">
+              {viewMode === ReaderMode.PDF ? pdfZoom : mindmapZoom}%
+            </span>
+            <button
+              onClick={() => {
+                if (viewMode === ReaderMode.PDF) {
+                  setPdfZoom((z) => Math.min(200, z + 10));
+                } else {
+                  setMindmapZoom((z) => Math.min(200, z + 10));
+                }
+              }}
+              className="p-1 hover:bg-gray-100 rounded"
+            >
               <ZoomIn size={14} />
             </button>
           </div>
@@ -2882,7 +2908,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                       <Page
                         pageNumber={index + 1}
                         width={800}
-                        scale={zoom / 100}
+                        scale={pdfZoom / 100}
                         renderAnnotationLayer={false}
                         renderTextLayer
                       />
@@ -2948,6 +2974,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                 >
                   <LazyMindMap
                     root={mindmapRoot}
+                    zoomScale={mindmapZoomScale}
                     collapsedIds={collapsedMindmapIds}
                     expandedNoteIds={expandedHighlightIds}
                     offset={mindmapOffset}
@@ -3034,7 +3061,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
               onClick={() => setActiveTab(AssistantTab.QUESTIONS)}
               className={`w-full h-full flex justify-center items-center border-b-2 transition-colors ${activeTab === AssistantTab.QUESTIONS ? 'border-emerald-400 text-emerald-600 bg-emerald-50' : 'border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-200'}`}
             >
-              <Info size={16} />
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="1.5" />
+                <path d="M6.7 6.2C6.9 5.4 7.6 4.9 8.4 4.9C9.4 4.9 10.2 5.6 10.2 6.6C10.2 7.2 9.9 7.6 9.4 7.9C8.8 8.3 8.6 8.6 8.6 9.1V9.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                <circle cx="8.6" cy="11.3" r="1" fill="currentColor" />
+              </svg>
             </button>
           </Tooltip>
           <Tooltip label="文章信息" wrapperClassName="flex-1 h-full">

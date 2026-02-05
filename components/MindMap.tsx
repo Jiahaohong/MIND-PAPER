@@ -96,6 +96,7 @@ const cloneTree = (node: MindMapNode, collapsedIds: Set<string>): MindMapNode =>
 
 interface MindMapProps {
   root: MindMapNode | null;
+  zoomScale?: number;
   collapsedIds?: Set<string>;
   expandedNoteIds?: Set<string>;
   offset?: { x: number; y: number };
@@ -111,6 +112,7 @@ interface MindMapProps {
 
 export const MindMap: React.FC<MindMapProps> = ({
   root,
+  zoomScale = 1,
   collapsedIds = new Set(),
   expandedNoteIds = new Set(),
   offset,
@@ -309,7 +311,9 @@ export const MindMap: React.FC<MindMapProps> = ({
       }}
     >
       <svg width="100%" height="100%">
-        <g transform={`translate(${layout.offset.x + dragOffset.x}, ${layout.offset.y + dragOffset.y})`}>
+        <g transform={`translate(${dragOffset.x}, ${dragOffset.y})`}>
+          <g transform={`scale(${zoomScale})`}>
+            <g transform={`translate(${layout.offset.x}, ${layout.offset.y})`}>
           <g fill="none" stroke="#cbd5f5" strokeWidth={1.5}>
             {layout.edges.map((edge) => {
               const startX = edge.from.x + edge.from.width;
@@ -444,6 +448,8 @@ export const MindMap: React.FC<MindMapProps> = ({
                 </g>
               );
             })}
+          </g>
+            </g>
           </g>
         </g>
       </svg>
