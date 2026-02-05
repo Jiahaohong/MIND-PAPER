@@ -5,13 +5,19 @@ import { Folder, Paper } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
 import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
+import {
+  extractMetadataWithAI,
+  extractPdfFirstPageMetadata,
+  extractPdfFirstPageText
+} from './services/pdfMetadataService';
 
 const App: React.FC = () => {
   const DEFAULT_SETTINGS = {
     translationEngine: 'cnki' as 'cnki' | 'openai',
     apiKey: '',
     baseUrl: '',
-    model: ''
+    model: '',
+    parsePdfWithAI: false
   };
   // State for tabs
   const [openPapers, setOpenPapers] = useState<Paper[]>([]);
@@ -75,25 +81,78 @@ const App: React.FC = () => {
     }
   };
 
-  const handleAddPdf = async (file: File, folderId: string | null) => {
-    if (!file) return;
+  const handleAddPdf = async (file: File, folderId: string | null): Promise<Paper | null> => {
+    if (!file) return null;
     const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
     if (!isPdf) {
       window.alert('请上传PDF格式文件。');
-      return;
+      return null;
     }
     if (!folderId) {
       window.alert('请先在左侧选择一个文件夹，再添加文档。');
-      return;
+      return null;
     }
     if (folderId === SYSTEM_FOLDER_TRASH_ID) {
       window.alert('回收站中不能添加文档。');
-      return;
+      return null;
     }
 
     const fileData = await file.arrayBuffer();
     const id = `p-${Date.now()}`;
-    const title = file.name.replace(/\.pdf$/i, '');
+    const fallbackTitle = file.name.replace(/\.pdf$/i, '');
+    let parsedTitle = fallbackTitle;
+    let parsedAuthor = 'Unknown';
+    let parsedSummary = 'Uploaded PDF';
+    let parsedKeywords: string[] = [];
+    let parsedDate = new Date().toISOString().slice(0, 10);
+
+    let parseWithAI = false;
+    let canUseAI = false;
+    if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
+      try {
+        const settings = await window.electronAPI.settingsGet();
+        parseWithAI = Boolean(settings?.parsePdfWithAI);
+        canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
+      } catch {
+        parseWithAI = false;
+        canUseAI = false;
+      }
+    }
+
+    if (parseWithAI && canUseAI) {
+      try {
+        const firstPageText = await extractPdfFirstPageText(fileData);
+        const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+        parsedTitle = aiMetadata.title || fallbackTitle;
+        parsedAuthor = aiMetadata.author || 'Unknown';
+        parsedSummary = aiMetadata.summary || 'No abstract extracted.';
+        parsedKeywords = aiMetadata.keywords || [];
+        parsedDate = aiMetadata.publishedDate || parsedDate;
+      } catch (error) {
+        console.warn('AI解析失败，回退传统解析:', error);
+        try {
+          const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
+          parsedTitle = parsed.metadata.title || fallbackTitle;
+          parsedAuthor = parsed.metadata.author || 'Unknown';
+          parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
+          parsedKeywords = parsed.metadata.keywords || [];
+          parsedDate = parsed.metadata.publishedDate || parsedDate;
+        } catch (fallbackError) {
+          console.warn('传统解析也失败，使用默认信息:', fallbackError);
+        }
+      }
+    } else {
+      try {
+        const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
+        parsedTitle = parsed.metadata.title || fallbackTitle;
+        parsedAuthor = parsed.metadata.author || 'Unknown';
+        parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
+        parsedKeywords = parsed.metadata.keywords || [];
+        parsedDate = parsed.metadata.publishedDate || parsedDate;
+      } catch (error) {
+        console.warn('PDF首页解析失败，使用默认信息:', error);
+      }
+    }
     const assignedFolderId =
       folderId === SYSTEM_FOLDER_ALL_ID ? SYSTEM_FOLDER_ALL_ID : folderId;
     let filePath: string | undefined;
@@ -105,13 +164,13 @@ const App: React.FC = () => {
     }
     const nextPaper: Paper = {
       id,
-      title,
-      author: 'Unknown',
-      date: new Date().toISOString().slice(0, 10),
+      title: parsedTitle,
+      author: parsedAuthor,
+      date: parsedDate,
       folderId: assignedFolderId,
-      summary: 'Uploaded PDF',
+      summary: parsedSummary,
       content: '',
-      keywords: [],
+      keywords: parsedKeywords,
       fileUrl: filePath ? undefined : URL.createObjectURL(file),
       fileData: filePath ? undefined : fileData,
       filePath
@@ -120,7 +179,8 @@ const App: React.FC = () => {
     pdfFileCacheRef.current.set(id, { data: fileData.slice(0) });
     setPdfFileMap((prev) => ({ ...prev, [id]: { data: fileData.slice(0) } }));
     setPapers(prev => [nextPaper, ...prev]);
-    handleOpenPaper(nextPaper);
+
+    return nextPaper;
   };
 
   const getCachedPdfFile = (paper: Paper) => {
@@ -535,6 +595,30 @@ const App: React.FC = () => {
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="gpt-3.5-turbo"
                 />
+              </div>
+
+              <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                <div>
+                  <div className="text-xs text-gray-700">使用 AI 解析 PDF 信息</div>
+                  <div className="text-[11px] text-gray-400 mt-0.5">
+                    开启后上传新 PDF 优先使用 AI 解析标题、作者、摘要、关键词
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSettingsForm((prev) => ({ ...prev, parsePdfWithAI: !prev.parsePdfWithAI }))
+                  }
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    settingsForm.parsePdfWithAI ? 'bg-emerald-500' : 'bg-gray-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                      settingsForm.parsePdfWithAI ? 'translate-x-5' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
               </div>
             </div>
 

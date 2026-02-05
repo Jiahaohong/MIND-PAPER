@@ -25,17 +25,20 @@ declare global {
         apiKey?: string;
         baseUrl?: string;
         model?: string;
+        parsePdfWithAI?: boolean;
       }>;
       settingsSet?: (payload: {
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
         baseUrl?: string;
         model?: string;
+        parsePdfWithAI?: boolean;
       }) => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
         baseUrl?: string;
         model?: string;
+        parsePdfWithAI?: boolean;
       }>;
       library?: {
         getFolders?: () => Promise<any>;

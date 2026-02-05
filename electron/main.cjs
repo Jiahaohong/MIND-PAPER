@@ -22,7 +22,8 @@ let runtimeSettings = {
   translationEngine: 'cnki',
   apiKey: '',
   baseUrl: '',
-  model: ''
+  model: '',
+  parsePdfWithAI: false
 };
 
 let cnkiTokenCache = { token: '', t: 0 };
@@ -31,7 +32,8 @@ const sanitizeSettings = (payload = {}) => ({
   translationEngine: payload.translationEngine === 'openai' ? 'openai' : 'cnki',
   apiKey: String(payload.apiKey || '').trim(),
   baseUrl: String(payload.baseUrl || '').trim(),
-  model: String(payload.model || '').trim()
+  model: String(payload.model || '').trim(),
+  parsePdfWithAI: Boolean(payload.parsePdfWithAI)
 });
 
 const loadSettings = async () => {

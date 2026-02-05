@@ -3240,13 +3240,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                     <div className="text-gray-400 text-xs uppercase mb-1">发布日期</div>
                     <div>{paper.date}</div>
                   </div>
-                  <div>
-                    <div className="text-gray-400 text-xs uppercase mb-1">统计</div>
-                    <div className="grid grid-cols-2 gap-2 text-gray-600">
-                       <div className="bg-gray-100 p-2 rounded">页数: 12</div>
-                       <div className="bg-gray-100 p-2 rounded">参考文献: 45</div>
-                    </div>
-                  </div>
                 </div>
              </div>
           )}

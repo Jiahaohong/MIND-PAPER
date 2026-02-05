@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Folder as FolderIcon,
   FileText,
@@ -13,6 +13,12 @@ import {
 import { Tooltip } from './Tooltip';
 import { Folder, Paper } from '../types';
 import { SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from '../constants';
+import { Document, Page, pdfjs } from 'react-pdf';
+
+pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
 
 interface FolderItemProps {
   folder: Folder;
@@ -199,7 +205,7 @@ interface LibraryViewProps {
   folders: Folder[];
   onFoldersChange: (folders: Folder[]) => void;
   papers: Paper[];
-  onAddPdf: (file: File, folderId: string | null) => void;
+  onAddPdf: (file: File, folderId: string | null) => Promise<Paper | null>;
   onOpenPaper: (paper: Paper) => void;
   onEmptyTrash: () => void;
   onMovePapersToTrash: (folderIds: string[]) => void;
@@ -220,13 +226,40 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onMovePaperToFolder,
   onRestorePaper
 }) => {
+  const MIN_LEFT_WIDTH = 180;
+  const MIN_MIDDLE_WIDTH = 240;
+  const MIN_RIGHT_WIDTH = 280;
+  const RESIZE_HANDLE_WIDTH = 4;
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(SYSTEM_FOLDER_ALL_ID);
   const [selectedPaperId, setSelectedPaperId] = useState<string | null>(null);
   const [draggingPaperId, setDraggingPaperId] = useState<string | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
+  const [selectedPaperThumbnail, setSelectedPaperThumbnail] = useState<string | null>(null);
+  const [thumbnailPageSize, setThumbnailPageSize] = useState<{ width: number; height: number } | null>(null);
+  const [thumbnailViewportSize, setThumbnailViewportSize] = useState<{ width: number; height: number }>({
+    width: 0,
+    height: 0
+  });
+  const [isPanelResizing, setIsPanelResizing] = useState(false);
+  const [leftWidth, setLeftWidth] = useState(256);
+  const [middleWidth, setMiddleWidth] = useState(320);
+  const [rightWidth, setRightWidth] = useState(0);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const dragStateRef = useRef<{
+    boundary: 'left-middle' | 'middle-right';
+    startX: number;
+    left: number;
+    middle: number;
+    right: number;
+  } | null>(null);
+  const hasInitWidthsRef = useRef(false);
+  const thumbnailBlobUrlRef = useRef<string | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['root-1']));
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const [folderDraft, setFolderDraft] = useState('');
+  const [sortMenuOpen, setSortMenuOpen] = useState(false);
+  const [sortField, setSortField] = useState<'title' | 'author' | 'publishedDate' | 'uploadedAt'>('uploadedAt');
+  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const folderEditRef = useRef<{ id: string | null; originalName: string; isNew: boolean }>({
     id: null,
     originalName: '',
@@ -234,6 +267,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+  const thumbnailViewportRef = useRef<HTMLDivElement>(null);
+  const sortMenuRef = useRef<HTMLDivElement>(null);
 
   // --- Helpers ---
   const toggleFolder = (id: string) => {
@@ -369,23 +404,313 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     return null;
   };
 
-  const selectedPaper = papers.find(p => p.id === selectedPaperId);
+  const visiblePapers = selectedFolderId ? getFolderPapers(selectedFolderId) : [];
+  const parseUploadTime = (paper: Paper) => {
+    const match = /^p-(\d+)/.exec(paper.id || '');
+    if (match?.[1]) {
+      const ts = Number(match[1]);
+      if (Number.isFinite(ts)) return ts;
+    }
+    return 0;
+  };
+  const parsePublishedTime = (paper: Paper) => {
+    const value = String(paper.date || '').trim();
+    if (!value) return 0;
+    if (/^\d{4}$/.test(value)) return Number(value) * 10000;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const sortedVisiblePapers = useMemo(() => {
+    const list = [...visiblePapers];
+    list.sort((a, b) => {
+      let result = 0;
+      if (sortField === 'title') {
+        result = (a.title || '').localeCompare(b.title || '', 'zh-Hans-CN', { sensitivity: 'base' });
+      } else if (sortField === 'author') {
+        result = (a.author || '').localeCompare(b.author || '', 'zh-Hans-CN', { sensitivity: 'base' });
+      } else if (sortField === 'publishedDate') {
+        result = parsePublishedTime(a) - parsePublishedTime(b);
+      } else {
+        result = parseUploadTime(a) - parseUploadTime(b);
+      }
+      if (result === 0) {
+        result = (a.title || '').localeCompare(b.title || '', 'zh-Hans-CN', { sensitivity: 'base' });
+      }
+      return sortOrder === 'asc' ? result : -result;
+    });
+    return list;
+  }, [visiblePapers, sortField, sortOrder]);
+  const selectedPaper = visiblePapers.find((paper) => paper.id === selectedPaperId) || null;
+
+  useEffect(() => {
+    if (!sortMenuOpen) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('[data-sort-menu-anchor]')) return;
+      setSortMenuOpen(false);
+    };
+    window.addEventListener('mousedown', handleMouseDown);
+    return () => window.removeEventListener('mousedown', handleMouseDown);
+  }, [sortMenuOpen]);
+
+  useEffect(() => {
+    if (!selectedPaperId) return;
+    if (!selectedPaper) {
+      setSelectedPaperId(null);
+    }
+  }, [selectedPaper, selectedPaperId]);
+  const syncThumbnailViewportSize = () => {
+    const element = thumbnailViewportRef.current;
+    if (!element) return;
+    const nextWidth = element.clientWidth;
+    const nextHeight = element.clientHeight;
+    setThumbnailViewportSize((prev) => {
+      if (Math.abs(prev.width - nextWidth) < 2 && Math.abs(prev.height - nextHeight) < 2) {
+        return prev;
+      }
+      return { width: nextWidth, height: nextHeight };
+    });
+  };
+
+  const thumbnailScale = (() => {
+    if (!thumbnailPageSize || !thumbnailViewportSize.width || !thumbnailViewportSize.height) return 1;
+    const fitWidth = thumbnailViewportSize.width / thumbnailPageSize.width;
+    const fitHeight = thumbnailViewportSize.height / thumbnailPageSize.height;
+    const scale = Math.min(1, fitWidth, fitHeight);
+    if (!Number.isFinite(scale) || scale <= 0) return 1;
+    return Math.round(scale * 100) / 100;
+  })();
+
+  const clampWidths = (left: number, middle: number, right: number, totalWidth: number) => {
+    const total = Math.max(0, totalWidth - RESIZE_HANDLE_WIDTH * 2);
+    if (!total) {
+      return { left, middle, right };
+    }
+
+    let nextLeft = Math.max(MIN_LEFT_WIDTH, left);
+    let nextMiddle = Math.max(MIN_MIDDLE_WIDTH, middle);
+    let nextRight = Math.max(MIN_RIGHT_WIDTH, right);
+
+    const sum = nextLeft + nextMiddle + nextRight;
+    if (sum > total) {
+      let overflow = sum - total;
+      const reduceRight = Math.min(overflow, nextRight - MIN_RIGHT_WIDTH);
+      nextRight -= reduceRight;
+      overflow -= reduceRight;
+      const reduceMiddle = Math.min(overflow, nextMiddle - MIN_MIDDLE_WIDTH);
+      nextMiddle -= reduceMiddle;
+      overflow -= reduceMiddle;
+      const reduceLeft = Math.min(overflow, nextLeft - MIN_LEFT_WIDTH);
+      nextLeft -= reduceLeft;
+      overflow -= reduceLeft;
+      if (overflow > 0) {
+        // If viewport is extremely small, allow right column to shrink below min last.
+        nextRight = Math.max(120, nextRight - overflow);
+      }
+    } else if (sum < total) {
+      nextRight += total - sum;
+    }
+
+    return { left: nextLeft, middle: nextMiddle, right: nextRight };
+  };
+
+  useEffect(() => {
+    if (hasInitWidthsRef.current) return;
+    let rafId = 0;
+    const init = () => {
+      const container = containerRef.current;
+      if (!container) return;
+      const total = container.clientWidth - RESIZE_HANDLE_WIDTH * 2;
+      if (total <= 0) {
+        rafId = window.requestAnimationFrame(init);
+        return;
+      }
+      const initial = clampWidths(
+        Math.round(total * 0.22),
+        Math.round(total * 0.28),
+        Math.round(total * 0.5),
+        container.clientWidth
+      );
+      setLeftWidth(initial.left);
+      setMiddleWidth(initial.middle);
+      setRightWidth(initial.right);
+      hasInitWidthsRef.current = true;
+    };
+    init();
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const container = containerRef.current;
+      if (!container || !hasInitWidthsRef.current) return;
+      const next = clampWidths(leftWidth, middleWidth, rightWidth, container.clientWidth);
+      setLeftWidth(next.left);
+      setMiddleWidth(next.middle);
+      setRightWidth(next.right);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [leftWidth, middleWidth, rightWidth]);
+
+  useEffect(() => {
+    const handleMove = (event: MouseEvent) => {
+      const drag = dragStateRef.current;
+      const container = containerRef.current;
+      if (!drag || !container) return;
+      const total = container.clientWidth - RESIZE_HANDLE_WIDTH * 2;
+      const delta = event.clientX - drag.startX;
+      if (drag.boundary === 'left-middle') {
+        const maxLeft = Math.max(MIN_LEFT_WIDTH, total - drag.right - MIN_MIDDLE_WIDTH);
+        const nextLeft = Math.min(maxLeft, Math.max(MIN_LEFT_WIDTH, drag.left + delta));
+        const nextMiddle = total - drag.right - nextLeft;
+        setLeftWidth(nextLeft);
+        setMiddleWidth(nextMiddle);
+        setRightWidth(drag.right);
+      } else {
+        const maxMiddle = Math.max(MIN_MIDDLE_WIDTH, total - drag.left - MIN_RIGHT_WIDTH);
+        const nextMiddle = Math.min(maxMiddle, Math.max(MIN_MIDDLE_WIDTH, drag.middle + delta));
+        const nextRight = total - drag.left - nextMiddle;
+        setLeftWidth(drag.left);
+        setMiddleWidth(nextMiddle);
+        setRightWidth(nextRight);
+      }
+    };
+    const handleUp = () => {
+      dragStateRef.current = null;
+      setIsPanelResizing(false);
+      syncThumbnailViewportSize();
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const resetOwnedThumbnailUrl = () => {
+      if (thumbnailBlobUrlRef.current) {
+        URL.revokeObjectURL(thumbnailBlobUrlRef.current);
+        thumbnailBlobUrlRef.current = null;
+      }
+    };
+    const setThumbnailFromBuffer = (buffer: ArrayBuffer) => {
+      resetOwnedThumbnailUrl();
+      const blobUrl = URL.createObjectURL(new Blob([buffer], { type: 'application/pdf' }));
+      thumbnailBlobUrlRef.current = blobUrl;
+      setSelectedPaperThumbnail(blobUrl);
+    };
+    const loadThumbnail = async () => {
+      if (!selectedPaper) {
+        resetOwnedThumbnailUrl();
+        setSelectedPaperThumbnail(null);
+        return;
+      }
+      if (selectedPaper.fileData) {
+        setThumbnailFromBuffer(selectedPaper.fileData.slice(0));
+        return;
+      }
+      if (selectedPaper.fileUrl) {
+        resetOwnedThumbnailUrl();
+        setSelectedPaperThumbnail(selectedPaper.fileUrl);
+        return;
+      }
+      if (
+        selectedPaper.filePath &&
+        typeof window !== 'undefined' &&
+        window.electronAPI?.library?.readPdf
+      ) {
+        const response = await window.electronAPI.library.readPdf({
+          paperId: selectedPaper.id,
+          filePath: selectedPaper.filePath
+        });
+        if (cancelled || !response?.ok || !response.data) return;
+        let arrayBuffer: ArrayBuffer;
+        if (response.data instanceof ArrayBuffer) {
+          arrayBuffer = response.data.slice(0);
+        } else if (ArrayBuffer.isView(response.data)) {
+          arrayBuffer = response.data.buffer.slice(
+            response.data.byteOffset,
+            response.data.byteOffset + response.data.byteLength
+          );
+        } else {
+          arrayBuffer = response.data as ArrayBuffer;
+        }
+        if (!cancelled) {
+          setThumbnailFromBuffer(arrayBuffer);
+        }
+        return;
+      }
+      resetOwnedThumbnailUrl();
+      setSelectedPaperThumbnail(null);
+    };
+    loadThumbnail();
+    return () => {
+      cancelled = true;
+      resetOwnedThumbnailUrl();
+    };
+  }, [selectedPaper]);
+
+  useEffect(() => {
+    setThumbnailPageSize(null);
+  }, [selectedPaperThumbnail, selectedPaper?.id]);
+
+  useEffect(() => {
+    const element = thumbnailViewportRef.current;
+    if (!element) return;
+    let rafId = 0;
+    const update = () => {
+      if (isPanelResizing) return;
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+      rafId = window.requestAnimationFrame(() => {
+        syncThumbnailViewportSize();
+      });
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+    };
+  }, [selectedPaper?.id, isPanelResizing]);
 
   const handleAddClick = () => {
     fileInputRef.current?.click();
   };
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file) onAddPdf(file, selectedFolderId);
+    if (file) {
+      const created = await onAddPdf(file, selectedFolderId);
+      if (created?.id) {
+        setSelectedPaperId(created.id);
+      }
+    }
     event.target.value = '';
   };
 
-  const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
+  const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     if (selectedFolderId === SYSTEM_FOLDER_TRASH_ID) return;
     const file = event.dataTransfer.files?.[0];
-    if (file) onAddPdf(file, selectedFolderId);
+    if (file) {
+      const created = await onAddPdf(file, selectedFolderId);
+      if (created?.id) {
+        setSelectedPaperId(created.id);
+      }
+    }
   };
 
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
@@ -431,10 +756,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   }, [editingFolderId, folderDraft]);
   // --- Render ---
   return (
-    <div className="flex h-[calc(100vh-28px)] bg-white text-gray-800">
+    <div ref={containerRef} className="flex h-[calc(100vh-28px)] bg-white text-gray-800 overflow-hidden">
       
       {/* SECTION A: Sidebar (Folders) */}
-      <div className="w-64 bg-[#f6f5f4]/80 backdrop-blur-xl border-r border-gray-200 flex flex-col">
+      <div
+        className="flex-none bg-[#f6f5f4]/80 backdrop-blur-xl border-r border-gray-200 flex flex-col"
+        style={{ width: leftWidth }}
+      >
         <div className="p-3 text-xs font-semibold text-gray-400 uppercase tracking-wider">文库</div>
         <div className="flex-1 overflow-y-auto pt-2">
           {folders.map((folder) => (
@@ -475,9 +803,26 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         </div>
       </div>
 
+      <div
+        className="w-1 flex-none cursor-col-resize bg-transparent hover:bg-gray-200/80"
+        onMouseDown={(event) => {
+          setIsPanelResizing(true);
+          dragStateRef.current = {
+            boundary: 'left-middle',
+            startX: event.clientX,
+            left: leftWidth,
+            middle: middleWidth,
+            right: rightWidth
+          };
+          document.body.style.cursor = 'col-resize';
+          document.body.style.userSelect = 'none';
+        }}
+      />
+
       {/* SECTION B: File List */}
       <div
-        className="w-80 bg-white border-r border-gray-200 flex flex-col"
+        className="flex-none bg-white flex flex-col"
+        style={{ width: middleWidth }}
         onDrop={handleDrop}
         onDragOver={handleDragOver}
       >
@@ -492,29 +837,94 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
             {selectedFolderId ? findFolderName(folders, selectedFolderId) || 'Documents' : 'Documents'}
           </div>
-          {selectedFolderId === SYSTEM_FOLDER_TRASH_ID ? (
-            <Tooltip label="清空回收站">
+          <div className="relative flex items-center gap-1" data-sort-menu-anchor>
+            <Tooltip label="排序">
               <button
-                onClick={onEmptyTrash}
-                className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+                type="button"
+                onClick={() => setSortMenuOpen((prev) => !prev)}
+                className={`p-1 rounded-md text-gray-500 ${sortMenuOpen ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
               >
-                <Trash2 size={14} />
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                  <path d="M2 3.5H12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  <path d="M2 7H9.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  <path d="M2 10.5H7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                </svg>
               </button>
             </Tooltip>
-          ) : (
-            <Tooltip label="添加文档">
-              <button
-                onClick={handleAddClick}
-                className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+            {sortMenuOpen ? (
+              <div
+                ref={sortMenuRef}
+                className="absolute right-0 top-8 z-30 w-52 rounded-md border border-gray-200 bg-white shadow-md p-2"
               >
-                <Plus size={14} />
-              </button>
-            </Tooltip>
-          )}
+                <div className="flex gap-1 mb-2">
+                  <button
+                    type="button"
+                    onClick={() => setSortOrder('asc')}
+                    className={`flex-1 px-2 py-1 rounded text-xs ${
+                      sortOrder === 'asc' ? 'bg-gray-100 text-gray-900' : 'text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    正序
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSortOrder('desc')}
+                    className={`flex-1 px-2 py-1 rounded text-xs ${
+                      sortOrder === 'desc' ? 'bg-gray-100 text-gray-900' : 'text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    倒序
+                  </button>
+                </div>
+                <div className="h-px bg-gray-100 mb-2" />
+                <div className="text-[11px] text-gray-400 px-1 mb-1">排序字段</div>
+                <div className="space-y-1">
+                  {[
+                    { value: 'title', label: '论文题目' },
+                    { value: 'author', label: '论文作者' },
+                    { value: 'publishedDate', label: '论文发布时间' },
+                    { value: 'uploadedAt', label: '论文上传时间' }
+                  ].map((item) => (
+                    <button
+                      key={item.value}
+                      type="button"
+                      onClick={() =>
+                        setSortField(item.value as 'title' | 'author' | 'publishedDate' | 'uploadedAt')
+                      }
+                      className={`w-full text-left px-2 py-1 rounded text-xs ${
+                        sortField === item.value ? 'bg-gray-100 text-gray-900' : 'text-gray-600 hover:bg-gray-50'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {selectedFolderId === SYSTEM_FOLDER_TRASH_ID ? (
+              <Tooltip label="清空回收站">
+                <button
+                  onClick={onEmptyTrash}
+                  className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </Tooltip>
+            ) : (
+              <Tooltip label="添加文档">
+                <button
+                  onClick={handleAddClick}
+                  className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+                >
+                  <Plus size={14} />
+                </button>
+              </Tooltip>
+            )}
+          </div>
         </div>
         <div className="flex-1 overflow-y-auto">
           {selectedFolderId ? (
-             getFolderPapers(selectedFolderId).map(paper => (
+             sortedVisiblePapers.map(paper => (
                <div
                  key={paper.id}
                  onClick={() => setSelectedPaperId(paper.id)}
@@ -540,8 +950,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                    <div className="flex items-start min-w-0">
                      <FileText size={20} className="text-gray-400 mt-1 mr-3 shrink-0" />
                      <div className="min-w-0">
-                       <div className="text-sm font-medium text-gray-900 leading-tight mb-1 truncate">{paper.title}</div>
-                       <div className="text-xs text-gray-500">{paper.author}</div>
+                       <div className="text-sm font-medium text-gray-900 leading-tight mb-1 whitespace-normal break-words">
+                         {paper.title}
+                       </div>
+                       <div className="text-xs text-gray-500 w-full truncate" title={paper.author}>
+                         {paper.author}
+                       </div>
                        <div className="text-xs text-gray-400 mt-0.5">{paper.date}</div>
                      </div>
                    </div>
@@ -581,40 +995,58 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         </div>
       </div>
 
-      {/* SECTION C: Details */}
-      <div className="flex-1 bg-gray-50 flex flex-col">
-        {selectedPaper ? (
-          <div className="p-8 max-w-2xl mx-auto w-full">
-            <div className="bg-white shadow-sm border border-gray-200 rounded-xl p-8 flex flex-col items-center text-center">
-              <div className="w-24 h-32 bg-gray-100 border border-gray-200 mb-6 shadow-md flex items-center justify-center">
-                 <FileText size={48} className="text-gray-300" />
-              </div>
-              <h2 className="text-xl font-bold text-gray-900 mb-2">{selectedPaper.title}</h2>
-              <p className="text-gray-600 mb-6">{selectedPaper.author}</p>
-              
-              <div className="w-full text-left space-y-4">
-                <div>
-                  <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Summary</h3>
-                  <p className="text-sm text-gray-700 leading-relaxed">{selectedPaper.summary}</p>
-                </div>
-                <div>
-                  <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Keywords</h3>
-                  <div className="flex flex-wrap gap-2">
-                    {selectedPaper.keywords.map(k => (
-                      <span key={k} className="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded-full">
-                        {k}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              </div>
+      <div
+        className="w-1 flex-none cursor-col-resize bg-transparent hover:bg-gray-200/80"
+        onMouseDown={(event) => {
+          setIsPanelResizing(true);
+          dragStateRef.current = {
+            boundary: 'middle-right',
+            startX: event.clientX,
+            left: leftWidth,
+            middle: middleWidth,
+            right: rightWidth
+          };
+          document.body.style.cursor = 'col-resize';
+          document.body.style.userSelect = 'none';
+        }}
+      />
 
-              <button 
-                onClick={() => onOpenPaper(selectedPaper)}
-                className="mt-8 px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg shadow-sm font-medium text-sm transition-colors"
-              >
-                Open Document
-              </button>
+      {/* SECTION C: Details */}
+      <div
+        className="flex-none bg-gray-50 border-l border-gray-200 flex flex-col overflow-y-auto"
+        style={{ width: rightWidth }}
+      >
+        {selectedPaper ? (
+          <div className="flex-1 p-4 overflow-auto">
+            <div ref={thumbnailViewportRef} className="h-full w-full flex items-start justify-center">
+              {selectedPaperThumbnail ? (
+                <Document
+                  key={`thumb-${selectedPaper.id}`}
+                  file={selectedPaperThumbnail}
+                  loading={null}
+                  error={null}
+                  noData={null}
+                >
+                  <Page
+                    pageNumber={1}
+                    scale={thumbnailScale}
+                    loading={null}
+                    error={null}
+                    noData={null}
+                    renderTextLayer={false}
+                    renderAnnotationLayer={false}
+                    onLoadSuccess={(page: any) => {
+                      const viewport = page.getViewport({ scale: 1 });
+                      setThumbnailPageSize({
+                        width: viewport.width,
+                        height: viewport.height
+                      });
+                    }}
+                  />
+                </Document>
+              ) : (
+                <div className="w-full h-full bg-white" />
+              )}
             </div>
           </div>
         ) : (
