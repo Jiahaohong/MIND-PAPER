@@ -15,13 +15,20 @@ import {
   X,
   Ban,
   Plus,
-  Pencil
+  Pencil,
+  RefreshCw
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { Paper, TOCItem, ReaderMode, AssistantTab, Message } from '../types';
 import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
+import {
+  extractMetadataWithAI,
+  extractPdfFirstPageMetadata,
+  extractPdfFirstPageText,
+  extractPdfMetadataFromTextItems
+} from '../services/pdfMetadataService';
 
 const LazyMindMap = React.lazy(() =>
   import('./MindMap').then((mod) => ({ default: mod.MindMap }))
@@ -170,9 +177,10 @@ interface ReaderViewProps {
   paper: Paper;
   pdfFile: { data: ArrayBuffer } | string | null;
   onBack: () => void;
+  onUpdatePaper: (paperId: string, updates: Partial<Paper>) => void;
 }
 
-export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }) => {
+export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, onUpdatePaper }) => {
   const MIN_SIDE_WIDTH = 120;
   const MIN_CENTER_WIDTH = 120;
   const RESIZE_HANDLE_WIDTH = 4;
@@ -252,6 +260,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
   const [chapterParentOverrides, setChapterParentOverrides] = useState<Record<string, string>>({});
   const [expandedHighlightIds, setExpandedHighlightIds] = useState<Set<string>>(new Set());
   const mindmapZoomScale = mindmapZoom / 100;
+  const [infoRefreshing, setInfoRefreshing] = useState(false);
+  const [infoRefreshError, setInfoRefreshError] = useState('');
+
+  const formatDateYmd = (value: string) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const zhMatch = raw.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (zhMatch) {
+      return `${Number(zhMatch[1])}/${Number(zhMatch[2])}/${Number(zhMatch[3])}`;
+    }
+    const zhMonth = raw.match(/(\d{4})年(\d{1,2})月/);
+    if (zhMonth) {
+      return `${Number(zhMonth[1])}/${Number(zhMonth[2])}/1`;
+    }
+    if (/^\d{4}$/.test(raw)) return `${raw}/1/1`;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return raw;
+    return `${parsed.getFullYear()}/${parsed.getMonth() + 1}/${parsed.getDate()}`;
+  };
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const contentAreaRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -734,6 +761,86 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
       );
     } finally {
       setIsTyping(false);
+    }
+  };
+
+  const handleRefreshMetadata = async () => {
+    if (infoRefreshing) return;
+    setInfoRefreshing(true);
+    setInfoRefreshError('');
+    try {
+      let parseWithAI = false;
+      let canUseAI = false;
+      if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
+        const settings = await window.electronAPI.settingsGet();
+        parseWithAI = Boolean(settings?.parsePdfWithAI);
+        canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
+      }
+
+      const fallbackTitle = paper.title || 'Document';
+      let updates: Partial<Paper> = {};
+
+      if (parseWithAI && canUseAI) {
+        let firstPageText = '';
+        if (pdfDocRef.current) {
+          const page = await pdfDocRef.current.getPage(1);
+          const textContent = await page.getTextContent();
+          const parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
+          firstPageText = parsed.firstPageText;
+        } else if (pdfFile && typeof pdfFile !== 'string' && pdfFile.data) {
+          firstPageText = await extractPdfFirstPageText(pdfFile.data);
+        } else if (typeof pdfFile === 'string') {
+          const response = await fetch(pdfFile);
+          const buffer = await response.arrayBuffer();
+          firstPageText = await extractPdfFirstPageText(buffer);
+        }
+
+        if (!firstPageText) {
+          throw new Error('无法读取PDF首页内容');
+        }
+        const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+        updates = {
+          ...(aiMetadata.title ? { title: aiMetadata.title } : {}),
+          ...(aiMetadata.author ? { author: aiMetadata.author } : {}),
+          ...(aiMetadata.summary ? { summary: aiMetadata.summary } : {}),
+          ...(aiMetadata.keywords ? { keywords: aiMetadata.keywords } : {}),
+          ...(aiMetadata.publishedDate ? { date: aiMetadata.publishedDate } : {}),
+          ...(aiMetadata.publisher ? { publisher: aiMetadata.publisher } : {})
+        };
+      } else {
+        let parsed: { metadata: any } | null = null;
+        if (pdfDocRef.current) {
+          const page = await pdfDocRef.current.getPage(1);
+          const textContent = await page.getTextContent();
+          parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
+        } else if (pdfFile && typeof pdfFile !== 'string' && pdfFile.data) {
+          parsed = await extractPdfFirstPageMetadata(pdfFile.data, fallbackTitle);
+        } else if (typeof pdfFile === 'string') {
+          const response = await fetch(pdfFile);
+          const buffer = await response.arrayBuffer();
+          parsed = await extractPdfFirstPageMetadata(buffer, fallbackTitle);
+        }
+        if (!parsed) {
+          throw new Error('无法读取PDF首页内容');
+        }
+        const meta = parsed.metadata || {};
+        updates = {
+          ...(meta.title ? { title: meta.title } : {}),
+          ...(meta.author ? { author: meta.author } : {}),
+          ...(meta.summary ? { summary: meta.summary } : {}),
+          ...(meta.keywords ? { keywords: meta.keywords } : {}),
+          ...(meta.publishedDate ? { date: meta.publishedDate } : {}),
+          ...(meta.publisher ? { publisher: meta.publisher } : {})
+        };
+      }
+
+      if (Object.keys(updates).length) {
+        onUpdatePaper(paper.id, updates);
+      }
+    } catch (error: any) {
+      setInfoRefreshError(error?.message || '解析失败');
+    } finally {
+      setInfoRefreshing(false);
     }
   };
 
@@ -2597,22 +2704,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
     try {
       const outline = await doc.getOutline();
       const tree = outline?.length ? await buildOutlineTree(doc, outline, '') : [];
+      setOutlineNodes((prev) => {
+        const existingRootId = prev[0]?.id || `outline-root-${paper.id}`;
+        const rootNode: OutlineNode = {
+          id: existingRootId,
+          title: paper.title || 'Document',
+          pageIndex: 0,
+          topRatio: 0,
+          items: tree,
+          isRoot: true
+        };
+        return [rootNode];
+      });
       const rootId = `outline-root-${paper.id}`;
-      const rootNode: OutlineNode = {
-        id: rootId,
-        title: paper.title || 'Document',
-        pageIndex: 0,
-        topRatio: 0,
-        items: tree,
-        isRoot: true
-      };
-      setOutlineNodes([rootNode]);
-      setExpandedTOC(new Set([rootId]));
+      setExpandedTOC((prev) => {
+        const next = new Set(prev);
+        next.add(rootId);
+        return next;
+      });
     } catch (error) {
       console.error('Outline load error:', error);
       setOutlineNodes([]);
     }
   };
+
+  useEffect(() => {
+    setOutlineNodes((prev) => {
+      if (!prev.length) return prev;
+      const root = prev[0];
+      const nextTitle = paper.title || 'Document';
+      if (root.title === nextTitle) return prev;
+      return [{ ...root, title: nextTitle }, ...prev.slice(1)];
+    });
+  }, [paper.title]);
 
   // --- Components ---
 
@@ -3256,8 +3380,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
 
           {/* Tab 2: Info */}
           {activeTab === AssistantTab.INFO && (
-             <div className="px-4 py-5 overflow-y-auto h-full">
-                <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4">文章信息</h3>
+             <div className="px-4 py-4 overflow-y-auto h-full">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">文章信息</h3>
+                  <Tooltip label="重新解析">
+                    <button
+                      type="button"
+                      onClick={handleRefreshMetadata}
+                      disabled={infoRefreshing}
+                      className="p-1 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-50"
+                    >
+                      <RefreshCw size={14} className={infoRefreshing ? 'animate-spin' : ''} />
+                    </button>
+                  </Tooltip>
+                </div>
                 <div className="space-y-4 text-sm">
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">标题</div>
@@ -3269,8 +3405,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack }
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布日期</div>
-                    <div>{paper.date}</div>
+                    <div>{formatDateYmd(paper.date)}</div>
                   </div>
+                  <div>
+                    <div className="text-gray-400 text-xs uppercase mb-1">发布机构</div>
+                    <div>{paper.publisher || '-'}</div>
+                  </div>
+                  {infoRefreshError ? (
+                    <div className="text-xs text-red-500">{infoRefreshError}</div>
+                  ) : null}
                 </div>
              </div>
           )}

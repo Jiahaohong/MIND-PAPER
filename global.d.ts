@@ -26,6 +26,7 @@ declare global {
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        libraryPath?: string;
       }>;
       settingsSet?: (payload: {
         translationEngine?: 'cnki' | 'openai';
@@ -33,12 +34,14 @@ declare global {
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        libraryPath?: string;
       }) => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        libraryPath?: string;
       }>;
       library?: {
         getFolders?: () => Promise<any>;
@@ -57,6 +60,8 @@ declare global {
         }>;
         getPaperState?: (paperId: string) => Promise<any>;
         savePaperState?: (paperId: string, state: any) => Promise<{ ok: boolean }>;
+        deletePaper?: (payload: { paperId: string; filePath?: string }) => Promise<{ ok: boolean; error?: string }>;
+        deletePapers?: (payload: { items: Array<{ id: string; filePath?: string }> }) => Promise<{ ok: boolean; error?: string }>;
       };
     };
   }

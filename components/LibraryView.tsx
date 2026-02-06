@@ -210,6 +210,7 @@ interface LibraryViewProps {
   onEmptyTrash: () => void;
   onMovePapersToTrash: (folderIds: string[]) => void;
   onMovePaperToTrash: (paperId: string) => void;
+  onDeletePaper: (paperId: string) => void;
   onMovePaperToFolder: (paperId: string, folderId: string) => void;
   onRestorePaper: (paperId: string) => void;
 }
@@ -223,6 +224,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onEmptyTrash,
   onMovePapersToTrash,
   onMovePaperToTrash,
+  onDeletePaper,
   onMovePaperToFolder,
   onRestorePaper
 }) => {
@@ -413,9 +415,42 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     }
     return 0;
   };
+
+  const formatDateYmd = (value: string) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    const zhMatch = raw.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (zhMatch) {
+      return `${Number(zhMatch[1])}/${Number(zhMatch[2])}/${Number(zhMatch[3])}`;
+    }
+    const zhMonth = raw.match(/(\d{4})年(\d{1,2})月/);
+    if (zhMonth) {
+      return `${Number(zhMonth[1])}/${Number(zhMonth[2])}/1`;
+    }
+    if (/^\d{4}$/.test(raw)) return `${raw}/1/1`;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return raw;
+    return `${parsed.getFullYear()}/${parsed.getMonth() + 1}/${parsed.getDate()}`;
+  };
+
+  const formatUploadDateYmd = (paper: Paper) => {
+    const ts = parseUploadTime(paper);
+    if (!ts) return '';
+    const date = new Date(ts);
+    if (Number.isNaN(date.getTime())) return '';
+    return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+  };
   const parsePublishedTime = (paper: Paper) => {
     const value = String(paper.date || '').trim();
     if (!value) return 0;
+    const zhMatch = value.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+    if (zhMatch) {
+      return Number(zhMatch[1]) * 10000 + Number(zhMatch[2]) * 100 + Number(zhMatch[3]);
+    }
+    const zhMonth = value.match(/(\d{4})年(\d{1,2})月/);
+    if (zhMonth) {
+      return Number(zhMonth[1]) * 10000 + Number(zhMonth[2]) * 100;
+    }
     if (/^\d{4}$/.test(value)) return Number(value) * 10000;
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? parsed : 0;
@@ -950,13 +985,29 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                    <div className="flex items-start min-w-0">
                      <FileText size={20} className="text-gray-400 mt-1 mr-3 shrink-0" />
                      <div className="min-w-0">
-                       <div className="text-sm font-medium text-gray-900 leading-tight mb-1 whitespace-normal break-words">
-                         {paper.title}
-                       </div>
-                       <div className="text-xs text-gray-500 w-full truncate" title={paper.author}>
-                         {paper.author}
-                       </div>
-                       <div className="text-xs text-gray-400 mt-0.5">{paper.date}</div>
+                       {paper.isParsing ? (
+                         <div className="space-y-2 py-0.5">
+                           <div className="skeleton-shimmer h-3 w-5/6 rounded" />
+                           <div className="skeleton-shimmer h-3 w-3/5 rounded" />
+                           <div className="flex items-center justify-between">
+                             <div className="skeleton-shimmer h-3 w-16 rounded" />
+                             <div className="skeleton-shimmer h-3 w-16 rounded" />
+                           </div>
+                         </div>
+                       ) : (
+                         <>
+                           <div className="text-xs font-normal text-gray-900 leading-tight mb-1 whitespace-normal break-words">
+                             {paper.title}
+                           </div>
+                           <div className="text-xs text-gray-500 w-full truncate" title={paper.author}>
+                             {paper.author}
+                           </div>
+                           <div className="text-xs text-gray-400 mt-0.5 flex items-center justify-between">
+                             <span>{formatDateYmd(paper.date)}</span>
+                             <span>{formatUploadDateYmd(paper)}</span>
+                           </div>
+                         </>
+                       )}
                      </div>
                    </div>
                    {selectedFolderId !== SYSTEM_FOLDER_TRASH_ID ? (
@@ -973,18 +1024,32 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                        </button>
                      </Tooltip>
                    ) : (
-                     <Tooltip label="恢复">
-                       <button
-                         type="button"
-                         onClick={(event) => {
-                           event.stopPropagation();
-                           onRestorePaper(paper.id);
-                         }}
-                         className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
-                       >
-                         <RotateCcw size={14} />
-                       </button>
-                     </Tooltip>
+                     <div className="flex flex-col gap-1 items-end">
+                       <Tooltip label="恢复">
+                         <button
+                           type="button"
+                           onClick={(event) => {
+                             event.stopPropagation();
+                             onRestorePaper(paper.id);
+                           }}
+                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+                         >
+                           <RotateCcw size={14} />
+                         </button>
+                       </Tooltip>
+                       <Tooltip label="删除">
+                         <button
+                           type="button"
+                           onClick={(event) => {
+                             event.stopPropagation();
+                             onDeletePaper(paper.id);
+                           }}
+                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+                         >
+                           <Trash2 size={14} />
+                         </button>
+                       </Tooltip>
+                     </div>
                    )}
                  </div>
                </div>

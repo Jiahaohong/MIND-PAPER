@@ -15,9 +15,11 @@ export interface Paper {
   summary: string;
   content: string; // Mock content
   keywords: string[];
+  publisher?: string;
   fileUrl?: string;
   fileData?: ArrayBuffer;
   filePath?: string;
+  isParsing?: boolean;
 }
 
 export interface TOCItem {

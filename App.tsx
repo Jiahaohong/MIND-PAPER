@@ -17,7 +17,8 @@ const App: React.FC = () => {
     apiKey: '',
     baseUrl: '',
     model: '',
-    parsePdfWithAI: false
+    parsePdfWithAI: false,
+    libraryPath: ''
   };
   // State for tabs
   const [openPapers, setOpenPapers] = useState<Paper[]>([]);
@@ -55,6 +56,13 @@ const App: React.FC = () => {
       setOpenPapers([...openPapers, paper]);
     }
     setActivePaperId(paper.id);
+  };
+
+  const handleUpdatePaper = (paperId: string, updates: Partial<Paper>) => {
+    setPapers((prev) => prev.map((paper) => (paper.id === paperId ? { ...paper, ...updates } : paper)));
+    setOpenPapers((prev) =>
+      prev.map((paper) => (paper.id === paperId ? { ...paper, ...updates } : paper))
+    );
   };
 
   const handleCloseTab = (e: React.MouseEvent, paperId: string) => {
@@ -100,59 +108,13 @@ const App: React.FC = () => {
     const fileData = await file.arrayBuffer();
     const id = `p-${Date.now()}`;
     const fallbackTitle = file.name.replace(/\.pdf$/i, '');
-    let parsedTitle = fallbackTitle;
-    let parsedAuthor = 'Unknown';
-    let parsedSummary = 'Uploaded PDF';
-    let parsedKeywords: string[] = [];
-    let parsedDate = new Date().toISOString().slice(0, 10);
-
-    let parseWithAI = false;
-    let canUseAI = false;
-    if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
-      try {
-        const settings = await window.electronAPI.settingsGet();
-        parseWithAI = Boolean(settings?.parsePdfWithAI);
-        canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
-      } catch {
-        parseWithAI = false;
-        canUseAI = false;
-      }
-    }
-
-    if (parseWithAI && canUseAI) {
-      try {
-        const firstPageText = await extractPdfFirstPageText(fileData);
-        const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
-        parsedTitle = aiMetadata.title || fallbackTitle;
-        parsedAuthor = aiMetadata.author || 'Unknown';
-        parsedSummary = aiMetadata.summary || 'No abstract extracted.';
-        parsedKeywords = aiMetadata.keywords || [];
-        parsedDate = aiMetadata.publishedDate || parsedDate;
-      } catch (error) {
-        console.warn('AI解析失败，回退传统解析:', error);
-        try {
-          const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
-          parsedTitle = parsed.metadata.title || fallbackTitle;
-          parsedAuthor = parsed.metadata.author || 'Unknown';
-          parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
-          parsedKeywords = parsed.metadata.keywords || [];
-          parsedDate = parsed.metadata.publishedDate || parsedDate;
-        } catch (fallbackError) {
-          console.warn('传统解析也失败，使用默认信息:', fallbackError);
-        }
-      }
-    } else {
-      try {
-        const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
-        parsedTitle = parsed.metadata.title || fallbackTitle;
-        parsedAuthor = parsed.metadata.author || 'Unknown';
-        parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
-        parsedKeywords = parsed.metadata.keywords || [];
-        parsedDate = parsed.metadata.publishedDate || parsedDate;
-      } catch (error) {
-        console.warn('PDF首页解析失败，使用默认信息:', error);
-      }
-    }
+    const formatNowDate = () => {
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = now.getMonth() + 1;
+      const day = now.getDate();
+      return `${year}年${month}月${day}日`;
+    };
     const assignedFolderId =
       folderId === SYSTEM_FOLDER_ALL_ID ? SYSTEM_FOLDER_ALL_ID : folderId;
     let filePath: string | undefined;
@@ -162,25 +124,102 @@ const App: React.FC = () => {
         filePath = response.filePath;
       }
     }
-    const nextPaper: Paper = {
+
+    const pendingPaper: Paper = {
       id,
-      title: parsedTitle,
-      author: parsedAuthor,
-      date: parsedDate,
+      title: fallbackTitle,
+      author: 'Unknown',
+      date: formatNowDate(),
       folderId: assignedFolderId,
-      summary: parsedSummary,
+      summary: 'Uploaded PDF',
       content: '',
-      keywords: parsedKeywords,
+      keywords: [],
+      publisher: '',
       fileUrl: filePath ? undefined : URL.createObjectURL(file),
       fileData: filePath ? undefined : fileData,
-      filePath
+      filePath,
+      isParsing: true
     };
 
     pdfFileCacheRef.current.set(id, { data: fileData.slice(0) });
     setPdfFileMap((prev) => ({ ...prev, [id]: { data: fileData.slice(0) } }));
-    setPapers(prev => [nextPaper, ...prev]);
+    setPapers((prev) => [pendingPaper, ...prev]);
 
-    return nextPaper;
+    const updateParsedPaper = (updates: Partial<Paper>) => {
+      setPapers((prev) =>
+        prev.map((paper) => (paper.id === id ? { ...paper, ...updates, isParsing: false } : paper))
+      );
+      setOpenPapers((prev) =>
+        prev.map((paper) => (paper.id === id ? { ...paper, ...updates, isParsing: false } : paper))
+      );
+    };
+
+    (async () => {
+      let parsedTitle = fallbackTitle;
+      let parsedAuthor = 'Unknown';
+      let parsedSummary = 'Uploaded PDF';
+      let parsedKeywords: string[] = [];
+      let parsedDate = formatNowDate();
+      let parsedPublisher = '';
+      let parseWithAI = false;
+      let canUseAI = false;
+      if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
+        try {
+          const settings = await window.electronAPI.settingsGet();
+          parseWithAI = Boolean(settings?.parsePdfWithAI);
+          canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
+        } catch {
+          parseWithAI = false;
+          canUseAI = false;
+        }
+      }
+
+      if (parseWithAI && canUseAI) {
+        try {
+          const firstPageText = await extractPdfFirstPageText(fileData);
+          const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+          parsedTitle = aiMetadata.title || fallbackTitle;
+          parsedAuthor = aiMetadata.author || 'Unknown';
+          parsedSummary = aiMetadata.summary || 'No abstract extracted.';
+          parsedKeywords = aiMetadata.keywords || [];
+          parsedDate = aiMetadata.publishedDate || parsedDate;
+          parsedPublisher = aiMetadata.publisher || parsedPublisher;
+          updateParsedPaper({
+            title: parsedTitle,
+            author: parsedAuthor,
+            summary: parsedSummary,
+            keywords: parsedKeywords,
+            date: parsedDate,
+            publisher: parsedPublisher
+          });
+          return;
+        } catch (error) {
+          console.warn('AI解析失败，回退传统解析:', error);
+        }
+      }
+
+      try {
+        const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
+        parsedTitle = parsed.metadata.title || fallbackTitle;
+        parsedAuthor = parsed.metadata.author || 'Unknown';
+        parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
+        parsedKeywords = parsed.metadata.keywords || [];
+        parsedDate = parsed.metadata.publishedDate || parsedDate;
+        parsedPublisher = parsed.metadata.publisher || parsedPublisher;
+      } catch (error) {
+        console.warn('PDF首页解析失败，使用默认信息:', error);
+      }
+      updateParsedPaper({
+        title: parsedTitle,
+        author: parsedAuthor,
+        summary: parsedSummary,
+        keywords: parsedKeywords,
+        date: parsedDate,
+        publisher: parsedPublisher
+      });
+    })();
+
+    return pendingPaper;
   };
 
   const getCachedPdfFile = (paper: Paper) => {
@@ -243,6 +282,12 @@ const App: React.FC = () => {
     const trashIds = papers.filter((paper) => paper.folderId === SYSTEM_FOLDER_TRASH_ID).map((paper) => paper.id);
     if (!trashIds.length) return;
     const trashSet = new Set(trashIds);
+    if (typeof window !== 'undefined' && window.electronAPI?.library?.deletePapers) {
+      const items = papers
+        .filter((paper) => trashSet.has(paper.id))
+        .map((paper) => ({ id: paper.id, filePath: paper.filePath }));
+      window.electronAPI.library.deletePapers({ items }).catch(() => null);
+    }
     trashIds.forEach((id) => pdfFileCacheRef.current.delete(id));
     setPdfFileMap((prev) => {
       const next = { ...prev };
@@ -281,6 +326,30 @@ const App: React.FC = () => {
           : paper
       )
     );
+  };
+
+  const handleDeletePaper = (paperId: string) => {
+    const targetPaper = papers.find((paper) => paper.id === paperId);
+    if (typeof window !== 'undefined' && window.electronAPI?.library?.deletePaper) {
+      window.electronAPI.library
+        .deletePaper({ paperId, filePath: targetPaper?.filePath })
+        .catch(() => null);
+    }
+    pdfFileCacheRef.current.delete(paperId);
+    setPdfFileMap((prev) => {
+      if (!prev[paperId]) return prev;
+      const next = { ...prev };
+      delete next[paperId];
+      return next;
+    });
+    setPapers((prev) => prev.filter((paper) => paper.id !== paperId));
+    setOpenPapers((prev) => {
+      const next = prev.filter((paper) => paper.id !== paperId);
+      if (activePaperId === paperId) {
+        setActivePaperId(next.length ? next[next.length - 1].id : null);
+      }
+      return next;
+    });
   };
 
   const handleMovePaperToFolder = (paperId: string, targetFolderId: string) => {
@@ -334,27 +403,38 @@ const App: React.FC = () => {
     );
   };
 
+  const loadLibrary = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.library) {
+      setPapers(MOCK_PAPERS);
+      setFolders(INITIAL_FOLDERS);
+      setOpenPapers([]);
+      setActivePaperId(null);
+      return;
+    }
+    const savedFolders = await window.electronAPI.library.getFolders();
+    const nextFolders =
+      Array.isArray(savedFolders) && savedFolders.length
+        ? ensureSystemFolders(savedFolders)
+        : ensureSystemFolders(INITIAL_FOLDERS);
+    const savedPapers = await window.electronAPI.library.getPapers();
+    const nextPapers =
+      Array.isArray(savedPapers) && savedPapers.length ? savedPapers : [];
+    setFolders(nextFolders);
+    setPapers(nextPapers);
+    setOpenPapers((prev) => {
+      if (!nextPapers.length) return [];
+      const map = new Map(nextPapers.map((paper) => [paper.id, paper]));
+      return prev
+        .filter((paper) => map.has(paper.id))
+        .map((paper) => map.get(paper.id) || paper);
+    });
+    setActivePaperId((prev) =>
+      prev && nextPapers.some((paper) => paper.id === prev) ? prev : null
+    );
+    setLibraryLoaded(true);
+  };
+
   useEffect(() => {
-    const loadLibrary = async () => {
-      if (typeof window === 'undefined' || !window.electronAPI?.library) {
-        setPapers(MOCK_PAPERS);
-        setFolders(INITIAL_FOLDERS);
-        return;
-      }
-      const savedFolders = await window.electronAPI.library.getFolders();
-      if (Array.isArray(savedFolders) && savedFolders.length) {
-        setFolders(ensureSystemFolders(savedFolders));
-      } else {
-        setFolders(ensureSystemFolders(INITIAL_FOLDERS));
-      }
-      const savedPapers = await window.electronAPI.library.getPapers();
-      if (Array.isArray(savedPapers) && savedPapers.length) {
-        setPapers(savedPapers);
-      } else {
-        setPapers([]);
-      }
-      setLibraryLoaded(true);
-    };
     loadLibrary();
   }, []);
 
@@ -399,6 +479,8 @@ const App: React.FC = () => {
       setSettingsForm((prev) => ({ ...prev, ...data }));
       setSettingsSaved(true);
       window.setTimeout(() => setSettingsSaved(false), 1500);
+      setSettingsOpen(false);
+      await loadLibrary();
     } catch (error: any) {
       setSettingsError(error?.message || '设置保存失败');
     } finally {
@@ -489,6 +571,7 @@ const App: React.FC = () => {
             onEmptyTrash={handleEmptyTrash}
             onMovePapersToTrash={handleMovePapersToTrash}
             onMovePaperToTrash={handleMovePaperToTrash}
+            onDeletePaper={handleDeletePaper}
             onMovePaperToFolder={handleMovePaperToFolder}
             onRestorePaper={handleRestorePaper}
           />
@@ -501,7 +584,8 @@ const App: React.FC = () => {
                 <ReaderView 
                   paper={paper}
                   pdfFile={getCachedPdfFile(paper)}
-                  onBack={switchToLibrary} 
+                  onBack={switchToLibrary}
+                  onUpdatePaper={handleUpdatePaper}
                 />
               </div>
             );
@@ -523,102 +607,98 @@ const App: React.FC = () => {
             </div>
 
             <div className="space-y-3">
-              <div>
-                <div className="text-xs text-gray-500 mb-1">翻译引擎</div>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((prev) => ({ ...prev, translationEngine: 'cnki' }))
-                    }
-                    className={`px-2.5 py-1 rounded-md text-xs border ${
-                      settingsForm.translationEngine === 'cnki'
-                        ? 'bg-gray-900 text-white border-gray-900'
-                        : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
-                    }`}
-                  >
-                    CNKI
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((prev) => ({ ...prev, translationEngine: 'openai' }))
-                    }
-                    className={`px-2.5 py-1 rounded-md text-xs border ${
-                      settingsForm.translationEngine === 'openai'
-                        ? 'bg-gray-900 text-white border-gray-900'
-                        : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'
-                    }`}
-                  >
-                    OpenAI
-                  </button>
-                </div>
-              </div>
-
               <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">OpenAI API Key</label>
+                <label className="text-xs text-gray-500">API KEY</label>
                 <input
                   type="password"
                   value={settingsForm.apiKey}
                   onChange={(e) =>
                     setSettingsForm((prev) => ({ ...prev, apiKey: e.target.value }))
                   }
-                  disabled={settingsForm.translationEngine !== 'openai'}
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="sk-..."
                 />
               </div>
 
               <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">OpenAI Base URL</label>
+                <label className="text-xs text-gray-500">API URL</label>
                 <input
                   type="text"
                   value={settingsForm.baseUrl}
                   onChange={(e) =>
                     setSettingsForm((prev) => ({ ...prev, baseUrl: e.target.value }))
                   }
-                  disabled={settingsForm.translationEngine !== 'openai'}
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="https://api.openai.com/v1"
                 />
               </div>
 
               <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">OpenAI Model</label>
+                <label className="text-xs text-gray-500">模型</label>
                 <input
                   type="text"
                   value={settingsForm.model}
                   onChange={(e) =>
                     setSettingsForm((prev) => ({ ...prev, model: e.target.value }))
                   }
-                  disabled={settingsForm.translationEngine !== 'openai'}
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="gpt-3.5-turbo"
                 />
               </div>
 
-              <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
-                <div>
-                  <div className="text-xs text-gray-700">使用 AI 解析 PDF 信息</div>
-                  <div className="text-[11px] text-gray-400 mt-0.5">
-                    开启后上传新 PDF 优先使用 AI 解析标题、作者、摘要、关键词
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setSettingsForm((prev) => ({ ...prev, parsePdfWithAI: !prev.parsePdfWithAI }))
+              <div className="grid grid-cols-1 gap-2">
+                <label className="text-xs text-gray-500">数据保存路径</label>
+                <input
+                  type="text"
+                  value={settingsForm.libraryPath}
+                  onChange={(e) =>
+                    setSettingsForm((prev) => ({ ...prev, libraryPath: e.target.value }))
                   }
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    settingsForm.parsePdfWithAI ? 'bg-emerald-500' : 'bg-gray-300'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                      settingsForm.parsePdfWithAI ? 'translate-x-5' : 'translate-x-1'
+                  className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
+                  placeholder="/Users/you/Library/MindPaper"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                  <div className="text-xs text-gray-700">AI翻译</div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSettingsForm((prev) => ({
+                        ...prev,
+                        translationEngine: prev.translationEngine === 'openai' ? 'cnki' : 'openai'
+                      }))
+                    }
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      settingsForm.translationEngine === 'openai' ? 'bg-emerald-500' : 'bg-gray-300'
                     }`}
-                  />
-                </button>
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                        settingsForm.translationEngine === 'openai' ? 'translate-x-5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+                <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                  <div className="text-xs text-gray-700">AI解析</div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSettingsForm((prev) => ({ ...prev, parsePdfWithAI: !prev.parsePdfWithAI }))
+                    }
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      settingsForm.parsePdfWithAI ? 'bg-emerald-500' : 'bg-gray-300'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                        settingsForm.parsePdfWithAI ? 'translate-x-5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -628,7 +708,7 @@ const App: React.FC = () => {
 
             <div className="mt-4 flex items-center justify-between">
               <div className="text-[11px] text-gray-400">
-                CNKI 不需要配置；OpenAI 需填写 Key / Base URL。
+                开启 AI 功能需填写 API KEY / URL / 模型。
               </div>
               <button
                 type="button"

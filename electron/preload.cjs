@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     readPdf: (payload) => ipcRenderer.invoke('library-read-pdf', payload),
     getPaperState: (paperId) => ipcRenderer.invoke('library-get-paper-state', { paperId }),
     savePaperState: (paperId, state) =>
-      ipcRenderer.invoke('library-save-paper-state', { paperId, state })
+      ipcRenderer.invoke('library-save-paper-state', { paperId, state }),
+    deletePaper: (payload) => ipcRenderer.invoke('library-delete-paper', payload),
+    deletePapers: (payload) => ipcRenderer.invoke('library-delete-papers', payload)
   }
 });

@@ -11,6 +11,7 @@ type ParsedMetadata = {
   summary: string;
   keywords: string[];
   publishedDate?: string;
+  publisher?: string;
 };
 
 type LineItem = {
@@ -154,14 +155,14 @@ const MONTH_MAP: Record<string, number> = {
   december: 12
 };
 
-const formatIsoDate = (year: number, month?: number, day?: number) => {
+const formatZhDate = (year: number, month?: number, day?: number) => {
   if (!year || year < 1900 || year > 2100) return '';
-  if (!month) return String(year);
-  if (month < 1 || month > 12) return String(year);
+  if (!month) return `${year}年`;
+  if (month < 1 || month > 12) return `${year}年`;
   if (!day || day < 1 || day > 31) {
-    return `${year}-${String(month).padStart(2, '0')}-01`;
+    return `${year}年${month}月`;
   }
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return `${year}年${month}月${day}日`;
 };
 
 const parseDateFromText = (text: string) => {
@@ -170,7 +171,7 @@ const parseDateFromText = (text: string) => {
 
   const isoMatch = normalized.match(/\b(19|20)\d{2}[./-](0?[1-9]|1[0-2])[./-](0?[1-9]|[12]\d|3[01])\b/);
   if (isoMatch) {
-    return formatIsoDate(Number(isoMatch[0].slice(0, 4)), Number(isoMatch[2]), Number(isoMatch[3]));
+    return formatZhDate(Number(isoMatch[0].slice(0, 4)), Number(isoMatch[2]), Number(isoMatch[3]));
   }
 
   const monthDayYear = normalized.match(
@@ -178,7 +179,7 @@ const parseDateFromText = (text: string) => {
   );
   if (monthDayYear) {
     const month = MONTH_MAP[monthDayYear[1].toLowerCase()];
-    return formatIsoDate(Number(monthDayYear[3]), month, Number(monthDayYear[2]));
+    return formatZhDate(Number(monthDayYear[3]), month, Number(monthDayYear[2]));
   }
 
   const dayMonthYear = normalized.match(
@@ -186,12 +187,12 @@ const parseDateFromText = (text: string) => {
   );
   if (dayMonthYear) {
     const month = MONTH_MAP[dayMonthYear[2].toLowerCase()];
-    return formatIsoDate(Number(dayMonthYear[3]), month, Number(dayMonthYear[1]));
+    return formatZhDate(Number(dayMonthYear[3]), month, Number(dayMonthYear[1]));
   }
 
   const yearOnly = normalized.match(/\b((?:19|20)\d{2})\b/);
   if (yearOnly) {
-    return formatIsoDate(Number(yearOnly[1]));
+    return formatZhDate(Number(yearOnly[1]));
   }
 
   return '';
@@ -233,18 +234,42 @@ const parseJsonCandidate = (raw: string) => {
   return raw.trim();
 };
 
-export const extractPdfFirstPageMetadata = async (
-  fileData: ArrayBuffer,
-  fallbackTitle: string
-): Promise<{ metadata: ParsedMetadata; firstPageText: string }> => {
-  ensureWorker();
-  const loadingTask = pdfjs.getDocument({ data: fileData.slice(0) });
-  const doc = await loadingTask.promise;
-  const page = await doc.getPage(1);
-  const textContent = await page.getTextContent();
-  const lines = buildLines(textContent.items || []);
-  const firstPageText = lines.map((line) => line.text).join('\n');
+const extractPublisher = (lines: LineItem[], title: string) => {
+  const titleTokens = new Set(tokenizeForMatch(title));
+  const candidates: Array<{ text: string; score: number }> = [];
+  const patterns: Array<{ regex: RegExp; score: number }> = [
+    { regex: /(journal|transactions|proceedings|conference|symposium|workshop|arxiv|preprint)/i, score: 40 },
+    { regex: /(ieee|acm|springer|elsevier|wiley|nature|science|neurips|icml|iclr|cvpr|aaai)/i, score: 35 },
+    { regex: /(出版社|期刊|学报|会议|杂志|论文集|大会|研究会)/, score: 30 }
+  ];
 
+  lines.slice(0, 40).forEach((line, index) => {
+    const value = String(line.text || '').trim();
+    if (!value || value.length < 4 || value.length > 160) return;
+    if (/@/.test(value)) return;
+    if (/^(abstract|摘要|keywords?|关键[词字])\b[:：]?/i.test(value)) return;
+    let score = 5;
+    patterns.forEach(({ regex, score: bonus }) => {
+      if (regex.test(value)) score += bonus;
+    });
+    if (index < 10) score += 5;
+    if (titleTokens.size) {
+      const tokens = new Set(tokenizeForMatch(value));
+      const similarity = jaccardSimilarity(tokens, titleTokens);
+      if (similarity >= 0.45) score -= 20;
+    }
+    if (score >= 20) {
+      candidates.push({ text: value, score });
+    }
+  });
+
+  if (!candidates.length) return '';
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0].text;
+};
+
+const extractMetadataFromLines = (lines: LineItem[], fallbackTitle: string) => {
+  const firstPageText = lines.map((line) => line.text).join('\n');
   const abstractLineIndex = lines.findIndex((line) => /^(abstract|摘要)\b[:：]?\s*/i.test(line.text));
   const keywordLineIndex = lines.findIndex((line) => /^(keywords?|关键[词字])\b[:：]?\s*/i.test(line.text));
 
@@ -289,7 +314,6 @@ export const extractPdfFirstPageMetadata = async (
       });
       const overlapRatio = overlap / lineTokenSet.size;
       const titleSimilarity = jaccardSimilarity(lineTokenSet, titleTokenSet);
-      // Drop probable title continuation lines that leaked into author block.
       if (overlapRatio >= 0.6 || titleSimilarity >= 0.45) return false;
       return true;
     });
@@ -327,7 +351,9 @@ export const extractPdfFirstPageMetadata = async (
       keywords = extractKeywords(lines[keywordLineIndex + 1].text);
     }
   }
+
   const publishedDate = extractPublishedDate(lines);
+  const publisher = extractPublisher(lines, title);
 
   return {
     metadata: {
@@ -335,10 +361,32 @@ export const extractPdfFirstPageMetadata = async (
       author: author || 'Unknown',
       summary: summary || 'No abstract extracted.',
       keywords,
-      ...(publishedDate ? { publishedDate } : {})
+      ...(publishedDate ? { publishedDate } : {}),
+      ...(publisher ? { publisher } : {})
     },
     firstPageText
   };
+};
+
+export const extractPdfFirstPageMetadata = async (
+  fileData: ArrayBuffer,
+  fallbackTitle: string
+): Promise<{ metadata: ParsedMetadata; firstPageText: string }> => {
+  ensureWorker();
+  const loadingTask = pdfjs.getDocument({ data: fileData.slice(0) });
+  const doc = await loadingTask.promise;
+  const page = await doc.getPage(1);
+  const textContent = await page.getTextContent();
+  const lines = buildLines(textContent.items || []);
+  return extractMetadataFromLines(lines, fallbackTitle);
+};
+
+export const extractPdfMetadataFromTextItems = (
+  items: any[],
+  fallbackTitle: string
+): { metadata: ParsedMetadata; firstPageText: string } => {
+  const lines = buildLines(items || []);
+  return extractMetadataFromLines(lines, fallbackTitle);
 };
 
 export const extractPdfFirstPageText = async (fileData: ArrayBuffer): Promise<string> => {
@@ -379,11 +427,14 @@ export const extractMetadataWithAI = async (
     ? parsed.keywords.map((item: unknown) => String(item || '').trim()).filter(Boolean)
     : [];
   const publishedDate = String(parsed?.publishedDate || '').trim();
+  const publisher =
+    String(parsed?.publisher || parsed?.organization || parsed?.venue || '').trim();
   return {
     ...(title ? { title: title.slice(0, 280) } : {}),
     ...(authorList.length ? { author: authorList.join(', ').slice(0, 200) } : {}),
     ...(abstractText ? { summary: abstractText.slice(0, 2400) } : {}),
     ...(keywordList.length ? { keywords: keywordList.slice(0, 12) } : {}),
-    ...(publishedDate ? { publishedDate } : {})
+    ...(publishedDate ? { publishedDate } : {}),
+    ...(publisher ? { publisher } : {})
   };
 };

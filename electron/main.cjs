@@ -7,6 +7,7 @@ const isDev = !app.isPackaged;
 const devServerURL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:3001';
 
 const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
+const DEFAULT_LIBRARY_ROOT = path.join(app.getPath('userData'), 'Library');
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-3.5-turbo';
 const TRANSLATE_SYSTEM_PROMPT =
@@ -23,18 +24,43 @@ let runtimeSettings = {
   apiKey: '',
   baseUrl: '',
   model: '',
-  parsePdfWithAI: false
+  parsePdfWithAI: false,
+  libraryPath: ''
 };
 
 let cnkiTokenCache = { token: '', t: 0 };
+
+const resolveLibraryPath = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('~')) {
+    return path.resolve(path.join(app.getPath('home'), raw.slice(1)));
+  }
+  return path.resolve(raw);
+};
 
 const sanitizeSettings = (payload = {}) => ({
   translationEngine: payload.translationEngine === 'openai' ? 'openai' : 'cnki',
   apiKey: String(payload.apiKey || '').trim(),
   baseUrl: String(payload.baseUrl || '').trim(),
   model: String(payload.model || '').trim(),
-  parsePdfWithAI: Boolean(payload.parsePdfWithAI)
+  parsePdfWithAI: Boolean(payload.parsePdfWithAI),
+  libraryPath: resolveLibraryPath(payload.libraryPath)
 });
+
+const getLibraryRoot = () => runtimeSettings.libraryPath || DEFAULT_LIBRARY_ROOT;
+
+const getLibraryPaths = () => {
+  const root = getLibraryRoot();
+  return {
+    root,
+    papersDir: path.join(root, 'papers'),
+    statesDir: path.join(root, 'states'),
+    papersPath: path.join(root, 'papers.json'),
+    foldersPath: path.join(root, 'folders.json'),
+    indexPath: path.join(root, 'index.json')
+  };
+};
 
 const loadSettings = async () => {
   if (settingsLoaded) return runtimeSettings;
@@ -45,16 +71,29 @@ const loadSettings = async () => {
   } catch (error) {
     // ignore missing/invalid settings
   }
+  if (!runtimeSettings.libraryPath) {
+    runtimeSettings.libraryPath = DEFAULT_LIBRARY_ROOT;
+  }
   settingsLoaded = true;
   return runtimeSettings;
 };
 
 const saveSettings = async (payload = {}) => {
+  const prevLibraryRoot = getLibraryRoot();
   const next = { ...runtimeSettings, ...sanitizeSettings(payload) };
+  if (!next.libraryPath) {
+    next.libraryPath = DEFAULT_LIBRARY_ROOT;
+  }
   runtimeSettings = next;
   settingsLoaded = true;
   await fs.mkdir(path.dirname(SETTINGS_PATH), { recursive: true });
   await fs.writeFile(SETTINGS_PATH, JSON.stringify(runtimeSettings, null, 2), 'utf8');
+
+  const nextLibraryRoot = getLibraryRoot();
+  if (prevLibraryRoot !== nextLibraryRoot) {
+    await migrateLibrary(prevLibraryRoot, nextLibraryRoot);
+  }
+
   return runtimeSettings;
 };
 
@@ -231,17 +270,12 @@ const cnkiTranslateWithRetry = async (text, maxAttempts = 10) => {
   throw lastError || new Error('CNKI翻译失败');
 };
 
-const LIBRARY_ROOT = path.join(app.getPath('userData'), 'Library');
-const LIBRARY_PAPERS_DIR = path.join(LIBRARY_ROOT, 'papers');
-const LIBRARY_STATES_DIR = path.join(LIBRARY_ROOT, 'states');
-const LIBRARY_PAPERS_PATH = path.join(LIBRARY_ROOT, 'papers.json');
-const LIBRARY_FOLDERS_PATH = path.join(LIBRARY_ROOT, 'folders.json');
-const LIBRARY_INDEX_PATH = path.join(LIBRARY_ROOT, 'index.json');
-
 const ensureLibrary = async () => {
-  await fs.mkdir(LIBRARY_ROOT, { recursive: true });
-  await fs.mkdir(LIBRARY_PAPERS_DIR, { recursive: true });
-  await fs.mkdir(LIBRARY_STATES_DIR, { recursive: true });
+  await loadSettings();
+  const paths = getLibraryPaths();
+  await fs.mkdir(paths.root, { recursive: true });
+  await fs.mkdir(paths.papersDir, { recursive: true });
+  await fs.mkdir(paths.statesDir, { recursive: true });
 };
 
 const readJsonFile = async (filePath, fallback) => {
@@ -260,6 +294,63 @@ const writeJsonFile = async (filePath, data) => {
   await fs.rename(tmpPath, filePath);
 };
 
+const removeFileIfExists = async (filePath) => {
+  const target = String(filePath || '').trim();
+  if (!target) return;
+  try {
+    await fs.rm(target, { force: true });
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+};
+
+const updatePaperPaths = (papers, fromRoot, toRoot) => {
+  if (!Array.isArray(papers)) return [];
+  return papers.map((paper) => {
+    if (!paper || typeof paper !== 'object') return paper;
+    const filePath = String(paper.filePath || '');
+    if (filePath && filePath.startsWith(fromRoot)) {
+      const relative = path.relative(fromRoot, filePath);
+      return { ...paper, filePath: path.join(toRoot, relative) };
+    }
+    return paper;
+  });
+};
+
+const migrateLibrary = async (fromRoot, toRoot) => {
+  const source = String(fromRoot || '').trim();
+  const target = String(toRoot || '').trim();
+  if (!source || !target || source === target) return;
+
+  try {
+    await fs.access(source);
+  } catch {
+    await fs.mkdir(target, { recursive: true });
+    return;
+  }
+
+  await fs.mkdir(target, { recursive: true });
+
+  try {
+    await fs.rename(source, target);
+  } catch {
+    try {
+      await fs.cp(source, target, { recursive: true });
+    } catch (error) {
+      throw new Error(`迁移数据失败: ${error?.message || error}`);
+    }
+  }
+
+  const newPapersPath = path.join(target, 'papers.json');
+  const papers = await readJsonFile(newPapersPath, null);
+  if (papers) {
+    const updated = updatePaperPaths(papers, source, target);
+    await writeJsonFile(newPapersPath, updated);
+  }
+};
+
 const openaiTranslate = async (text, settings) => {
   return openaiChatCompletion(
     [
@@ -271,7 +362,10 @@ const openaiTranslate = async (text, settings) => {
   );
 };
 
-ipcMain.handle('settings-get', async () => loadSettings());
+ipcMain.handle('settings-get', async () => {
+  const settings = await loadSettings();
+  return { ...settings, libraryPath: getLibraryRoot() };
+});
 ipcMain.handle('settings-set', async (_event, payload = {}) => saveSettings(payload));
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
@@ -325,23 +419,27 @@ ipcMain.handle('ask-ai', async (_event, payload = {}) => {
 
 ipcMain.handle('library-get-folders', async () => {
   await ensureLibrary();
-  return readJsonFile(LIBRARY_FOLDERS_PATH, null);
+  const paths = getLibraryPaths();
+  return readJsonFile(paths.foldersPath, null);
 });
 
 ipcMain.handle('library-save-folders', async (_event, payload = []) => {
   await ensureLibrary();
-  await writeJsonFile(LIBRARY_FOLDERS_PATH, Array.isArray(payload) ? payload : []);
+  const paths = getLibraryPaths();
+  await writeJsonFile(paths.foldersPath, Array.isArray(payload) ? payload : []);
   return { ok: true };
 });
 
 ipcMain.handle('library-get-papers', async () => {
   await ensureLibrary();
-  return readJsonFile(LIBRARY_PAPERS_PATH, null);
+  const paths = getLibraryPaths();
+  return readJsonFile(paths.papersPath, null);
 });
 
 ipcMain.handle('library-save-papers', async (_event, payload = []) => {
   await ensureLibrary();
-  await writeJsonFile(LIBRARY_PAPERS_PATH, Array.isArray(payload) ? payload : []);
+  const paths = getLibraryPaths();
+  await writeJsonFile(paths.papersPath, Array.isArray(payload) ? payload : []);
   return { ok: true };
 });
 
@@ -349,22 +447,24 @@ ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {
   const paperId = String(payload.paperId || '').trim();
   if (!paperId) return { ok: false, error: '缺少paperId' };
   await ensureLibrary();
+  const paths = getLibraryPaths();
   const data = payload.data;
   if (!data) return { ok: false, error: '缺少PDF数据' };
   const buffer = Buffer.from(new Uint8Array(data));
-  const filePath = path.join(LIBRARY_PAPERS_DIR, `${paperId}.pdf`);
+  const filePath = path.join(paths.papersDir, `${paperId}.pdf`);
   await fs.writeFile(filePath, buffer);
-  await writeJsonFile(LIBRARY_INDEX_PATH, { updatedAt: Date.now() });
+  await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
   return { ok: true, filePath };
 });
 
 ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
   await ensureLibrary();
+  const paths = getLibraryPaths();
   const filePath = payload.filePath ? String(payload.filePath) : '';
   const paperId = payload.paperId ? String(payload.paperId) : '';
   let resolvedPath = filePath;
   if (!resolvedPath && paperId) {
-    const papers = await readJsonFile(LIBRARY_PAPERS_PATH, []);
+    const papers = await readJsonFile(paths.papersPath, []);
     const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
     resolvedPath = entry?.filePath || '';
   }
@@ -381,18 +481,62 @@ ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
 
 ipcMain.handle('library-get-paper-state', async (_event, payload = {}) => {
   await ensureLibrary();
+  const paths = getLibraryPaths();
   const paperId = String(payload.paperId || '').trim();
   if (!paperId) return null;
-  const statePath = path.join(LIBRARY_STATES_DIR, `${paperId}.json`);
+  const statePath = path.join(paths.statesDir, `${paperId}.json`);
   return readJsonFile(statePath, null);
 });
 
 ipcMain.handle('library-save-paper-state', async (_event, payload = {}) => {
   await ensureLibrary();
+  const paths = getLibraryPaths();
   const paperId = String(payload.paperId || '').trim();
   if (!paperId) return { ok: false, error: '缺少paperId' };
-  const statePath = path.join(LIBRARY_STATES_DIR, `${paperId}.json`);
+  const statePath = path.join(paths.statesDir, `${paperId}.json`);
   await writeJsonFile(statePath, payload.state || {});
+  return { ok: true };
+});
+
+ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
+  await ensureLibrary();
+  const paths = getLibraryPaths();
+  const paperId = String(payload.paperId || '').trim();
+  if (!paperId) return { ok: false, error: '缺少paperId' };
+  let resolvedPath = payload.filePath ? String(payload.filePath) : '';
+  if (!resolvedPath) {
+    const papers = await readJsonFile(paths.papersPath, []);
+    const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
+    resolvedPath = entry?.filePath || '';
+  }
+  await removeFileIfExists(resolvedPath);
+  await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
+  return { ok: true };
+});
+
+ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
+  await ensureLibrary();
+  const paths = getLibraryPaths();
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const ids = items
+    .map((item) => String(item?.id || '').trim())
+    .filter(Boolean);
+  if (!ids.length) return { ok: true };
+  const papers = await readJsonFile(paths.papersPath, []);
+  const paperMap = new Map(
+    Array.isArray(papers) ? papers.map((paper) => [paper.id, paper]) : []
+  );
+  for (const item of items) {
+    const paperId = String(item?.id || '').trim();
+    if (!paperId) continue;
+    let resolvedPath = item?.filePath ? String(item.filePath) : '';
+    if (!resolvedPath) {
+      const entry = paperMap.get(paperId);
+      resolvedPath = entry?.filePath || '';
+    }
+    await removeFileIfExists(resolvedPath);
+    await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
+  }
   return { ok: true };
 });
 
