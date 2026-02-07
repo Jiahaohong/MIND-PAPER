@@ -2317,7 +2317,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         customChapters,
         questions,
         aiConversations: chatThreads,
-        activeChatId
+        activeChatId,
+        updatedAt: Date.now()
       });
     }, 400);
     return () => {

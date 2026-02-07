@@ -36,6 +36,7 @@ const App: React.FC = () => {
   const [settingsSaved, setSettingsSaved] = useState(false);
 
   const activePaper = openPapers.find(p => p.id === activePaperId);
+  const MAX_FULL_PDF_CACHE = 20;
   const systemFolders = [
     { id: SYSTEM_FOLDER_ALL_ID, name: '所有文档', parentId: null, children: [] },
     { id: SYSTEM_FOLDER_TRASH_ID, name: '回收站', parentId: null, children: [] }
@@ -141,8 +142,6 @@ const App: React.FC = () => {
       isParsing: true
     };
 
-    pdfFileCacheRef.current.set(id, { data: fileData.slice(0) });
-    setPdfFileMap((prev) => ({ ...prev, [id]: { data: fileData.slice(0) } }));
     setPapers((prev) => [pendingPaper, ...prev]);
 
     const updateParsedPaper = (updates: Partial<Paper>) => {
@@ -225,18 +224,70 @@ const App: React.FC = () => {
   const getCachedPdfFile = (paper: Paper) => {
     const cache = pdfFileCacheRef.current;
     const mapped = pdfFileMap[paper.id];
-    if (mapped) return mapped;
+    if (mapped) {
+      if (cache.has(paper.id)) {
+        const existing = cache.get(paper.id);
+        if (existing) {
+          cache.delete(paper.id);
+          cache.set(paper.id, existing);
+        }
+      }
+      return mapped;
+    }
     const existing = cache.get(paper.id);
-    if (existing) return existing;
+    if (existing) {
+      cache.delete(paper.id);
+      cache.set(paper.id, existing);
+      setPdfFileMap((prev) => ({ ...prev, [paper.id]: existing }));
+      return existing;
+    }
     if (paper.fileData) {
       const cached = { data: paper.fileData.slice(0) };
+      cache.delete(paper.id);
       cache.set(paper.id, cached);
       setPdfFileMap((prev) => ({ ...prev, [paper.id]: cached }));
+      if (cache.size > MAX_FULL_PDF_CACHE) {
+        const toRemove: string[] = [];
+        while (cache.size > MAX_FULL_PDF_CACHE) {
+          const oldest = cache.keys().next().value as string | undefined;
+          if (!oldest) break;
+          cache.delete(oldest);
+          toRemove.push(oldest);
+        }
+        if (toRemove.length) {
+          setPdfFileMap((prev) => {
+            const next = { ...prev };
+            toRemove.forEach((id) => {
+              delete next[id];
+            });
+            return next;
+          });
+        }
+      }
       return cached;
     }
     if (paper.fileUrl) {
+      cache.delete(paper.id);
       cache.set(paper.id, paper.fileUrl);
       setPdfFileMap((prev) => ({ ...prev, [paper.id]: paper.fileUrl as string }));
+      if (cache.size > MAX_FULL_PDF_CACHE) {
+        const toRemove: string[] = [];
+        while (cache.size > MAX_FULL_PDF_CACHE) {
+          const oldest = cache.keys().next().value as string | undefined;
+          if (!oldest) break;
+          cache.delete(oldest);
+          toRemove.push(oldest);
+        }
+        if (toRemove.length) {
+          setPdfFileMap((prev) => {
+            const next = { ...prev };
+            toRemove.forEach((id) => {
+              delete next[id];
+            });
+            return next;
+          });
+        }
+      }
       return paper.fileUrl;
     }
     if (
@@ -262,8 +313,28 @@ const App: React.FC = () => {
                 arrayBuffer = response.data as ArrayBuffer;
               }
               const cached = { data: arrayBuffer };
-              pdfFileCacheRef.current.set(paper.id, cached);
+              const nextCache = pdfFileCacheRef.current;
+              nextCache.delete(paper.id);
+              nextCache.set(paper.id, cached);
               setPdfFileMap((prev) => ({ ...prev, [paper.id]: cached }));
+              if (nextCache.size > MAX_FULL_PDF_CACHE) {
+                const toRemove: string[] = [];
+                while (nextCache.size > MAX_FULL_PDF_CACHE) {
+                  const oldest = nextCache.keys().next().value as string | undefined;
+                  if (!oldest) break;
+                  nextCache.delete(oldest);
+                  toRemove.push(oldest);
+                }
+                if (toRemove.length) {
+                  setPdfFileMap((prev) => {
+                    const next = { ...prev };
+                    toRemove.forEach((id) => {
+                      delete next[id];
+                    });
+                    return next;
+                  });
+                }
+              }
             }
           })
           .finally(() => {

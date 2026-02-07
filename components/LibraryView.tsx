@@ -13,12 +13,436 @@ import {
 import { Tooltip } from './Tooltip';
 import { Folder, Paper } from '../types';
 import { SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from '../constants';
-import { Document, Page, pdfjs } from 'react-pdf';
+import { pdfjs } from 'react-pdf';
+import { MindMap, type MindMapLayout, type MindMapNode } from './MindMap';
+import type { PDFDocumentProxy } from 'pdfjs-dist';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
 ).toString();
+
+const CHAPTER_START_TOLERANCE = 0.03;
+const MAX_THUMBNAIL_CACHE = 100;
+
+type OutlineNode = {
+  id: string;
+  title: string;
+  pageIndex: number | null;
+  topRatio: number | null;
+  items: OutlineNode[];
+  isRoot?: boolean;
+  isCustom?: boolean;
+  parentId?: string | null;
+};
+
+type HighlightRect = {
+  pageIndex: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+type HighlightItem = {
+  id: string;
+  text: string;
+  color: string;
+  pageIndex: number;
+  rects: HighlightRect[];
+  chapterId: string;
+  isChapterTitle: boolean;
+  translation?: string;
+};
+
+const resolveOutlineDestination = async (
+  doc: PDFDocumentProxy,
+  dest: unknown,
+  pageViewports: Map<number, any>
+) => {
+  if (!dest) return { pageIndex: null as number | null, topRatio: null as number | null };
+  try {
+    const resolved = typeof dest === 'string' ? await doc.getDestination(dest) : dest;
+    if (!Array.isArray(resolved) || !resolved.length) {
+      return { pageIndex: null, topRatio: null };
+    }
+    const pageRef = resolved[0];
+    let pageIndex: number | null = null;
+    if (typeof pageRef === 'number') {
+      pageIndex = pageRef;
+    } else {
+      try {
+        pageIndex = await doc.getPageIndex(pageRef);
+      } catch {
+        pageIndex = null;
+      }
+    }
+    if (pageIndex == null) return { pageIndex: null, topRatio: null };
+
+    const destType = resolved[1]?.name || resolved[1]?.toString?.() || '';
+    let top: number | null = null;
+    if (destType === 'XYZ') {
+      top = typeof resolved[3] === 'number' ? resolved[3] : null;
+    } else if (destType === 'FitH' || destType === 'FitBH') {
+      top = typeof resolved[2] === 'number' ? resolved[2] : null;
+    }
+    if (top == null) return { pageIndex, topRatio: null };
+
+    let viewport = pageViewports.get(pageIndex);
+    if (!viewport) {
+      const page = await doc.getPage(pageIndex + 1);
+      viewport = page.getViewport({ scale: 1 });
+      pageViewports.set(pageIndex, viewport);
+    }
+    const [, y] = viewport.convertToViewportPoint(0, top);
+    const topPx = Math.max(0, y);
+    const topRatio = viewport.height ? Math.max(0, Math.min(1, topPx / viewport.height)) : null;
+    return { pageIndex, topRatio };
+  } catch {
+    return { pageIndex: null, topRatio: null };
+  }
+};
+
+const buildOutlineTree = async (
+  doc: PDFDocumentProxy,
+  items: any[],
+  parentId = '',
+  pageViewports: Map<number, any> = new Map()
+): Promise<OutlineNode[]> => {
+  const nodes = await Promise.all(
+    (items || []).map(async (item, index) => {
+      const id = `${parentId}${parentId ? '.' : ''}${index}`;
+      const destInfo = await resolveOutlineDestination(doc, item?.dest, pageViewports);
+      const children = item?.items?.length
+        ? await buildOutlineTree(doc, item.items, id, pageViewports)
+        : [];
+      const rawTitle = String(item?.title || '').trim();
+      const title = rawTitle || (children.length ? '未命名章节' : '');
+      return {
+        id,
+        title,
+        pageIndex: destInfo.pageIndex,
+        topRatio: destInfo.topRatio,
+        items: children
+      } as OutlineNode;
+    })
+  );
+
+  return nodes.filter((node) => node.title || node.items.length);
+};
+
+const getFlatOutlineByPosition = (nodes: OutlineNode[]) => {
+  const list: OutlineNode[] = [];
+  const walk = (items: OutlineNode[]) => {
+    items.forEach((node) => {
+      list.push(node);
+      if (node.items?.length) walk(node.items);
+    });
+  };
+  walk(nodes);
+  return list
+    .filter((node) => typeof node.pageIndex === 'number')
+    .sort((a, b) => {
+      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+      }
+      return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+    });
+};
+
+const findChapterForPosition = (
+  pageIndex: number,
+  topRatio: number,
+  sourceList: OutlineNode[]
+) => {
+  if (!sourceList.length || pageIndex == null) return null;
+  const ratio = typeof topRatio === 'number' ? topRatio : 0;
+  let candidate: OutlineNode | null = null;
+  sourceList.forEach((node) => {
+    if (node.pageIndex == null) return;
+    const nodeRatio = typeof node.topRatio === 'number' ? node.topRatio : 0;
+    const isBefore =
+      node.pageIndex < pageIndex ||
+      (node.pageIndex === pageIndex && nodeRatio <= ratio);
+    if (isBefore) {
+      candidate = node;
+    }
+  });
+
+  if (candidate?.isRoot) {
+    const samePageHeadings = sourceList
+      .filter(
+        (node) =>
+          !node.isRoot &&
+          node.pageIndex === pageIndex &&
+          typeof node.topRatio === 'number'
+      )
+      .sort((a, b) => (a.topRatio ?? 0) - (b.topRatio ?? 0));
+    if (samePageHeadings.length) {
+      const firstHeading = samePageHeadings[0];
+      if (ratio + CHAPTER_START_TOLERANCE >= (firstHeading.topRatio ?? 0)) {
+        return firstHeading;
+      }
+    }
+  }
+  return candidate;
+};
+
+const mergeOutlineWithCustom = (
+  outline: OutlineNode[],
+  customNodes: OutlineNode[],
+  baseFlat: OutlineNode[],
+  rootId: string
+) => {
+  if (!customNodes.length) return outline;
+  const cloneNodes = (nodes: OutlineNode[]) =>
+    (nodes || []).map((node) => ({
+      ...node,
+      items: cloneNodes(node.items || [])
+    }));
+  const rootItems = cloneNodes(outline);
+  const baseIds = new Set(baseFlat.map((node) => node.id));
+
+  const insertIntoParent = (nodes: OutlineNode[], parentId: string, child: OutlineNode) => {
+    for (const node of nodes) {
+      if (node.id === parentId) {
+        node.items = Array.isArray(node.items) ? [...node.items, child] : [child];
+        return true;
+      }
+      if (node.items?.length && insertIntoParent(node.items, parentId, child)) return true;
+    }
+    return false;
+  };
+
+  customNodes.forEach((node) => {
+    if (!node) return;
+    const normalized: OutlineNode = {
+      ...node,
+      items: Array.isArray(node.items) ? node.items : [],
+      isCustom: true
+    };
+    let parentId = node.parentId || null;
+    if (!parentId || !baseIds.has(parentId)) {
+      const candidate = findChapterForPosition(
+        node.pageIndex ?? 0,
+        node.topRatio ?? 0,
+        baseFlat
+      );
+      parentId = candidate?.id || rootId;
+    }
+    if (parentId && parentId !== rootId && insertIntoParent(rootItems, parentId, normalized)) {
+      return;
+    }
+    const rootNode = rootItems.find((item) => item.id === rootId);
+    if (rootNode) {
+      rootNode.items = Array.isArray(rootNode.items)
+        ? [...rootNode.items, normalized]
+        : [normalized];
+      return;
+    }
+    rootItems.push(normalized);
+  });
+
+  const sortChildren = (nodes: OutlineNode[]) => {
+    if (!nodes.length) return;
+    nodes.sort((a, b) => {
+      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+      }
+      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
+        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+      }
+      return a.title.localeCompare(b.title);
+    });
+    nodes.forEach((node) => {
+      if (node.items?.length) sortChildren(node.items);
+    });
+  };
+
+  sortChildren(rootItems);
+  return rootItems;
+};
+
+const applyParentOverrides = (
+  outline: OutlineNode[],
+  overrides: Record<string, string>
+) => {
+  if (!overrides || !Object.keys(overrides).length) return outline;
+  const cloneNodes = (nodes: OutlineNode[]) =>
+    (nodes || []).map((node) => ({
+      ...node,
+      items: cloneNodes(node.items || [])
+    }));
+  const rootItems = cloneNodes(outline);
+  const idToNode = new Map<string, OutlineNode>();
+  const idToParent = new Map<string, OutlineNode | null>();
+
+  const walk = (nodes: OutlineNode[], parent: OutlineNode | null) => {
+    nodes.forEach((node) => {
+      idToNode.set(node.id, node);
+      idToParent.set(node.id, parent);
+      if (node.items?.length) walk(node.items, node);
+    });
+  };
+  walk(rootItems, null);
+
+  const isDescendant = (ancestorId: string, targetId: string) => {
+    let current = idToParent.get(targetId) || null;
+    while (current) {
+      if (current.id === ancestorId) return true;
+      current = idToParent.get(current.id) || null;
+    }
+    return false;
+  };
+
+  Object.entries(overrides).forEach(([nodeId, nextParentId]) => {
+    if (!nodeId || !nextParentId || nodeId === nextParentId) return;
+    const node = idToNode.get(nodeId);
+    const nextParent = idToNode.get(nextParentId);
+    if (!node || !nextParent) return;
+    if (isDescendant(nodeId, nextParentId)) return;
+    const currentParent = idToParent.get(nodeId);
+    if (currentParent) {
+      currentParent.items = (currentParent.items || []).filter((item) => item.id !== nodeId);
+    } else {
+      const rootIndex = rootItems.findIndex((item) => item.id === nodeId);
+      if (rootIndex >= 0) rootItems.splice(rootIndex, 1);
+    }
+    nextParent.items = Array.isArray(nextParent.items) ? [...nextParent.items, node] : [node];
+    idToParent.set(nodeId, nextParent);
+  });
+
+  return rootItems;
+};
+
+const getHighlightSortKey = (item: HighlightItem) => {
+  const rects = item.rects || [];
+  const pageIndex =
+    item.pageIndex ?? (rects.length ? rects[0].pageIndex : 0);
+  const top = rects.length ? Math.min(...rects.map((rect) => rect.y ?? 0)) : 0;
+  return { pageIndex, top };
+};
+
+const buildMindmapRoot = (
+  outlineDisplay: OutlineNode[],
+  highlights: HighlightItem[]
+): MindMapNode | null => {
+  if (!outlineDisplay.length) return null;
+  const rootNode = outlineDisplay[0];
+  const highlightsByChapter = new Map<string, HighlightItem[]>();
+  highlights.forEach((item) => {
+    if (!item.chapterId || item.isChapterTitle) return;
+    const list = highlightsByChapter.get(item.chapterId) || [];
+    list.push(item);
+    highlightsByChapter.set(item.chapterId, list);
+  });
+  highlightsByChapter.forEach((list) => {
+    list.sort((a, b) => {
+      const aKey = getHighlightSortKey(a);
+      const bKey = getHighlightSortKey(b);
+      if (aKey.pageIndex !== bKey.pageIndex) return aKey.pageIndex - bKey.pageIndex;
+      return aKey.top - bKey.top;
+    });
+  });
+
+  const getNodeOrder = (node: OutlineNode, index: number) => ({
+    pageIndex: typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
+    ratio: typeof node.topRatio === 'number' ? node.topRatio : 0,
+    index
+  });
+
+  const getNoteOrder = (note: HighlightItem, index: number) => {
+    const key = getHighlightSortKey(note);
+    return {
+      pageIndex: typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
+      ratio: typeof key.top === 'number' ? key.top : 0,
+      index
+    };
+  };
+
+  const buildNode = (node: OutlineNode): MindMapNode => {
+    const childItems = node.items || [];
+    const childNodes = childItems.map((child) => buildNode(child));
+    const noteItems = highlightsByChapter.get(node.id) || [];
+    const noteNodes: MindMapNode[] = noteItems.map((note) => ({
+      id: `note-${note.id}`,
+      text: note.text,
+      translation: note.isChapterTitle ? '' : note.translation || '',
+      kind: 'note',
+      color: note.color,
+      pageIndex: note.pageIndex,
+      note
+    }));
+    const combined = [
+      ...childNodes.map((child, index) => ({
+        node: child,
+        order: getNodeOrder(childItems[index], index)
+      })),
+      ...noteNodes.map((note, index) => ({
+        node: note,
+        order: getNoteOrder(noteItems[index], index + childNodes.length)
+      }))
+    ]
+      .sort((a, b) => {
+        if (a.order.pageIndex !== b.order.pageIndex) {
+          return a.order.pageIndex - b.order.pageIndex;
+        }
+        if (a.order.ratio !== b.order.ratio) {
+          return a.order.ratio - b.order.ratio;
+        }
+        return a.order.index - b.order.index;
+      })
+      .map((item) => item.node);
+
+    return {
+      id: node.id,
+      text: node.title,
+      kind: node.isRoot ? 'root' : 'chapter',
+      pageIndex: node.pageIndex,
+      topRatio: node.topRatio,
+      children: combined
+    };
+  };
+
+  const rootChildren = (rootNode.items || []).map((child) => buildNode(child));
+  const rootNotes = highlightsByChapter.get(rootNode.id) || [];
+  const rootNoteNodes: MindMapNode[] = rootNotes.map((note) => ({
+    id: `note-${note.id}`,
+    text: note.text,
+    translation: note.isChapterTitle ? '' : note.translation || '',
+    kind: 'note',
+    color: note.color,
+    pageIndex: note.pageIndex,
+    note
+  }));
+  const combinedRoot = [
+    ...rootChildren.map((node, index) => ({
+      node,
+      order: getNodeOrder(rootNode.items?.[index] || rootNode, index)
+    })),
+    ...rootNoteNodes.map((node, index) => ({
+      node,
+      order: getNoteOrder(rootNotes[index], index + rootChildren.length)
+    }))
+  ]
+    .sort((a, b) => {
+      if (a.order.pageIndex !== b.order.pageIndex) {
+        return a.order.pageIndex - b.order.pageIndex;
+      }
+      if (a.order.ratio !== b.order.ratio) {
+        return a.order.ratio - b.order.ratio;
+      }
+      return a.order.index - b.order.index;
+    })
+    .map((item) => item.node);
+
+  return {
+    id: rootNode.id,
+    text: rootNode.title,
+    kind: 'root',
+    children: combinedRoot
+  };
+};
 
 interface FolderItemProps {
   folder: Folder;
@@ -237,7 +661,22 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [draggingPaperId, setDraggingPaperId] = useState<string | null>(null);
   const [dragOverFolderId, setDragOverFolderId] = useState<string | null>(null);
   const [selectedPaperThumbnail, setSelectedPaperThumbnail] = useState<string | null>(null);
+  const [selectedThumbnailPaperId, setSelectedThumbnailPaperId] = useState<string | null>(null);
   const [thumbnailPageSize, setThumbnailPageSize] = useState<{ width: number; height: number } | null>(null);
+  const [previewMode, setPreviewMode] = useState<'pdf' | 'mindmap'>('pdf');
+  const [mindmapRoot, setMindmapRoot] = useState<MindMapNode | null>(null);
+  const [mindmapLoading, setMindmapLoading] = useState(false);
+  const [mindmapOffset, setMindmapOffset] = useState({ x: 0, y: 0 });
+  const [collapsedMindmapIds, setCollapsedMindmapIds] = useState<Set<string>>(new Set());
+  const mindmapCacheRef = useRef<
+    Map<string, { root: MindMapNode | null; updatedAt: number | null }>
+  >(new Map());
+  const mindmapPanRef = useRef<{ x: number; y: number; offsetX: number; offsetY: number } | null>(
+    null
+  );
+  const mindmapLayoutRef = useRef<MindMapLayout | null>(null);
+  const mindmapAnchorRef = useRef<{ id: string; x: number; y: number } | null>(null);
+  const mindmapZoomScale = 0.7;
   const [thumbnailViewportSize, setThumbnailViewportSize] = useState<{ width: number; height: number }>({
     width: 0,
     height: 0
@@ -255,7 +694,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     right: number;
   } | null>(null);
   const hasInitWidthsRef = useRef(false);
-  const thumbnailBlobUrlRef = useRef<string | null>(null);
+  const thumbnailCacheRef = useRef<
+    Map<string, { url: string; owned: boolean; pageSize?: { width: number; height: number } }>
+  >(new Map());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set(['root-1']));
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
   const [folderDraft, setFolderDraft] = useState('');
@@ -476,6 +917,62 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     return list;
   }, [visiblePapers, sortField, sortOrder]);
   const selectedPaper = visiblePapers.find((paper) => paper.id === selectedPaperId) || null;
+  const mindmapNodeMap = useMemo(() => {
+    if (!mindmapRoot) return new Map<string, MindMapNode>();
+    const map = new Map<string, MindMapNode>();
+    const walk = (node: MindMapNode) => {
+      map.set(node.id, node);
+      node.children?.forEach((child) => walk(child));
+    };
+    walk(mindmapRoot);
+    return map;
+  }, [mindmapRoot]);
+
+  useEffect(() => {
+    const activeIds = new Set(papers.map((paper) => paper.id));
+    thumbnailCacheRef.current.forEach((entry, id) => {
+      if (!activeIds.has(id)) {
+        if (entry.owned) {
+          URL.revokeObjectURL(entry.url);
+        }
+        thumbnailCacheRef.current.delete(id);
+      }
+    });
+    mindmapCacheRef.current.forEach((_value, id) => {
+      if (!activeIds.has(id)) {
+        mindmapCacheRef.current.delete(id);
+      }
+    });
+  }, [papers]);
+
+  const getPdfDataForPaper = async (paper: Paper): Promise<ArrayBuffer | null> => {
+    if (paper.fileData) return paper.fileData.slice(0);
+    if (paper.filePath && typeof window !== 'undefined' && window.electronAPI?.library?.readPdf) {
+      const response = await window.electronAPI.library.readPdf({
+        paperId: paper.id,
+        filePath: paper.filePath
+      });
+      if (response?.ok && response.data) {
+        if (response.data instanceof ArrayBuffer) return response.data.slice(0);
+        if (ArrayBuffer.isView(response.data)) {
+          return response.data.buffer.slice(
+            response.data.byteOffset,
+            response.data.byteOffset + response.data.byteLength
+          );
+        }
+        return response.data as ArrayBuffer;
+      }
+    }
+    if (paper.fileUrl) {
+      try {
+        const fetched = await fetch(paper.fileUrl);
+        return await fetched.arrayBuffer();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
 
   useEffect(() => {
     if (!sortMenuOpen) return;
@@ -630,31 +1127,97 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   useEffect(() => {
     let cancelled = false;
-    const resetOwnedThumbnailUrl = () => {
-      if (thumbnailBlobUrlRef.current) {
-        URL.revokeObjectURL(thumbnailBlobUrlRef.current);
-        thumbnailBlobUrlRef.current = null;
+    const setCachedThumbnail = (
+      paperId: string,
+      url: string,
+      owned: boolean,
+      pageSize?: { width: number; height: number } | null
+    ) => {
+      const map = thumbnailCacheRef.current;
+      const prev = map.get(paperId);
+      if (prev?.owned && prev.url !== url) {
+        URL.revokeObjectURL(prev.url);
       }
+      if (map.has(paperId)) {
+        map.delete(paperId);
+      }
+      map.set(paperId, {
+        url,
+        owned,
+        pageSize: pageSize || prev?.pageSize
+      });
+      while (map.size > MAX_THUMBNAIL_CACHE) {
+        const oldest = map.keys().next().value as string | undefined;
+        if (!oldest) break;
+        const entry = map.get(oldest);
+        if (entry?.owned) {
+          URL.revokeObjectURL(entry.url);
+        }
+        map.delete(oldest);
+      }
+      setSelectedPaperThumbnail(url);
+      setThumbnailPageSize(pageSize || prev?.pageSize || null);
+      setSelectedThumbnailPaperId(paperId);
     };
-    const setThumbnailFromBuffer = (buffer: ArrayBuffer) => {
-      resetOwnedThumbnailUrl();
-      const blobUrl = URL.createObjectURL(new Blob([buffer], { type: 'application/pdf' }));
-      thumbnailBlobUrlRef.current = blobUrl;
-      setSelectedPaperThumbnail(blobUrl);
+    const setThumbnailFromBuffer = (paperId: string, buffer: ArrayBuffer) => {
+      if (typeof document === 'undefined') return;
+      const task = async () => {
+        const loadingTask = pdfjs.getDocument({ data: buffer.slice(0) });
+        const doc = await loadingTask.promise;
+        const page = await doc.getPage(1);
+        const viewport = page.getViewport({ scale: 1 });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          await doc.destroy();
+          return;
+        }
+        const renderTask = page.render({ canvasContext: ctx, viewport });
+        await renderTask.promise;
+        const blob = await new Promise<Blob | null>((resolve) =>
+          canvas.toBlob((result) => resolve(result), 'image/png')
+        );
+        await doc.destroy();
+        if (cancelled) return;
+        if (!blob) return;
+        const blobUrl = URL.createObjectURL(blob);
+        setCachedThumbnail(paperId, blobUrl, true, {
+          width: viewport.width,
+          height: viewport.height
+        });
+      };
+      task().catch(() => null);
     };
     const loadThumbnail = async () => {
+      if (previewMode !== 'pdf') return;
       if (!selectedPaper) {
-        resetOwnedThumbnailUrl();
         setSelectedPaperThumbnail(null);
+        setThumbnailPageSize(null);
+        setSelectedThumbnailPaperId(null);
         return;
       }
+      const cached = thumbnailCacheRef.current.get(selectedPaper.id);
+      if (cached) {
+        if (thumbnailCacheRef.current.has(selectedPaper.id)) {
+          thumbnailCacheRef.current.delete(selectedPaper.id);
+          thumbnailCacheRef.current.set(selectedPaper.id, cached);
+        }
+        setSelectedPaperThumbnail(cached.url);
+        setThumbnailPageSize(cached.pageSize || null);
+        setSelectedThumbnailPaperId(selectedPaper.id);
+        return;
+      }
+      setSelectedPaperThumbnail(null);
+      setThumbnailPageSize(null);
+      setSelectedThumbnailPaperId(null);
       if (selectedPaper.fileData) {
-        setThumbnailFromBuffer(selectedPaper.fileData.slice(0));
+        setThumbnailFromBuffer(selectedPaper.id, selectedPaper.fileData.slice(0));
         return;
       }
       if (selectedPaper.fileUrl) {
-        resetOwnedThumbnailUrl();
-        setSelectedPaperThumbnail(selectedPaper.fileUrl);
+        setCachedThumbnail(selectedPaper.id, selectedPaper.fileUrl, false);
         return;
       }
       if (
@@ -679,22 +1242,105 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           arrayBuffer = response.data as ArrayBuffer;
         }
         if (!cancelled) {
-          setThumbnailFromBuffer(arrayBuffer);
+          setThumbnailFromBuffer(selectedPaper.id, arrayBuffer);
         }
         return;
       }
-      resetOwnedThumbnailUrl();
       setSelectedPaperThumbnail(null);
+      setThumbnailPageSize(null);
+      setSelectedThumbnailPaperId(null);
     };
     loadThumbnail();
     return () => {
       cancelled = true;
-      resetOwnedThumbnailUrl();
     };
-  }, [selectedPaper]);
+  }, [selectedPaper, previewMode]);
 
   useEffect(() => {
-    setThumbnailPageSize(null);
+    let cancelled = false;
+    const loadMindmap = async () => {
+      if (previewMode !== 'mindmap' || !selectedPaper) {
+        setMindmapRoot(null);
+        setMindmapLoading(false);
+        return;
+      }
+      setMindmapLoading(true);
+      try {
+        const state =
+          typeof window !== 'undefined' && window.electronAPI?.library?.getPaperState
+            ? await window.electronAPI.library.getPaperState(selectedPaper.id)
+            : null;
+        const stateUpdatedAt =
+          typeof state?.updatedAt === 'number' ? state.updatedAt : null;
+        if (mindmapCacheRef.current.has(selectedPaper.id)) {
+          const cached = mindmapCacheRef.current.get(selectedPaper.id) || null;
+          if (cached && cached.updatedAt === stateUpdatedAt) {
+            setMindmapRoot(cached.root);
+            setMindmapLoading(false);
+            return;
+          }
+        }
+        const pdfData = await getPdfDataForPaper(selectedPaper);
+        if (!pdfData) {
+          if (!cancelled) setMindmapRoot(null);
+          return;
+        }
+        const loadingTask = pdfjs.getDocument({ data: pdfData.slice(0) });
+        const doc = await loadingTask.promise;
+        const outline = await doc.getOutline();
+        const tree = outline?.length ? await buildOutlineTree(doc, outline, '') : [];
+        const rootId = `outline-root-${selectedPaper.id}`;
+        const rootNode: OutlineNode = {
+          id: rootId,
+          title: selectedPaper.title || 'Untitled',
+          pageIndex: 0,
+          topRatio: 0,
+          items: tree,
+          isRoot: true
+        };
+        const baseOutline = [rootNode];
+        const baseFlat = getFlatOutlineByPosition(baseOutline);
+        const customChapters = Array.isArray(state?.customChapters) ? state.customChapters : [];
+        const chapterParentOverrides = state?.chapterParentOverrides || {};
+        const highlights = Array.isArray(state?.highlights) ? state.highlights : [];
+        const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlat, rootId);
+        const outlineDisplay = applyParentOverrides(merged, chapterParentOverrides);
+        const root = buildMindmapRoot(outlineDisplay, highlights);
+        if (!cancelled) {
+          mindmapCacheRef.current.set(selectedPaper.id, { root, updatedAt: stateUpdatedAt });
+          setMindmapRoot(root);
+        }
+        await doc.destroy();
+      } catch (error) {
+        if (!cancelled) {
+          setMindmapRoot(null);
+        }
+      } finally {
+        if (!cancelled) setMindmapLoading(false);
+      }
+    };
+    loadMindmap();
+    return () => {
+      cancelled = true;
+    };
+  }, [previewMode, selectedPaper?.id, selectedPaper?.title]);
+
+  useEffect(() => {
+    setMindmapOffset({ x: 0, y: 0 });
+    setCollapsedMindmapIds(new Set());
+  }, [selectedPaper?.id, previewMode]);
+
+  useEffect(() => {
+    if (!selectedPaper) {
+      setThumbnailPageSize(null);
+      return;
+    }
+    const cached = thumbnailCacheRef.current.get(selectedPaper.id);
+    if (cached?.pageSize) {
+      setThumbnailPageSize(cached.pageSize);
+    } else {
+      setThumbnailPageSize(null);
+    }
   }, [selectedPaperThumbnail, selectedPaper?.id]);
 
   useEffect(() => {
@@ -702,7 +1348,6 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     if (!element) return;
     let rafId = 0;
     const update = () => {
-      if (isPanelResizing) return;
       if (rafId) {
         window.cancelAnimationFrame(rafId);
       }
@@ -1082,35 +1727,152 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         style={{ width: rightWidth }}
       >
         {selectedPaper ? (
-          <div className="flex-1 p-4 overflow-auto">
-            <div ref={thumbnailViewportRef} className="h-full w-full flex items-start justify-center">
-              {selectedPaperThumbnail ? (
-                <Document
-                  key={`thumb-${selectedPaper.id}`}
-                  file={selectedPaperThumbnail}
-                  loading={null}
-                  error={null}
-                  noData={null}
-                >
-                  <Page
-                    pageNumber={1}
-                    scale={thumbnailScale}
-                    loading={null}
-                    error={null}
-                    noData={null}
-                    renderTextLayer={false}
-                    renderAnnotationLayer={false}
-                    onLoadSuccess={(page: any) => {
-                      const viewport = page.getViewport({ scale: 1 });
-                      setThumbnailPageSize({
-                        width: viewport.width,
-                        height: viewport.height
-                      });
-                    }}
-                  />
-                </Document>
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-200">
+              <button
+                type="button"
+                onClick={() => setPreviewMode('pdf')}
+                className={`px-2 py-1 text-xs rounded-md ${
+                  previewMode === 'pdf'
+                    ? 'bg-white text-gray-900 shadow-sm'
+                    : 'text-gray-500 hover:bg-gray-100'
+                }`}
+              >
+                PDF
+              </button>
+              <button
+                type="button"
+                onClick={() => setPreviewMode('mindmap')}
+                className={`px-2 py-1 text-xs rounded-md ${
+                  previewMode === 'mindmap'
+                    ? 'bg-white text-gray-900 shadow-sm'
+                    : 'text-gray-500 hover:bg-gray-100'
+                }`}
+              >
+                Mind Map
+              </button>
+            </div>
+            <div className={`flex-1 overflow-auto ${previewMode === 'pdf' ? 'p-2' : 'p-0'}`}>
+              {previewMode === 'pdf' ? (
+                <div ref={thumbnailViewportRef} className="h-full w-full flex items-start justify-center">
+                  {selectedPaperThumbnail && selectedThumbnailPaperId === selectedPaper.id ? (
+                    <img
+                      src={selectedPaperThumbnail}
+                      alt={selectedPaper.title}
+                      style={{
+                        width: thumbnailPageSize ? thumbnailPageSize.width * thumbnailScale : 'auto',
+                        height: thumbnailPageSize ? thumbnailPageSize.height * thumbnailScale : 'auto'
+                      }}
+                      className="block max-w-full max-h-full"
+                    />
+                  ) : (
+                    <div className="w-full h-full bg-white" />
+                  )}
+                </div>
               ) : (
-                <div className="w-full h-full bg-white" />
+                <div className="h-full w-full">
+                  {mindmapLoading ? (
+                    <div className="h-full w-full flex items-center justify-center text-xs text-gray-400">
+                      正在生成思维导图...
+                    </div>
+                  ) : mindmapRoot ? (
+                    <MindMap
+                      root={mindmapRoot}
+                      zoomScale={mindmapZoomScale}
+                      collapsedIds={collapsedMindmapIds}
+                      offset={mindmapOffset}
+                      onLayout={(layout) => {
+                        mindmapLayoutRef.current = layout;
+                        const anchor = mindmapAnchorRef.current;
+                        if (!layout || !anchor) return;
+                        const target = layout.nodes.find((item) => item.id === anchor.id);
+                        if (!target) {
+                          mindmapAnchorRef.current = null;
+                          return;
+                        }
+                        const nextOffset = {
+                          x:
+                            anchor.x -
+                            (target.x + target.width / 2 + layout.offset.x) * mindmapZoomScale,
+                          y:
+                            anchor.y -
+                            (target.y + target.height / 2 + layout.offset.y) * mindmapZoomScale
+                        };
+                        setMindmapOffset(nextOffset);
+                        mindmapAnchorRef.current = null;
+                      }}
+                      onLayoutStart={() => {
+                        const anchor = mindmapAnchorRef.current;
+                        if (!anchor) return;
+                        setMindmapOffset({ x: anchor.x, y: anchor.y });
+                      }}
+                      onNodeClick={(node) => {
+                        if (node.kind === 'note') return;
+                        const originalNode = mindmapNodeMap.get(node.id);
+                        const hasChildren = Boolean(originalNode?.children && originalNode.children.length);
+                        if (!hasChildren) return;
+                        const layout = mindmapLayoutRef.current;
+                        if (layout) {
+                          const targetNode = layout.nodes.find((item) => item.id === node.id);
+                          if (targetNode) {
+                            mindmapAnchorRef.current = {
+                              id: node.id,
+                              x:
+                                (targetNode.x + targetNode.width / 2 + layout.offset.x) *
+                                  mindmapZoomScale +
+                                mindmapOffset.x,
+                              y:
+                                (targetNode.y + targetNode.height / 2 + layout.offset.y) *
+                                  mindmapZoomScale +
+                                mindmapOffset.y
+                            };
+                          }
+                        }
+                        setCollapsedMindmapIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(node.id)) {
+                            next.delete(node.id);
+                          } else {
+                            next.add(node.id);
+                          }
+                          return next;
+                        });
+                      }}
+                      onBackgroundMouseDown={(event) => {
+                        if (event.button !== 0) return;
+                        mindmapPanRef.current = {
+                          x: event.clientX,
+                          y: event.clientY,
+                          offsetX: mindmapOffset.x,
+                          offsetY: mindmapOffset.y
+                        };
+                        document.body.style.cursor = 'grabbing';
+                        document.body.style.userSelect = 'none';
+                        const handleMove = (moveEvent: MouseEvent) => {
+                          const start = mindmapPanRef.current;
+                          if (!start) return;
+                          setMindmapOffset({
+                            x: start.offsetX + (moveEvent.clientX - start.x),
+                            y: start.offsetY + (moveEvent.clientY - start.y)
+                          });
+                        };
+                        const handleUp = () => {
+                          mindmapPanRef.current = null;
+                          document.body.style.cursor = '';
+                          document.body.style.userSelect = '';
+                          window.removeEventListener('mousemove', handleMove);
+                          window.removeEventListener('mouseup', handleUp);
+                        };
+                        window.addEventListener('mousemove', handleMove);
+                        window.addEventListener('mouseup', handleUp);
+                      }}
+                    />
+                  ) : (
+                    <div className="h-full w-full flex items-center justify-center text-xs text-gray-400">
+                      暂无思维导图
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           </div>
