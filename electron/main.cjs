@@ -19,6 +19,9 @@ const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
 
 let settingsLoaded = false;
+let writeChain = Promise.resolve();
+let pendingWrites = 0;
+let isForceQuitting = false;
 let runtimeSettings = {
   translationEngine: 'cnki',
   apiKey: '',
@@ -29,6 +32,21 @@ let runtimeSettings = {
 };
 
 let cnkiTokenCache = { token: '', t: 0 };
+
+const enqueueWrite = (task) => {
+  pendingWrites += 1;
+  const run = writeChain.then(task);
+  writeChain = run
+    .catch((error) => {
+      console.error('[write-queue] task failed:', error);
+    })
+    .finally(() => {
+      pendingWrites -= 1;
+    });
+  return run;
+};
+
+const flushWrites = () => writeChain;
 
 const resolveLibraryPath = (value) => {
   const raw = String(value || '').trim();
@@ -366,7 +384,9 @@ ipcMain.handle('settings-get', async () => {
   const settings = await loadSettings();
   return { ...settings, libraryPath: getLibraryRoot() };
 });
-ipcMain.handle('settings-set', async (_event, payload = {}) => saveSettings(payload));
+ipcMain.handle('settings-set', async (_event, payload = {}) =>
+  enqueueWrite(() => saveSettings(payload))
+);
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
   const text = String(payload.text || '').trim();
@@ -424,10 +444,12 @@ ipcMain.handle('library-get-folders', async () => {
 });
 
 ipcMain.handle('library-save-folders', async (_event, payload = []) => {
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  await writeJsonFile(paths.foldersPath, Array.isArray(payload) ? payload : []);
-  return { ok: true };
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    await writeJsonFile(paths.foldersPath, Array.isArray(payload) ? payload : []);
+    return { ok: true };
+  });
 });
 
 ipcMain.handle('library-get-papers', async () => {
@@ -437,24 +459,41 @@ ipcMain.handle('library-get-papers', async () => {
 });
 
 ipcMain.handle('library-save-papers', async (_event, payload = []) => {
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  await writeJsonFile(paths.papersPath, Array.isArray(payload) ? payload : []);
-  return { ok: true };
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    await writeJsonFile(paths.papersPath, Array.isArray(payload) ? payload : []);
+    return { ok: true };
+  });
+});
+
+ipcMain.handle('library-save-snapshot', async (_event, payload = {}) => {
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    const folders = Array.isArray(payload.folders) ? payload.folders : [];
+    const papers = Array.isArray(payload.papers) ? payload.papers : [];
+    await writeJsonFile(paths.foldersPath, folders);
+    await writeJsonFile(paths.papersPath, papers);
+    await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
+    return { ok: true };
+  });
 });
 
 ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {
-  const paperId = String(payload.paperId || '').trim();
-  if (!paperId) return { ok: false, error: '缺少paperId' };
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  const data = payload.data;
-  if (!data) return { ok: false, error: '缺少PDF数据' };
-  const buffer = Buffer.from(new Uint8Array(data));
-  const filePath = path.join(paths.papersDir, `${paperId}.pdf`);
-  await fs.writeFile(filePath, buffer);
-  await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-  return { ok: true, filePath };
+  return enqueueWrite(async () => {
+    const paperId = String(payload.paperId || '').trim();
+    if (!paperId) return { ok: false, error: '缺少paperId' };
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    const data = payload.data;
+    if (!data) return { ok: false, error: '缺少PDF数据' };
+    const buffer = Buffer.from(new Uint8Array(data));
+    const filePath = path.join(paths.papersDir, `${paperId}.pdf`);
+    await fs.writeFile(filePath, buffer);
+    await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
+    return { ok: true, filePath };
+  });
 });
 
 ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
@@ -489,55 +528,61 @@ ipcMain.handle('library-get-paper-state', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('library-save-paper-state', async (_event, payload = {}) => {
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  const paperId = String(payload.paperId || '').trim();
-  if (!paperId) return { ok: false, error: '缺少paperId' };
-  const statePath = path.join(paths.statesDir, `${paperId}.json`);
-  await writeJsonFile(statePath, payload.state || {});
-  return { ok: true };
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    const paperId = String(payload.paperId || '').trim();
+    if (!paperId) return { ok: false, error: '缺少paperId' };
+    const statePath = path.join(paths.statesDir, `${paperId}.json`);
+    await writeJsonFile(statePath, payload.state || {});
+    return { ok: true };
+  });
 });
 
 ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  const paperId = String(payload.paperId || '').trim();
-  if (!paperId) return { ok: false, error: '缺少paperId' };
-  let resolvedPath = payload.filePath ? String(payload.filePath) : '';
-  if (!resolvedPath) {
-    const papers = await readJsonFile(paths.papersPath, []);
-    const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
-    resolvedPath = entry?.filePath || '';
-  }
-  await removeFileIfExists(resolvedPath);
-  await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-  return { ok: true };
-});
-
-ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
-  await ensureLibrary();
-  const paths = getLibraryPaths();
-  const items = Array.isArray(payload.items) ? payload.items : [];
-  const ids = items
-    .map((item) => String(item?.id || '').trim())
-    .filter(Boolean);
-  if (!ids.length) return { ok: true };
-  const papers = await readJsonFile(paths.papersPath, []);
-  const paperMap = new Map(
-    Array.isArray(papers) ? papers.map((paper) => [paper.id, paper]) : []
-  );
-  for (const item of items) {
-    const paperId = String(item?.id || '').trim();
-    if (!paperId) continue;
-    let resolvedPath = item?.filePath ? String(item.filePath) : '';
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    const paperId = String(payload.paperId || '').trim();
+    if (!paperId) return { ok: false, error: '缺少paperId' };
+    let resolvedPath = payload.filePath ? String(payload.filePath) : '';
     if (!resolvedPath) {
-      const entry = paperMap.get(paperId);
+      const papers = await readJsonFile(paths.papersPath, []);
+      const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
       resolvedPath = entry?.filePath || '';
     }
     await removeFileIfExists(resolvedPath);
     await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-  }
-  return { ok: true };
+    return { ok: true };
+  });
+});
+
+ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
+  return enqueueWrite(async () => {
+    await ensureLibrary();
+    const paths = getLibraryPaths();
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const ids = items
+      .map((item) => String(item?.id || '').trim())
+      .filter(Boolean);
+    if (!ids.length) return { ok: true };
+    const papers = await readJsonFile(paths.papersPath, []);
+    const paperMap = new Map(
+      Array.isArray(papers) ? papers.map((paper) => [paper.id, paper]) : []
+    );
+    for (const item of items) {
+      const paperId = String(item?.id || '').trim();
+      if (!paperId) continue;
+      let resolvedPath = item?.filePath ? String(item.filePath) : '';
+      if (!resolvedPath) {
+        const entry = paperMap.get(paperId);
+        resolvedPath = entry?.filePath || '';
+      }
+      await removeFileIfExists(resolvedPath);
+      await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
+    }
+    return { ok: true };
+  });
 });
 
 function createWindow() {
@@ -565,6 +610,16 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on('before-quit', (event) => {
+  if (isForceQuitting) return;
+  if (pendingWrites === 0) return;
+  event.preventDefault();
+  isForceQuitting = true;
+  flushWrites().finally(() => {
+    app.quit();
   });
 });
 

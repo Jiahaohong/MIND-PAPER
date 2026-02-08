@@ -512,14 +512,13 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!libraryLoaded) return;
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
-    window.electronAPI.library.saveFolders(folders);
-  }, [folders, libraryLoaded]);
-
-  useEffect(() => {
-    if (!libraryLoaded) return;
-    if (typeof window === 'undefined' || !window.electronAPI?.library) return;
-    window.electronAPI.library.savePapers(papers);
-  }, [papers, libraryLoaded]);
+    if (window.electronAPI.library.saveSnapshot) {
+      window.electronAPI.library.saveSnapshot({ folders, papers });
+      return;
+    }
+    window.electronAPI.library.saveFolders?.(folders);
+    window.electronAPI.library.savePapers?.(papers);
+  }, [folders, papers, libraryLoaded]);
 
   const loadSettings = async () => {
     setSettingsError('');
