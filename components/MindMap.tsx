@@ -31,11 +31,21 @@ const toSolidColor = (fill: string) => {
   return `rgb(${parts[0]}, ${parts[1]}, ${parts[2]})`;
 };
 
+const isManualMindmapNote = (note: any) => {
+  if (!note) return false;
+  if (note.source === 'manual') return true;
+  if (note.source === 'pdf') return false;
+  const rects = Array.isArray(note.rects) ? note.rects : [];
+  if (!rects.length) return true;
+  return rects.every((rect) => Number(rect?.w || 0) === 0 && Number(rect?.h || 0) === 0);
+};
+
 export type MindMapNode = {
   id: string;
   text: string;
   translation?: string;
   kind: 'root' | 'chapter' | 'note';
+  isNormalChapter?: boolean;
   pageIndex?: number | null;
   topRatio?: number | null;
   color?: string;
@@ -421,6 +431,9 @@ export const MindMap: React.FC<MindMapProps> = ({
               const isHovered = hoveredId === node.id;
               const isEditing = Boolean(editingNodeId && editingNodeId === node.id);
               const isSelected = Boolean(selectedNodeId && selectedNodeId === node.id);
+              const isManualNote = node.kind === 'note' && isManualMindmapNote(node.note);
+              const isNormalChapter = node.kind === 'chapter' && Boolean(node.isNormalChapter);
+              const useDashedSelectedStroke = isSelected && (isManualNote || isNormalChapter);
               const selectedStroke =
                 node.kind === 'note' && node.color
                   ? toSolidColor(node.color)
@@ -492,18 +505,32 @@ export const MindMap: React.FC<MindMapProps> = ({
                     fill={resolvedFill}
                     stroke={effectiveStroke}
                     strokeWidth={strokeWidth}
+                    strokeDasharray={useDashedSelectedStroke ? '4 3' : undefined}
                     opacity={isDraggingNote ? 0.5 : 1}
                   />
                   {node.kind === 'note' && !isEditing ? (
-                    <rect
-                      x={0}
-                      y={0}
-                      width={4}
-                      height={node.height}
-                      rx={8}
-                      ry={8}
-                      fill={node.color || '#cbd5f5'}
-                    />
+                    isManualNote ? (
+                      <line
+                        x1={2}
+                        y1={4}
+                        x2={2}
+                        y2={Math.max(4, node.height - 4)}
+                        stroke={node.color || '#cbd5f5'}
+                        strokeWidth={3}
+                        strokeDasharray="4 3"
+                        strokeLinecap="butt"
+                      />
+                    ) : (
+                      <rect
+                        x={0}
+                        y={0}
+                        width={4}
+                        height={node.height}
+                        rx={8}
+                        ry={8}
+                        fill={node.color || '#cbd5f5'}
+                      />
+                    )
                   ) : null}
                   {isEditing ? (
                     <foreignObject

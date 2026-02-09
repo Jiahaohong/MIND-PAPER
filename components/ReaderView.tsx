@@ -3084,25 +3084,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return map;
   }, [highlights]);
 
+  const showPdfMarginOutline = false;
   const pdfMarginChildrenByPage = useMemo(() => {
     const map = new Map<
       number,
       Array<{
         parentId: string;
         topRatio: number;
+        sortIndex?: number;
         items: Array<{
           key: string;
           label: string;
           kind: 'note' | 'chapter';
           color?: string;
+          indentPx?: number;
           note?: HighlightItem;
           node?: OutlineNode;
           sortPage: number;
           sortTop: number;
+          sortIndex?: number;
         }>;
       }>
     >();
-    if (viewMode !== ReaderMode.PDF || !outlineDisplay.length) return map;
+    if (!showPdfMarginOutline || viewMode !== ReaderMode.PDF || !outlineDisplay.length) return map;
 
     const highlightChapterNodeIdSet = new Set<string>();
     highlights.forEach((item) => {
@@ -3112,62 +3116,225 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       if (nodeId) highlightChapterNodeIdSet.add(nodeId);
     });
 
-    const chapterAnchors: OutlineNode[] = [];
-    const collectAnchors = (nodes: OutlineNode[]) => {
-      nodes.forEach((node) => {
-        if (!node.isRoot) chapterAnchors.push(node);
-        if (node.items?.length) collectAnchors(node.items);
+    const clampTopRatio = (value: number) => Math.max(0, Math.min(0.99, value));
+
+    const estimateMarginChapterHeightRatio = (label: string) => {
+      const text = String(label || '').trim();
+      if (!text) return 0.02;
+      const charsPerLine = 16;
+      const lines = Math.max(1, Math.ceil(text.length / charsPerLine));
+      const lineHeightPx = 18;
+      const paddingPx = 8;
+      const pageHeightPx = 1120;
+      const heightPx = paddingPx * 2 + lines * lineHeightPx;
+      const ratio = heightPx / pageHeightPx;
+      return Math.max(0.012, Math.min(0.2, ratio));
+    };
+
+    const estimateMarginNoteHeightRatio = (label: string) => {
+      const text = String(label || '').trim();
+      if (!text) return 0.018;
+      const charsPerLine = 20;
+      const lines = Math.max(1, Math.ceil(text.length / charsPerLine));
+      const lineHeightPx = 16;
+      const paddingPx = 6;
+      const pageHeightPx = 1120;
+      const heightPx = paddingPx * 2 + lines * lineHeightPx;
+      const ratio = heightPx / pageHeightPx;
+      return Math.max(0.01, Math.min(0.16, ratio));
+    };
+
+    const nodeDepthMap = new Map<string, number>();
+    const buildNodeDepth = (node: OutlineNode, depth: number) => {
+      nodeDepthMap.set(node.id, depth);
+      (node.items || []).forEach((child) => buildNodeDepth(child, depth + 1));
+    };
+
+    const normalChapterPlacement = new Map<
+      string,
+      { pageIndex: number; topRatio: number; sortIndex: number; indentPx: number }
+    >();
+    const normalNotePlacement = new Map<
+      string,
+      { pageIndex: number; topRatio: number; sortIndex: number; indentPx: number }
+    >();
+    const computeNormalChapterPlacement = (parent: OutlineNode) => {
+      const siblings = parent.items || [];
+      let prevNode: OutlineNode | null = null;
+      siblings.forEach((child, index) => {
+        const isNormalChapter = child.isCustom && !highlightChapterNodeIdSet.has(child.id);
+        const depth = nodeDepthMap.get(child.id) ?? 0;
+        const indentPx = depth * 12;
+        let pageIndex: number;
+        let topRatio: number;
+
+        if (prevNode) {
+          const prevPlacement = normalChapterPlacement.get(prevNode.id);
+          const prevPageIndex =
+            typeof prevPlacement?.pageIndex === 'number'
+              ? prevPlacement.pageIndex
+              : typeof prevNode.pageIndex === 'number'
+                ? prevNode.pageIndex
+                : typeof parent.pageIndex === 'number'
+                  ? parent.pageIndex
+                  : typeof child.pageIndex === 'number'
+                    ? child.pageIndex
+                    : 0;
+          const prevTopRatio =
+            typeof prevPlacement?.topRatio === 'number'
+              ? prevPlacement.topRatio
+              : typeof prevNode.topRatio === 'number'
+                ? prevNode.topRatio
+                : typeof parent.topRatio === 'number'
+                  ? parent.topRatio
+                  : typeof child.topRatio === 'number'
+                    ? child.topRatio
+                    : 0;
+          const prevHeightRatio = estimateMarginChapterHeightRatio(prevNode.title);
+          pageIndex = prevPageIndex;
+          topRatio = clampTopRatio(prevTopRatio + prevHeightRatio);
+        } else {
+          const basePageIndex =
+            typeof parent.pageIndex === 'number'
+              ? parent.pageIndex
+              : typeof child.pageIndex === 'number'
+                ? child.pageIndex
+                : 0;
+          const baseTopRatio =
+            typeof parent.topRatio === 'number'
+              ? parent.topRatio
+              : typeof child.topRatio === 'number'
+                ? child.topRatio
+                : 0;
+          pageIndex = basePageIndex;
+          topRatio = clampTopRatio(baseTopRatio);
+        }
+
+        if (isNormalChapter) {
+          normalChapterPlacement.set(child.id, { pageIndex, topRatio, sortIndex: index, indentPx });
+        }
+
+        prevNode = child;
       });
-    };
-    collectAnchors(outlineDisplay);
-    chapterAnchors.sort((a, b) => {
-      const aPage = typeof a.pageIndex === 'number' ? a.pageIndex : Number.POSITIVE_INFINITY;
-      const bPage = typeof b.pageIndex === 'number' ? b.pageIndex : Number.POSITIVE_INFINITY;
-      if (aPage !== bPage) return aPage - bPage;
-      const aTop = typeof a.topRatio === 'number' ? a.topRatio : 0;
-      const bTop = typeof b.topRatio === 'number' ? b.topRatio : 0;
-      if (aTop !== bTop) return aTop - bTop;
-      return a.title.localeCompare(b.title);
-    });
 
-    const findAnchorForChapter = (child: OutlineNode) => {
-      const pageIndex = typeof child.pageIndex === 'number' ? child.pageIndex : 0;
-      const ratio = typeof child.topRatio === 'number' ? child.topRatio : 0;
-      let candidate: OutlineNode | null = null;
-      for (const anchor of chapterAnchors) {
-        if (typeof anchor.pageIndex !== 'number') continue;
-        const anchorRatio = typeof anchor.topRatio === 'number' ? anchor.topRatio : 0;
-        const isBefore =
-          anchor.pageIndex < pageIndex ||
-          (anchor.pageIndex === pageIndex &&
-            (anchorRatio < ratio || (anchorRatio === ratio && anchor.id !== child.id)));
-        if (isBefore) {
-          candidate = anchor;
-          continue;
-        }
-        if (
-          anchor.pageIndex > pageIndex ||
-          (anchor.pageIndex === pageIndex && anchorRatio > ratio)
-        ) {
-          break;
-        }
-      }
-      return candidate || child;
+      siblings.forEach((child) => computeNormalChapterPlacement(child));
     };
 
-    const groupsByPage = new Map<number, Map<string, { parentId: string; topRatio: number; items: Array<{
+    const computeNormalNotePlacement = (parent: OutlineNode) => {
+      const nodes = parent.items || [];
+      const notes = highlightsByChapter.get(parent.id) || [];
+      const nodeMap = new Map(nodes.map((child) => [child.id, child]));
+      const noteMap = new Map(notes.map((note) => [note.id, note]));
+      const combinedEntries = sortCombinedEntries(buildCombinedEntries(nodes, notes));
+      let prevMetrics: { pageIndex: number; topRatio: number; heightRatio: number } | null = null;
+      const parentDepth = nodeDepthMap.get(parent.id) ?? 0;
+      const noteIndentPx = parentDepth * 12 + 6;
+
+      combinedEntries.forEach((entry, index) => {
+        if (entry.kind === 'note') {
+          const note = noteMap.get(entry.id);
+          if (!note) return;
+          const key = getHighlightSortKey(note);
+          if (isManualHighlight(note)) {
+            let pageIndex: number;
+            let topRatio: number;
+            if (prevMetrics) {
+              pageIndex = prevMetrics.pageIndex;
+              topRatio = clampTopRatio(prevMetrics.topRatio + prevMetrics.heightRatio);
+            } else {
+              pageIndex =
+                typeof parent.pageIndex === 'number'
+                  ? parent.pageIndex
+                  : typeof key.pageIndex === 'number'
+                    ? key.pageIndex
+                    : typeof note.pageIndex === 'number'
+                      ? note.pageIndex
+                      : 0;
+              const baseTop =
+                typeof parent.topRatio === 'number'
+                  ? parent.topRatio
+                  : typeof key.top === 'number'
+                    ? key.top
+                    : 0;
+              topRatio = clampTopRatio(baseTop);
+            }
+            normalNotePlacement.set(note.id, {
+              pageIndex,
+              topRatio,
+              sortIndex: index,
+              indentPx: noteIndentPx
+            });
+            prevMetrics = {
+              pageIndex,
+              topRatio,
+              heightRatio: estimateMarginNoteHeightRatio(note.text)
+            };
+          } else {
+            const pageIndex =
+              typeof key.pageIndex === 'number'
+                ? key.pageIndex
+                : typeof note.pageIndex === 'number'
+                  ? note.pageIndex
+                  : 0;
+            const topRatio = clampTopRatio(
+              typeof key.top === 'number' ? key.top : 0
+            );
+            prevMetrics = {
+              pageIndex,
+              topRatio,
+              heightRatio: estimateMarginNoteHeightRatio(note.text)
+            };
+          }
+          return;
+        }
+        const child = nodeMap.get(entry.id);
+        if (!child) return;
+        const isNormalChapter = child.isCustom && !highlightChapterNodeIdSet.has(child.id);
+        if (isNormalChapter) {
+          const placement = normalChapterPlacement.get(child.id);
+          if (placement) {
+            prevMetrics = {
+              pageIndex: placement.pageIndex,
+              topRatio: placement.topRatio,
+              heightRatio: estimateMarginChapterHeightRatio(child.title)
+            };
+            return;
+          }
+        }
+        const pageIndex =
+          typeof child.pageIndex === 'number'
+            ? child.pageIndex
+            : typeof parent.pageIndex === 'number'
+              ? parent.pageIndex
+              : 0;
+        const topRatio = clampTopRatio(
+          typeof child.topRatio === 'number' ? child.topRatio : 0
+        );
+        prevMetrics = {
+          pageIndex,
+          topRatio,
+          heightRatio: estimateMarginChapterHeightRatio(child.title)
+        };
+      });
+
+      nodes.forEach((child) => computeNormalNotePlacement(child));
+    };
+
+    const groupsByPage = new Map<number, Map<string, { parentId: string; topRatio: number; sortIndex?: number; items: Array<{
       key: string;
       label: string;
       kind: 'note' | 'chapter';
       color?: string;
+      indentPx?: number;
       note?: HighlightItem;
       node?: OutlineNode;
       sortPage: number;
       sortTop: number;
+      sortIndex?: number;
     }>}>>();
 
     const addToGroup = (
-      anchor: OutlineNode,
+      anchor: { anchorId: string; pageIndex: number; topRatio: number; sortIndex?: number },
       item: {
         key: string;
         label: string;
@@ -3177,73 +3344,121 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         node?: OutlineNode;
         sortPage: number;
         sortTop: number;
+        sortIndex?: number;
+        indentPx?: number;
       }
     ) => {
-      const pageIndex = typeof anchor.pageIndex === 'number' ? anchor.pageIndex : item.sortPage;
-      const topRatio = typeof anchor.topRatio === 'number' ? anchor.topRatio : 0;
+      const pageIndex = Number.isFinite(anchor.pageIndex) ? anchor.pageIndex : item.sortPage;
+      const topRatio = Number.isFinite(anchor.topRatio) ? anchor.topRatio : 0;
       if (!Number.isFinite(pageIndex)) return;
       const pageMap = groupsByPage.get(pageIndex) || new Map();
-      let group = pageMap.get(anchor.id);
+      let group = pageMap.get(anchor.anchorId);
       if (!group) {
-        group = { parentId: anchor.id, topRatio, items: [] };
-        pageMap.set(anchor.id, group);
+        group = { parentId: anchor.anchorId, topRatio, sortIndex: anchor.sortIndex, items: [] };
+        pageMap.set(anchor.anchorId, group);
+      } else if (typeof group.sortIndex !== 'number' && typeof anchor.sortIndex === 'number') {
+        group.sortIndex = anchor.sortIndex;
       }
       group.items.push(item);
       groupsByPage.set(pageIndex, pageMap);
     };
 
-    const walk = (node: OutlineNode) => {
+    const walk = (node: OutlineNode, ancestorsExpanded: boolean) => {
+      const childrenVisible =
+        ancestorsExpanded && (node.isRoot ? true : expandedTOC.has(node.id));
       const nodes = node.items || [];
       const notes = highlightsByChapter.get(node.id) || [];
-      const nodeMap = new Map(nodes.map((child) => [child.id, child]));
-      const noteMap = new Map(notes.map((note) => [note.id, note]));
-      const combinedEntries = sortCombinedEntries(buildCombinedEntries(nodes, notes));
-      combinedEntries.forEach((entry) => {
-        if (entry.kind === 'note') {
-          const note = noteMap.get(entry.id);
-          if (!note || !isManualHighlight(note)) return;
-          const key = getHighlightSortKey(note);
-          addToGroup(node, {
+      notes.forEach((note) => {
+        if (!childrenVisible) return;
+        if (!note || !isManualHighlight(note)) return;
+        const placement = normalNotePlacement.get(note.id);
+        if (!placement) return;
+        addToGroup(
+          {
+            anchorId: `note-${note.id}`,
+            pageIndex: placement.pageIndex,
+            topRatio: placement.topRatio,
+            sortIndex: placement.sortIndex
+          },
+          {
             key: `note-${note.id}`,
             label: note.text,
             kind: 'note' as const,
             color: note.color,
             note,
-            sortPage: typeof key.pageIndex === 'number' ? key.pageIndex : 0,
-            sortTop: typeof key.top === 'number' ? key.top : 0
-          });
-          return;
-        }
-        const child = nodeMap.get(entry.id);
-        if (!child || !child.isCustom || highlightChapterNodeIdSet.has(child.id)) return;
-        const anchor = findAnchorForChapter(child);
-        addToGroup(anchor, {
-          key: `node-${child.id}`,
-          label: child.title,
-          kind: 'chapter' as const,
-          node: child,
-          sortPage: typeof child.pageIndex === 'number' ? child.pageIndex : 0,
-          sortTop: typeof child.topRatio === 'number' ? child.topRatio : 0
-        });
+            sortPage: placement.pageIndex,
+            sortTop: placement.topRatio,
+            sortIndex: placement.sortIndex,
+            indentPx: placement.indentPx
+          }
+        );
       });
-      nodes.forEach((child) => walk(child));
+
+      nodes.forEach((child) => {
+        if (!childrenVisible) return;
+        if (!child || !child.isCustom || highlightChapterNodeIdSet.has(child.id)) return;
+        const placement = normalChapterPlacement.get(child.id);
+        if (!placement) return;
+        addToGroup(
+          {
+            anchorId: child.id,
+            pageIndex: placement.pageIndex,
+            topRatio: placement.topRatio,
+            sortIndex: placement.sortIndex
+          },
+          {
+            key: `node-${child.id}`,
+            label: child.title,
+            kind: 'chapter' as const,
+            node: child,
+            sortPage: placement.pageIndex,
+            sortTop: placement.topRatio,
+            sortIndex: placement.sortIndex,
+            indentPx: placement.indentPx
+          }
+        );
+      });
+      if (!childrenVisible) return;
+      nodes.forEach((child) => walk(child, childrenVisible));
     };
 
     const root = outlineDisplay[0];
-    if (root) walk(root);
+    if (root) {
+      buildNodeDepth(root, 0);
+      computeNormalChapterPlacement(root);
+      computeNormalNotePlacement(root);
+      walk(root, true);
+    }
     groupsByPage.forEach((pageMap, pageIndex) => {
       const list = Array.from(pageMap.values());
       list.forEach((group) => {
         group.items.sort((a, b) => {
+          const aIndex = typeof a.sortIndex === 'number' ? a.sortIndex : null;
+          const bIndex = typeof b.sortIndex === 'number' ? b.sortIndex : null;
+          if (aIndex !== null && bIndex !== null && aIndex !== bIndex) {
+            return aIndex - bIndex;
+          }
+          if (aIndex !== null && bIndex === null) return -1;
+          if (aIndex === null && bIndex !== null) return 1;
           if (a.sortPage !== b.sortPage) return a.sortPage - b.sortPage;
           return a.sortTop - b.sortTop;
         });
       });
-      list.sort((a, b) => a.topRatio - b.topRatio);
+      list.sort((a, b) => {
+        if (a.topRatio !== b.topRatio) return a.topRatio - b.topRatio;
+        const aIndex = typeof a.sortIndex === 'number' ? a.sortIndex : null;
+        const bIndex = typeof b.sortIndex === 'number' ? b.sortIndex : null;
+        if (aIndex !== null && bIndex !== null && aIndex !== bIndex) {
+          return aIndex - bIndex;
+        }
+        if (aIndex !== null && bIndex === null) return -1;
+        if (aIndex === null && bIndex !== null) return 1;
+        return 0;
+      });
       map.set(pageIndex, list);
     });
     return map;
-  }, [outlineDisplay, highlightsByChapter, highlights, viewMode]);
+  }, [outlineDisplay, highlightsByChapter, highlights, viewMode, expandedTOC, expandedHighlightIds]);
 
   const highlightsByQuestion = useMemo(() => {
     const map = new Map<string, HighlightItem[]>();
@@ -3286,6 +3501,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const buildMindmapRoot = useCallback((): MindMapNode | null => {
     if (!outlineDisplay.length) return null;
     const rootNode = outlineDisplay[0];
+    const highlightChapterNodeIdSet = new Set<string>();
+    highlights.forEach((item) => {
+      if (!item.isChapterTitle) return;
+      if (isManualHighlight(item)) return;
+      const nodeId = item.chapterNodeId || item.chapterId;
+      if (nodeId) highlightChapterNodeIdSet.add(nodeId);
+    });
 
     const buildNode = (node: OutlineNode): MindMapNode => {
       const childItems = node.items || [];
@@ -3316,6 +3538,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         id: node.id,
         text: node.title,
         kind: node.isRoot ? 'root' : 'chapter',
+        isNormalChapter: Boolean(node.isCustom && !highlightChapterNodeIdSet.has(node.id)),
         pageIndex: node.pageIndex,
         topRatio: node.topRatio,
         children: combined
@@ -3784,6 +4007,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const notes = highlightsByChapter.get(item.id) || [];
     const hasChildren = (item.items && item.items.length > 0) || notes.length > 0;
     const isExpanded = expandedTOC.has(item.id);
+    const isNormalChapterInToc = item.isCustom && !highlightChapterIdSet.has(item.id);
     const isDropTarget =
       dragOverTocId === item.id && (Boolean(draggingTocNoteId) || Boolean(draggingTocChapterId));
     const nodeMap = new Map((item.items || []).map((node) => [node.id, node]));
@@ -3801,7 +4025,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         <div 
           data-toc-id={item.id}
           data-toc-kind="chapter"
-          className={`group flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 ${
+          className={`group flex items-center py-1 px-2 cursor-pointer rounded my-0.5 ${
+            isNormalChapterInToc ? 'text-xs text-gray-600' : 'text-sm text-gray-700'
+          } ${
             isDropTarget ? 'bg-gray-200' : 'hover:bg-gray-200'
           }`}
           style={{ paddingLeft: `${level * 12 + 8}px` }}
@@ -3863,6 +4089,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                     <div key={entry.note.id} style={{ paddingLeft: `${level * 12 + 14}px` }}>
                       {(() => {
                         const isExpanded = expandedHighlightIds.has(entry.note.id);
+                        const isPlainNote =
+                          isManualHighlight(entry.note) && !entry.note.isChapterTitle;
                         const clampStyle = isExpanded
                           ? { whiteSpace: 'pre-wrap' as const }
                           : {
@@ -3897,10 +4125,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                                   return next;
                                 });
                               }}
-                              className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
+                              className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 group-hover:bg-gray-200 flex flex-col items-start ${
                                 entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
                               }`}
-                              style={{ borderLeft: `3px solid ${entry.note.color}` }}
+                              style={{
+                                borderLeft: `3px solid ${entry.note.color}`,
+                                borderLeftStyle: isPlainNote ? 'dashed' : 'solid'
+                              }}
                             >
                               <span className="leading-4 w-full" style={clampStyle}>
                                 {entry.note.text}
@@ -4171,7 +4402,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                           })}
                         </div>
                       ) : null}
-                      {pdfMarginChildrenByPage.get(index)?.length ? (
+                      {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
                         <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
                           {pdfMarginChildrenByPage.get(index)!.map((group) => {
                             const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
@@ -4192,28 +4423,97 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                                     const label = item.label?.trim() || '（空白）';
                                     if (item.kind === 'chapter') {
                                       return (
-                                        <button
-                                          key={item.key}
-                                          type="button"
-                                          className="w-full text-left rounded px-2 py-1 text-sm text-gray-700 border border-transparent hover:bg-gray-200 cursor-pointer"
-                                          onMouseDown={(event) => event.stopPropagation()}
-                                          onClick={(event) => openMarginToolbar(event, item)}
-                                        >
-                                          <span className="break-words">{label}</span>
-                                        </button>
+                                        <div key={item.key} className="relative group">
+                                          <button
+                                            type="button"
+                                            className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
+                                            style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
+                                            onMouseDown={(event) => event.stopPropagation()}
+                                            onClick={(event) => openMarginToolbar(event, item)}
+                                          >
+                                            <span className="truncate flex-1">{label}</span>
+                                          </button>
+                                          {item.node?.isCustom ? (
+                                            <button
+                                              type="button"
+                                              onMouseDown={(event) => event.stopPropagation()}
+                                              onClick={(event) => {
+                                                event.stopPropagation();
+                                                removeCustomChapter(item.node!.id);
+                                              }}
+                                              className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                              aria-label="删除章节"
+                                            >
+                                              <X size={12} />
+                                            </button>
+                                          ) : null}
+                                        </div>
                                       );
                                     }
+                                    const isExpanded = expandedHighlightIds.has(item.note?.id || '');
+                                    const clampStyle = isExpanded
+                                      ? { whiteSpace: 'pre-wrap' as const }
+                                      : {
+                                          display: '-webkit-box',
+                                          WebkitLineClamp: 2,
+                                          WebkitBoxOrient: 'vertical',
+                                          overflow: 'hidden'
+                                        };
                                     return (
-                                      <button
-                                        key={item.key}
-                                        type="button"
-                                        className="w-full text-left rounded px-2 py-1 text-xs text-gray-600 border border-transparent hover:bg-gray-200 cursor-pointer"
-                                        style={{ borderLeft: `3px solid ${swatch}` }}
-                                        onMouseDown={(event) => event.stopPropagation()}
-                                        onClick={(event) => openMarginToolbar(event, item)}
-                                      >
-                                        <span className="break-words leading-4 block">{label}</span>
-                                      </button>
+                                      <div key={item.key} className="relative group">
+                                        <button
+                                          type="button"
+                                          className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
+                                          style={{
+                                            borderLeft: `3px solid ${swatch}`,
+                                            paddingLeft: `${8 + (item.indentPx || 0)}px`
+                                          }}
+                                          onMouseDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => openMarginToolbar(event, item)}
+                                          onDoubleClick={(event) => {
+                                            event.stopPropagation();
+                                            if (!item.note) return;
+                                            setExpandedHighlightIds((prev) => {
+                                              const next = new Set(prev);
+                                              if (next.has(item.note!.id)) {
+                                                next.delete(item.note!.id);
+                                              } else {
+                                                next.add(item.note!.id);
+                                              }
+                                              return next;
+                                            });
+                                          }}
+                                        >
+                                          <span className="leading-4 w-full" style={clampStyle}>
+                                            {label}
+                                          </span>
+                                          {item.note &&
+                                          !item.note.isChapterTitle &&
+                                          !isManualHighlight(item.note) &&
+                                          item.note.translation ? (
+                                            <span
+                                              className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                              style={clampStyle}
+                                            >
+                                              {item.note.translation}
+                                            </span>
+                                          ) : null}
+                                        </button>
+                                        {item.note && !item.note.isChapterTitle ? (
+                                          <button
+                                            type="button"
+                                            onMouseDown={(event) => event.stopPropagation()}
+                                            onClick={(event) => {
+                                              event.stopPropagation();
+                                              removeHighlightNote(item.note!);
+                                            }}
+                                            className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                            aria-label="删除笔记"
+                                          >
+                                            <X size={12} />
+                                          </button>
+                                        ) : null}
+                                      </div>
                                     );
                                   })}
                                 </div>
