@@ -50,6 +50,7 @@ type OutlineNode = {
   isCustom?: boolean;
   parentId?: string | null;
   createdAt?: number;
+  order?: number;
 };
 
 type HighlightRect = {
@@ -71,6 +72,8 @@ type HighlightItem = {
   chapterNodeId?: string | null;
   translation?: string;
   questionIds?: string[];
+  source?: 'pdf' | 'manual';
+  order?: number;
 };
 
 type ChatThread = {
@@ -202,10 +205,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const [selectionText, setSelectionText] = useState('');
   const [selectionRect, setSelectionRect] = useState<{ left: number; right: number; top: number; bottom: number } | null>(null);
   const [selectionInfo, setSelectionInfo] = useState<{ pageIndex: number; rects: HighlightRect[]; text: string } | null>(null);
+  const [suppressTranslation, setSuppressTranslation] = useState(false);
   const [highlights, setHighlights] = useState<HighlightItem[]>([]);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const [activeHighlightColor, setActiveHighlightColor] = useState<string | null>(null);
   const [translationResult, setTranslationResult] = useState('');
+  const [activeMindmapNodeId, setActiveMindmapNodeId] = useState<string | null>(null);
   const [questions, setQuestions] = useState<Array<{ id: string; text: string }>>([]);
   const [isGeneratingQuestions, setIsGeneratingQuestions] = useState(false);
   const [questionGenerateError, setQuestionGenerateError] = useState('');
@@ -245,6 +250,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const [draggingTocNoteId, setDraggingTocNoteId] = useState<string | null>(null);
   const [draggingTocChapterId, setDraggingTocChapterId] = useState<string | null>(null);
   const [dragOverTocId, setDragOverTocId] = useState<string | null>(null);
+  const [mindmapEditing, setMindmapEditing] = useState<{
+    nodeId: string;
+    kind: 'note' | 'chapter';
+    targetId: string;
+  } | null>(null);
+  const [mindmapEditValue, setMindmapEditValue] = useState('');
   const [dragGhost, setDragGhost] = useState<{
     id: string;
     text: string;
@@ -855,6 +866,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setActiveHighlightId(null);
     setActiveHighlightColor(null);
     setTranslationResult('');
+    setSuppressTranslation(false);
   };
 
   const clearNativeSelection = () => {
@@ -880,12 +892,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   useEffect(() => {
+    if (suppressTranslation) {
+      translateRequestRef.current += 1;
+      setTranslationResult('');
+      pendingTranslationTextRef.current = null;
+      return;
+    }
     const source = normalizeTranslationText(selectionText);
     if (!source) {
       translateRequestRef.current += 1;
       setTranslationResult('');
       pendingTranslationTextRef.current = null;
       return;
+    }
+
+    if (activeHighlightId) {
+      const activeNote = highlights.find((item) => item.id === activeHighlightId);
+      if (activeNote && !activeNote.isChapterTitle) {
+        const noteText = normalizeTranslationText(activeNote.text);
+        if (noteText && noteText === source && activeNote.translation) {
+          setTranslationResult(activeNote.translation);
+          return;
+        }
+      }
     }
 
     const cached = translationCacheRef.current.get(source);
@@ -939,17 +968,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
 
     run();
-  }, [selectionText, selectionInfo?.pageIndex]);
+  }, [selectionText, selectionInfo?.pageIndex, suppressTranslation, activeHighlightId, highlights]);
 
   const findChapterForPosition = (
     pageIndex: number,
     topRatio: number,
-    sourceList: OutlineNode[] = flatOutline
+    sourceList?: OutlineNode[]
   ) => {
-    if (!sourceList.length || pageIndex == null) return null;
+    const list = sourceList && sourceList.length ? sourceList : highlightParentOutline;
+    if (!list.length || pageIndex == null) return null;
     const ratio = typeof topRatio === 'number' ? topRatio : 0;
     let candidate: OutlineNode | null = null;
-    sourceList.forEach((node) => {
+    list.forEach((node) => {
       if (node.pageIndex == null) return;
       const nodeRatio = typeof node.topRatio === 'number' ? node.topRatio : 0;
       const isBefore =
@@ -961,7 +991,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     });
 
     if (candidate?.isRoot) {
-      const samePageHeadings = sourceList
+      const samePageHeadings = list
         .filter(
           (node) =>
             !node.isRoot &&
@@ -997,7 +1027,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const cachedTranslation = translationCacheRef.current.get(
       normalizeTranslationText(selectionText)
     );
-    return {
+    const base: HighlightItem = {
       id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       text: selectionText,
       color,
@@ -1006,8 +1036,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       chapterId,
       isChapterTitle: false,
       translation: cachedTranslation || undefined,
+      source: 'pdf',
       ...options
     } as HighlightItem;
+    let nextOrder = base.order;
+    if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
+      nextOrder = getCombinedOrderValue(base.chapterId);
+    }
+    return { ...base, order: nextOrder };
   };
 
   const buildHighlightFromSelectionData = (
@@ -1024,7 +1060,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const cachedTranslation = translationCacheRef.current.get(
       normalizeTranslationText(text)
     );
-    return {
+    const base: HighlightItem = {
       id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
       text,
       color,
@@ -1033,8 +1069,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       chapterId,
       isChapterTitle: false,
       translation: cachedTranslation || undefined,
+      source: 'pdf',
       ...options
     } as HighlightItem;
+    let nextOrder = base.order;
+    if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
+      nextOrder = getCombinedOrderValue(base.chapterId);
+    }
+    return { ...base, order: nextOrder };
+  };
+
+  const isManualHighlight = (item: HighlightItem) => {
+    if (item.source === 'manual') return true;
+    if (item.source === 'pdf') return false;
+    const rects = Array.isArray(item.rects) ? item.rects : [];
+    if (!rects.length) return true;
+    return rects.every((rect) => Number(rect.w || 0) === 0 && Number(rect.h || 0) === 0);
   };
 
   const findParentNode = (
@@ -1287,8 +1337,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     if (!rects.length || selectionInfo.pageIndex == null) return;
     const topRatio = Math.min(...rects.map((rect) => rect.y ?? 0));
     const pageIndex = selectionInfo.pageIndex;
-    const parentChapter = findChapterForPosition(pageIndex, topRatio, baseFlatOutline);
+    const parentChapter = findChapterForPosition(pageIndex, topRatio, highlightParentOutline);
     const parentId = parentChapter && !parentChapter.isRoot ? parentChapter.id : outlineRootId;
+    const activeHighlight = activeHighlightId
+      ? highlights.find((item) => item.id === activeHighlightId)
+      : null;
+    const order =
+      activeHighlight && !activeHighlight.isChapterTitle
+        ? getCombinedEntryOrderValue(parentId, 'note', activeHighlight.id) ??
+          getCombinedOrderValue(parentId)
+        : getCombinedOrderValue(parentId);
 
     const chapterNode: OutlineNode = {
       id: `custom-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -1298,7 +1356,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       items: [],
       isCustom: true,
       parentId,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      order
     };
 
     setCustomChapters((prev) => [...prev, chapterNode]);
@@ -1421,6 +1480,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       }));
 
     setSelectionText(text);
+    setSuppressTranslation(false);
     setSelectionRect({
       left: rect.left,
       right: rect.right,
@@ -1469,6 +1529,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setActiveHighlightId(highlight.id);
     setActiveHighlightColor(highlight.color);
     setSelectionText(highlight.text);
+    setSuppressTranslation(false);
     setSelectionInfo({
       pageIndex: highlight.pageIndex,
       rects: highlight.rects,
@@ -1480,6 +1541,53 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       top: pageRect.top + rect.y * pageRect.height,
       bottom: pageRect.top + (rect.y + rect.h) * pageRect.height
     });
+  };
+
+  const openMarginToolbar = (
+    event: React.MouseEvent<HTMLElement>,
+    item: {
+      kind: 'note' | 'chapter';
+      label: string;
+      note?: HighlightItem;
+      node?: OutlineNode;
+      color?: string;
+    }
+  ) => {
+    if (viewMode !== ReaderMode.PDF) return;
+    event.preventDefault();
+    event.stopPropagation();
+    clearNativeSelection();
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const text =
+      item.kind === 'note' && item.note ? item.note.text : item.label;
+    const safeText = text && text.trim().length ? text : item.label || ' ';
+    setSelectionRect({
+      left: rect.left,
+      right: rect.right,
+      top: rect.top,
+      bottom: rect.bottom
+    });
+    setSelectionText(safeText);
+    setSuppressTranslation(item.kind === 'chapter');
+    if (item.kind === 'note' && item.note?.translation) {
+      setTranslationResult(item.note.translation);
+    } else if (item.kind === 'chapter') {
+      setTranslationResult('');
+    }
+    if (item.kind === 'note' && item.note) {
+      const note = item.note;
+      setSelectionInfo({
+        pageIndex: note.pageIndex,
+        rects: Array.isArray(note.rects) ? note.rects : [],
+        text: note.text
+      });
+      setActiveHighlightId(note.id);
+      setActiveHighlightColor(note.color);
+      return;
+    }
+    setSelectionInfo(null);
+    setActiveHighlightId(null);
+    setActiveHighlightColor(null);
   };
 
   useEffect(() => {
@@ -1543,41 +1651,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
   const handleMindMapNodeClick = (node: MindMapNode) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
+    setActiveMindmapNodeId(node.id);
     if (dragNoteTriggeredRef.current || draggingNoteId || dragChapterTriggeredRef.current || draggingChapterId) {
       return;
     }
     if (node.kind === 'note' && node.note) {
       jumpToHighlight(node.note as HighlightItem);
-      return;
-    }
-
-    const originalNode = mindmapNodeMap.get(node.id);
-    const hasChildren = Boolean(originalNode?.children && originalNode.children.length);
-    if (node.kind !== 'note' && hasChildren) {
-      const layout = mindmapLayoutRef.current;
-      if (layout) {
-        const targetNode = layout.nodes.find((item) => item.id === node.id);
-        if (targetNode) {
-          mindmapAnchorRef.current = {
-            id: node.id,
-            x:
-              (targetNode.x + targetNode.width / 2 + layout.offset.x) * mindmapZoomScale +
-              mindmapOffset.x,
-            y:
-              (targetNode.y + targetNode.height / 2 + layout.offset.y) * mindmapZoomScale +
-              mindmapOffset.y
-          };
-        }
-      }
-      setCollapsedMindmapIds((prev) => {
-        const next = new Set(prev);
-        if (next.has(node.id)) {
-          next.delete(node.id);
-        } else {
-          next.add(node.id);
-        }
-        return next;
-      });
       return;
     }
 
@@ -1590,6 +1669,509 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const top = target.offsetTop + offset;
     container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
   };
+
+  const handleMindmapToggleCollapse = (node: MindMapNode) => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    const originalNode = mindmapNodeMap.get(node.id);
+    const hasChildren = Boolean(originalNode?.children && originalNode.children.length);
+    if (!hasChildren) return;
+    const layout = mindmapLayoutRef.current;
+    if (layout) {
+      const targetNode = layout.nodes.find((item) => item.id === node.id);
+      if (targetNode) {
+        mindmapAnchorRef.current = {
+          id: node.id,
+          x:
+            (targetNode.x + targetNode.width / 2 + layout.offset.x) * mindmapZoomScale +
+            mindmapOffset.x,
+          y:
+            (targetNode.y + targetNode.height / 2 + layout.offset.y) * mindmapZoomScale +
+            mindmapOffset.y
+        };
+      }
+    }
+    setCollapsedMindmapIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(node.id)) {
+        next.delete(node.id);
+      } else {
+        next.add(node.id);
+      }
+      return next;
+    });
+  };
+
+  const handleMindmapNodeDoubleClick = (
+    node: MindMapNode,
+    event: React.MouseEvent<SVGGElement>
+  ) => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      if (note.isChapterTitle) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setMindmapEditing({ nodeId: node.id, kind: 'note', targetId: note.id });
+      setMindmapEditValue(note.text || '');
+      return;
+    }
+    if (node.kind === 'chapter' && customChapterIdSet.has(node.id)) {
+      event.preventDefault();
+      event.stopPropagation();
+      setMindmapEditing({ nodeId: node.id, kind: 'chapter', targetId: node.id });
+      setMindmapEditValue(node.text || '');
+    }
+  };
+
+  const cancelMindmapEdit = () => {
+    setMindmapEditing(null);
+    setMindmapEditValue('');
+  };
+
+  const commitMindmapEdit = (node: MindMapNode, value: string) => {
+    if (!mindmapEditing) return;
+    const nextText = String(value || '').trim();
+    if (!nextText) {
+      cancelMindmapEdit();
+      return;
+    }
+    if (mindmapEditing.kind === 'note') {
+      const targetNote = highlights.find((item) => item.id === mindmapEditing.targetId);
+      const isManual = targetNote ? isManualHighlight(targetNote) : false;
+      const stableOrder =
+        targetNote && typeof targetNote.order === 'number'
+          ? targetNote.order
+          : targetNote
+            ? getCombinedEntryOrderValue(targetNote.chapterId, 'note', targetNote.id)
+            : undefined;
+      setHighlights((prev) =>
+        prev.map((item) =>
+          item.id === mindmapEditing.targetId
+            ? {
+                ...item,
+                text: nextText,
+                translation: isManual ? nextText : undefined,
+                order: stableOrder ?? item.order
+              }
+            : item
+        )
+      );
+      cancelMindmapEdit();
+      return;
+    }
+    if (mindmapEditing.kind === 'chapter') {
+      const parentId = resolveParentForChapter(mindmapEditing.targetId);
+      const targetChapter = customChapters.find((item) => item.id === mindmapEditing.targetId);
+      const stableOrder =
+        targetChapter && typeof targetChapter.order === 'number'
+          ? targetChapter.order
+          : getCombinedEntryOrderValue(parentId, 'node', mindmapEditing.targetId);
+      setCustomChapters((prev) =>
+        prev.map((item) =>
+          item.id === mindmapEditing.targetId
+            ? { ...item, title: nextText, order: stableOrder ?? item.order }
+            : item
+        )
+      );
+      setHighlights((prev) =>
+        prev.map((item) =>
+          item.isChapterTitle && item.chapterNodeId === mindmapEditing.targetId
+            ? { ...item, text: nextText, translation: undefined }
+            : item
+        )
+      );
+      cancelMindmapEdit();
+    }
+  };
+
+  const getMindmapDraftText = (nodeId: string, fallback: string) => {
+    if (mindmapEditing?.nodeId === nodeId) return mindmapEditValue;
+    return fallback;
+  };
+
+  const handleMindmapAddChild = (node: MindMapNode) => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      const chapterId = note.chapterId || outlineRootId;
+      const pageIndex =
+        typeof note.pageIndex === 'number'
+          ? note.pageIndex
+          : typeof node.pageIndex === 'number'
+            ? node.pageIndex
+            : 0;
+      const baseTop = note.rects?.[0]?.y ?? 0.99;
+      const rects = [
+        {
+          pageIndex,
+          x: 0,
+          y: Math.min(0.99, baseTop + 0.0001),
+          w: 0,
+          h: 0
+        }
+      ];
+      const newNote: HighlightItem = {
+        id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        text: '新笔记',
+        color: HIGHLIGHT_COLORS[0]?.fill || 'rgba(250, 204, 21, 0.45)',
+        pageIndex,
+        rects,
+        chapterId,
+        isChapterTitle: false,
+        translation: '新笔记',
+        source: 'manual',
+        order: getCombinedOrderValue(chapterId)
+      };
+      setHighlights((prev) => [...prev, newNote]);
+      setActiveHighlightId(newNote.id);
+      setExpandedTOC((prev) => {
+        const next = new Set(prev);
+        next.add(chapterId);
+        return next;
+      });
+      setCollapsedMindmapIds((prev) => {
+        if (!prev.has(chapterId)) return prev;
+        const next = new Set(prev);
+        next.delete(chapterId);
+        return next;
+      });
+      setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
+      setMindmapEditValue(newNote.text);
+      return;
+    }
+
+    const parentId = node.kind === 'root' ? outlineRootId : node.id;
+    const pageIndex = typeof node.pageIndex === 'number' ? node.pageIndex : 0;
+    const topRatio = typeof node.topRatio === 'number' ? node.topRatio : 0;
+    const newId = `custom-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const order = getCombinedOrderValue(parentId);
+    const chapterNode: OutlineNode = {
+      id: newId,
+      title: '新节点',
+      pageIndex,
+      topRatio,
+      items: [],
+      isCustom: true,
+      parentId,
+      createdAt: Date.now(),
+      order
+    };
+    setCustomChapters((prev) => [...prev, chapterNode]);
+    setExpandedTOC((prev) => {
+      const next = new Set(prev);
+      next.add(parentId);
+      next.add(newId);
+      return next;
+    });
+    setChapterParentOverrides((prev) => ({
+      ...prev,
+      [newId]: parentId
+    }));
+    setCollapsedMindmapIds((prev) => {
+      if (!prev.has(parentId)) return prev;
+      const next = new Set(prev);
+      next.delete(parentId);
+      return next;
+    });
+    setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
+    setMindmapEditValue(chapterNode.title);
+  };
+
+  const handleMindmapAddSibling = (node: MindMapNode) => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    if (node.kind === 'root') return;
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      const chapterId = note.chapterId || outlineRootId;
+      const pageIndex =
+        typeof note.pageIndex === 'number'
+          ? note.pageIndex
+          : typeof node.pageIndex === 'number'
+            ? node.pageIndex
+            : 0;
+      const baseTop = note.rects?.[0]?.y ?? 0.99;
+      const rects = [
+        {
+          pageIndex,
+          x: 0,
+          y: Math.min(0.99, baseTop + 0.0001),
+          w: 0,
+          h: 0
+        }
+      ];
+      const newNote: HighlightItem = {
+        id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        text: '新笔记',
+        color: HIGHLIGHT_COLORS[0]?.fill || 'rgba(250, 204, 21, 0.45)',
+        pageIndex,
+        rects,
+        chapterId,
+        isChapterTitle: false,
+        translation: '新笔记',
+        source: 'manual',
+        order: getCombinedOrderValueAfter(chapterId, 'note', note.id)
+      };
+      setHighlights((prev) => [...prev, newNote]);
+      setActiveHighlightId(newNote.id);
+      setExpandedTOC((prev) => {
+        const next = new Set(prev);
+        next.add(chapterId);
+        return next;
+      });
+      setCollapsedMindmapIds((prev) => {
+        if (!prev.has(chapterId)) return prev;
+        const next = new Set(prev);
+        next.delete(chapterId);
+        return next;
+      });
+      setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
+      setMindmapEditValue(newNote.text);
+      return;
+    }
+
+    if (node.kind === 'chapter') {
+      const parentId = mindmapParentMap.get(node.id) || outlineRootId;
+      if (!parentId) return;
+      const pageIndex = typeof node.pageIndex === 'number' ? node.pageIndex : 0;
+      const topRatioBase = typeof node.topRatio === 'number' ? node.topRatio : 0;
+      const topRatio = Math.min(0.99, Math.max(0, topRatioBase + 0.0001));
+      const newId = `custom-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const order = getNodeOrderValueAfter(parentId, node.id);
+      const chapterNode: OutlineNode = {
+        id: newId,
+        title: '新节点',
+        pageIndex,
+        topRatio,
+        items: [],
+        isCustom: true,
+        parentId,
+        createdAt: Date.now(),
+        order
+      };
+      setCustomChapters((prev) => [...prev, chapterNode]);
+      setExpandedTOC((prev) => {
+        const next = new Set(prev);
+        next.add(parentId);
+        next.add(newId);
+        return next;
+      });
+      setChapterParentOverrides((prev) => ({
+        ...prev,
+        [newId]: parentId
+      }));
+      setCollapsedMindmapIds((prev) => {
+        if (!prev.has(parentId)) return prev;
+        const next = new Set(prev);
+        next.delete(parentId);
+        return next;
+      });
+      setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
+      setMindmapEditValue(chapterNode.title);
+    }
+  };
+
+  const removeHighlightNote = (note: HighlightItem) => {
+    if (note.isChapterTitle) return;
+    setHighlights((prev) => prev.filter((item) => item.id !== note.id));
+    setExpandedHighlightIds((prev) => {
+      if (!prev.has(note.id)) return prev;
+      const next = new Set(prev);
+      next.delete(note.id);
+      return next;
+    });
+    if (activeHighlightId === note.id) {
+      setActiveHighlightId(null);
+    }
+    if (mindmapEditing?.targetId === note.id) {
+      cancelMindmapEdit();
+    }
+  };
+
+  const handleMindmapDelete = (node: MindMapNode) => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      removeHighlightNote(note);
+      return;
+    }
+    if (node.kind === 'chapter' && customChapterIdSet.has(node.id)) {
+      removeCustomChapter(node.id, { keepSelection: true });
+      if (mindmapEditing?.targetId === node.id) {
+        cancelMindmapEdit();
+      }
+    }
+  };
+
+  const isMindmapNodeDeletable = (node: MindMapNode) => {
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      return !note.isChapterTitle;
+    }
+    if (node.kind === 'chapter') return customChapterIdSet.has(node.id);
+    return false;
+  };
+
+  const isMindmapNodeSiblingAddable = (node: MindMapNode) => node.kind !== 'root';
+
+  const handleMindmapToolbarColor = (node: MindMapNode, color: string) => {
+    if (node.kind === 'note' && node.note) {
+      const note = node.note as HighlightItem;
+      if (note.isChapterTitle && note.chapterNodeId) {
+        const draftText = getMindmapDraftText(`note-${note.id}`, note.text || '');
+        detachCustomChapter(note.chapterNodeId, {
+          keepHighlightId: note.id,
+          keepHighlightColor: color
+        });
+        setHighlights((prev) =>
+          prev.map((item) => (item.id === note.id ? { ...item, text: draftText } : item))
+        );
+        setMindmapEditing({ nodeId: `note-${note.id}`, kind: 'note', targetId: note.id });
+        setMindmapEditValue(draftText);
+        return;
+      }
+      setHighlights((prev) =>
+        prev.map((item) => (item.id === note.id ? { ...item, color } : item))
+      );
+      return;
+    }
+    if (node.kind === 'chapter' && customChapterIdSet.has(node.id)) {
+      const chapterTitle = highlights.find(
+        (item) => item.isChapterTitle && item.chapterNodeId === node.id
+      );
+      const draftText = getMindmapDraftText(node.id, node.text || '');
+      if (chapterTitle) {
+        detachCustomChapter(node.id, {
+          keepHighlightId: chapterTitle.id,
+          keepHighlightColor: color
+        });
+        setHighlights((prev) =>
+          prev.map((item) =>
+            item.id === chapterTitle.id ? { ...item, text: draftText } : item
+          )
+        );
+        setMindmapEditing({
+          nodeId: `note-${chapterTitle.id}`,
+          kind: 'note',
+          targetId: chapterTitle.id
+        });
+        setMindmapEditValue(draftText || chapterTitle.text || node.text || '');
+        return;
+      }
+      const parentId = resolveParentForChapter(node.id);
+      const text = String(draftText || node.text || '').trim() || '新笔记';
+      const pageIndex = typeof node.pageIndex === 'number' ? node.pageIndex : 0;
+      const topRatio =
+        typeof node.topRatio === 'number' ? Math.min(0.99, Math.max(0, node.topRatio)) : 0.99;
+      const rects = [
+        {
+          pageIndex,
+          x: 0,
+          y: topRatio,
+          w: 0,
+          h: 0
+        }
+      ];
+      const newNote: HighlightItem = {
+        id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        text,
+        color,
+        pageIndex,
+        rects,
+        chapterId: parentId,
+        isChapterTitle: false,
+        translation: text,
+        source: 'manual',
+        order: getCombinedEntryOrderValue(parentId, 'node', node.id)
+      };
+      detachCustomChapter(node.id);
+      setHighlights((prev) => [...prev, newNote]);
+      setActiveHighlightId(newNote.id);
+      setExpandedTOC((prev) => {
+        const next = new Set(prev);
+        next.add(parentId);
+        return next;
+      });
+      setCollapsedMindmapIds((prev) => {
+        if (!prev.has(parentId)) return prev;
+        const next = new Set(prev);
+        next.delete(parentId);
+        return next;
+      });
+      setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
+      setMindmapEditValue(draftText || text);
+    }
+  };
+
+  const handleMindmapToolbarMakeChapter = (node: MindMapNode) => {
+    if (node.kind !== 'note' || !node.note) return;
+    const note = node.note as HighlightItem;
+    if (note.isChapterTitle) return;
+    const draftText = getMindmapDraftText(node.id, note.text || '');
+    const title = String(draftText || '').trim();
+    if (!title) return;
+    const rects = Array.isArray(note.rects) ? note.rects.filter((rect) => rect.pageIndex >= 0) : [];
+    const topRatio = rects.length ? Math.min(...rects.map((rect) => rect.y ?? 0)) : 0;
+    const pageIndex =
+      typeof note.pageIndex === 'number'
+        ? note.pageIndex
+        : rects.length
+          ? rects[0].pageIndex
+          : 0;
+    const parentId = note.chapterId || outlineRootId;
+    const newId = `custom-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const order =
+      getCombinedEntryOrderValue(parentId, 'note', note.id) ??
+      getCombinedOrderValue(parentId);
+    const chapterNode: OutlineNode = {
+      id: newId,
+      title,
+      pageIndex,
+      topRatio,
+      items: [],
+      isCustom: true,
+      parentId,
+      createdAt: Date.now(),
+      order
+    };
+    setCustomChapters((prev) => [...prev, chapterNode]);
+    setExpandedTOC((prev) => {
+      const next = new Set(prev);
+      next.add(parentId);
+      next.add(newId);
+      return next;
+    });
+    setChapterParentOverrides((prev) => ({
+      ...prev,
+      [newId]: parentId
+    }));
+    setHighlights((prev) =>
+      prev.map((item) =>
+        item.id === note.id
+          ? {
+              ...item,
+              text: title,
+              isChapterTitle: true,
+              chapterId: newId,
+              chapterNodeId: newId,
+              color: 'rgba(107, 114, 128, 0.35)'
+            }
+          : item
+      )
+    );
+    setActiveHighlightId(note.id);
+    setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
+    setMindmapEditValue(draftText);
+  };
+
+  const handleMindmapToolbarClear = (node: MindMapNode) => {
+    handleMindmapDelete(node);
+  };
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.MIND_MAP && mindmapEditing) {
+      cancelMindmapEdit();
+    }
+  }, [viewMode, mindmapEditing]);
 
   const handleMindmapLayout = (layout: MindMapLayout | null) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
@@ -1747,6 +2329,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   ) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
     if (event.button !== 0) return;
+    setActiveMindmapNodeId(node.id);
     const target = event.currentTarget;
     const rect = target.getBoundingClientRect();
     const offsetX = event.clientX - rect.left;
@@ -2112,6 +2695,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
   const baseFlatOutline = useMemo(() => getFlatOutlineByPosition(baseOutline), [baseOutline]);
 
+  const sortOutlineNodes = (nodes: OutlineNode[]) => {
+    if (!nodes.length) return;
+    const baseSorted = nodes.map((node) => node);
+    baseSorted.sort((a, b) => {
+      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+      }
+      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
+        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+      }
+      return a.title.localeCompare(b.title);
+    });
+    const baseOrder = new Map<string, number>();
+    baseSorted.forEach((node, index) => {
+      baseOrder.set(node.id, index);
+    });
+
+    const indexed = nodes.map((node, index) => ({ node, index }));
+    indexed.sort((a, b) => {
+      const aBase = baseOrder.get(a.node.id) ?? a.index;
+      const bBase = baseOrder.get(b.node.id) ?? b.index;
+      const aOrder = typeof a.node.order === 'number' ? a.node.order : aBase;
+      const bOrder = typeof b.node.order === 'number' ? b.node.order : bBase;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      if (aBase !== bBase) return aBase - bBase;
+      return a.node.title.localeCompare(b.node.title);
+    });
+    nodes.splice(0, nodes.length, ...indexed.map((entry) => entry.node));
+    nodes.forEach((node) => {
+      if (node.items?.length) sortOutlineNodes(node.items);
+    });
+  };
+
   const mergeOutlineWithCustom = (
     outline: OutlineNode[],
     customNodes: OutlineNode[],
@@ -2167,23 +2783,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       rootItems.push(normalized);
     });
 
-    const sortChildren = (nodes: OutlineNode[]) => {
-      if (!nodes.length) return;
-      nodes.sort((a, b) => {
-        if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
-          return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
-        }
-        if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
-          return (a.topRatio ?? 0) - (b.topRatio ?? 0);
-        }
-        return a.title.localeCompare(b.title);
-      });
-      nodes.forEach((node) => {
-        if (node.items?.length) sortChildren(node.items);
-      });
-    };
-
-    sortChildren(rootItems);
+    sortOutlineNodes(rootItems);
     return rootItems;
   };
 
@@ -2241,8 +2841,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
   const outlineDisplay = useMemo(() => {
     const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlatOutline, outlineRootId);
-    return applyParentOverrides(merged, chapterParentOverrides);
+    const applied = applyParentOverrides(merged, chapterParentOverrides);
+    sortOutlineNodes(applied);
+    return applied;
   }, [baseOutline, customChapters, baseFlatOutline, outlineRootId, chapterParentOverrides]);
+
+  const findOutlineNodeById = (nodes: OutlineNode[], targetId: string): OutlineNode | null => {
+    for (const node of nodes) {
+      if (node.id === targetId) return node;
+      if (node.items?.length) {
+        const found = findOutlineNodeById(node.items, targetId);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
 
   useEffect(() => {
     const map = new Map<string, string | null>();
@@ -2258,17 +2871,206 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     tocParentMapRef.current = map;
   }, [outlineDisplay]);
 
-  const flatOutline = useMemo(
-    () => getFlatOutlineByPosition(outlineDisplay),
-    [outlineDisplay]
-  );
-
   const getHighlightSortKey = (item: HighlightItem) => {
     const rects = item.rects || [];
     const pageIndex =
       item.pageIndex ?? (rects.length ? rects[0].pageIndex : 0);
     const top = rects.length ? Math.min(...rects.map((rect) => rect.y ?? 0)) : 0;
     return { pageIndex, top };
+  };
+
+  type CombinedEntry = {
+    key: string;
+    kind: 'node' | 'note';
+    id: string;
+    order?: number;
+    pageIndex: number;
+    top: number;
+    index: number;
+  };
+
+  const buildCombinedEntries = (nodes: OutlineNode[], notes: HighlightItem[]) => {
+    const entries: CombinedEntry[] = [
+      ...nodes.map((node, index) => ({
+        key: `node:${node.id}`,
+        kind: 'node' as const,
+        id: node.id,
+        order: node.order,
+        pageIndex:
+          typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
+        top: typeof node.topRatio === 'number' ? node.topRatio : 0,
+        index
+      })),
+      ...notes.map((note, index) => {
+        const key = getHighlightSortKey(note);
+        return {
+          key: `note:${note.id}`,
+          kind: 'note' as const,
+          id: note.id,
+          order: note.order,
+          pageIndex:
+            typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
+          top: typeof key.top === 'number' ? key.top : 0,
+          index: index + nodes.length
+        };
+      })
+    ];
+    return entries;
+  };
+
+  const getCombinedFallbackOrder = (entries: CombinedEntry[]) => {
+    const fallbackSorted = entries.slice().sort((a, b) => {
+      if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
+      if (a.top !== b.top) return a.top - b.top;
+      return a.index - b.index;
+    });
+    const map = new Map<string, number>();
+    fallbackSorted.forEach((entry, idx) => {
+      map.set(entry.key, idx);
+    });
+    return map;
+  };
+
+  const sortCombinedEntries = (entries: CombinedEntry[]) => {
+    const fallbackOrder = getCombinedFallbackOrder(entries);
+    return entries.slice().sort((a, b) => {
+      const aOrder =
+        typeof a.order === 'number' ? a.order : (fallbackOrder.get(a.key) ?? 0);
+      const bOrder =
+        typeof b.order === 'number' ? b.order : (fallbackOrder.get(b.key) ?? 0);
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return (fallbackOrder.get(a.key) ?? 0) - (fallbackOrder.get(b.key) ?? 0);
+    });
+  };
+
+  const getCombinedOrderValue = (parentId: string) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    const notes = highlights.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    const entries = buildCombinedEntries(nodes, notes);
+    if (!entries.length) return 0;
+    const fallbackOrder = getCombinedFallbackOrder(entries);
+    let maxOrder = -Infinity;
+    entries.forEach((entry) => {
+      const value =
+        typeof entry.order === 'number' ? entry.order : (fallbackOrder.get(entry.key) ?? 0);
+      if (value > maxOrder) maxOrder = value;
+    });
+    if (!Number.isFinite(maxOrder)) return 0;
+    return maxOrder + 1;
+  };
+
+  const getCombinedEntryOrderValue = (
+    parentId: string,
+    kind: 'node' | 'note',
+    id: string
+  ) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    const notes = highlights.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    const entries = buildCombinedEntries(nodes, notes);
+    if (!entries.length) return undefined;
+    const fallbackOrder = getCombinedFallbackOrder(entries);
+    const targetKey = `${kind}:${id}`;
+    const target = entries.find((entry) => entry.key === targetKey);
+    if (!target) return undefined;
+    if (typeof target.order === 'number') return target.order;
+    return fallbackOrder.get(target.key);
+  };
+
+  const getCombinedOrderValueAfter = (
+    parentId: string,
+    kind: 'node' | 'note',
+    id: string
+  ) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    const notes = highlights.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    const entries = buildCombinedEntries(nodes, notes);
+    if (!entries.length) return 0;
+    const sorted = sortCombinedEntries(entries);
+    const fallbackOrder = getCombinedFallbackOrder(entries);
+    const targetKey = `${kind}:${id}`;
+    const index = sorted.findIndex((entry) => entry.key === targetKey);
+    if (index === -1) return getCombinedOrderValue(parentId);
+    const current = sorted[index];
+    const currentOrder =
+      typeof current.order === 'number'
+        ? current.order
+        : (fallbackOrder.get(current.key) ?? index);
+    const next = sorted[index + 1];
+    if (!next) return currentOrder + 1;
+    const nextOrder =
+      typeof next.order === 'number'
+        ? next.order
+        : (fallbackOrder.get(next.key) ?? currentOrder + 1);
+    if (nextOrder - currentOrder > 1e-6) {
+      return (currentOrder + nextOrder) / 2;
+    }
+    return currentOrder + 0.0001;
+  };
+
+  const getNodeOrderValueAfter = (parentId: string, nodeId: string) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    if (!nodes.length) return 0;
+    const baseSorted = nodes.slice().sort((a, b) => {
+      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+      }
+      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
+        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+      }
+      return a.title.localeCompare(b.title);
+    });
+    const baseOrder = new Map<string, number>();
+    baseSorted.forEach((node, index) => {
+      baseOrder.set(node.id, index);
+    });
+    const indexed = nodes.map((node, index) => ({ node, index }));
+    indexed.sort((a, b) => {
+      const aBase = baseOrder.get(a.node.id) ?? a.index;
+      const bBase = baseOrder.get(b.node.id) ?? b.index;
+      const aOrder = typeof a.node.order === 'number' ? a.node.order : aBase;
+      const bOrder = typeof b.node.order === 'number' ? b.node.order : bBase;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      if (aBase !== bBase) return aBase - bBase;
+      return a.node.title.localeCompare(b.node.title);
+    });
+    const sorted = indexed.map((entry) => entry.node);
+    const index = sorted.findIndex((node) => node.id === nodeId);
+    if (index === -1) return getCombinedOrderValue(parentId);
+    const current = sorted[index];
+    const currentBase = baseOrder.get(current.id) ?? index;
+    const currentOrder =
+      typeof current.order === 'number' ? current.order : currentBase;
+    const next = sorted[index + 1];
+    if (!next) return currentOrder + 1;
+    const nextBase = baseOrder.get(next.id) ?? currentOrder + 1;
+    const nextOrder =
+      typeof next.order === 'number' ? next.order : nextBase;
+    if (nextOrder - currentOrder > 1e-6) {
+      return (currentOrder + nextOrder) / 2;
+    }
+    return currentOrder + 0.0001;
   };
 
   const highlightsByChapter = useMemo(() => {
@@ -2279,16 +3081,169 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       list.push(item);
       map.set(item.chapterId, list);
     });
-    map.forEach((list) => {
-      list.sort((a, b) => {
-        const aKey = getHighlightSortKey(a);
-        const bKey = getHighlightSortKey(b);
-        if (aKey.pageIndex !== bKey.pageIndex) return aKey.pageIndex - bKey.pageIndex;
-        return aKey.top - bKey.top;
-      });
-    });
     return map;
   }, [highlights]);
+
+  const pdfMarginChildrenByPage = useMemo(() => {
+    const map = new Map<
+      number,
+      Array<{
+        parentId: string;
+        topRatio: number;
+        items: Array<{
+          key: string;
+          label: string;
+          kind: 'note' | 'chapter';
+          color?: string;
+          note?: HighlightItem;
+          node?: OutlineNode;
+          sortPage: number;
+          sortTop: number;
+        }>;
+      }>
+    >();
+    if (viewMode !== ReaderMode.PDF || !outlineDisplay.length) return map;
+
+    const highlightChapterNodeIdSet = new Set<string>();
+    highlights.forEach((item) => {
+      if (!item.isChapterTitle) return;
+      if (isManualHighlight(item)) return;
+      const nodeId = item.chapterNodeId || item.chapterId;
+      if (nodeId) highlightChapterNodeIdSet.add(nodeId);
+    });
+
+    const chapterAnchors: OutlineNode[] = [];
+    const collectAnchors = (nodes: OutlineNode[]) => {
+      nodes.forEach((node) => {
+        if (!node.isRoot) chapterAnchors.push(node);
+        if (node.items?.length) collectAnchors(node.items);
+      });
+    };
+    collectAnchors(outlineDisplay);
+    chapterAnchors.sort((a, b) => {
+      const aPage = typeof a.pageIndex === 'number' ? a.pageIndex : Number.POSITIVE_INFINITY;
+      const bPage = typeof b.pageIndex === 'number' ? b.pageIndex : Number.POSITIVE_INFINITY;
+      if (aPage !== bPage) return aPage - bPage;
+      const aTop = typeof a.topRatio === 'number' ? a.topRatio : 0;
+      const bTop = typeof b.topRatio === 'number' ? b.topRatio : 0;
+      if (aTop !== bTop) return aTop - bTop;
+      return a.title.localeCompare(b.title);
+    });
+
+    const findAnchorForChapter = (child: OutlineNode) => {
+      const pageIndex = typeof child.pageIndex === 'number' ? child.pageIndex : 0;
+      const ratio = typeof child.topRatio === 'number' ? child.topRatio : 0;
+      let candidate: OutlineNode | null = null;
+      for (const anchor of chapterAnchors) {
+        if (typeof anchor.pageIndex !== 'number') continue;
+        const anchorRatio = typeof anchor.topRatio === 'number' ? anchor.topRatio : 0;
+        const isBefore =
+          anchor.pageIndex < pageIndex ||
+          (anchor.pageIndex === pageIndex &&
+            (anchorRatio < ratio || (anchorRatio === ratio && anchor.id !== child.id)));
+        if (isBefore) {
+          candidate = anchor;
+          continue;
+        }
+        if (
+          anchor.pageIndex > pageIndex ||
+          (anchor.pageIndex === pageIndex && anchorRatio > ratio)
+        ) {
+          break;
+        }
+      }
+      return candidate || child;
+    };
+
+    const groupsByPage = new Map<number, Map<string, { parentId: string; topRatio: number; items: Array<{
+      key: string;
+      label: string;
+      kind: 'note' | 'chapter';
+      color?: string;
+      note?: HighlightItem;
+      node?: OutlineNode;
+      sortPage: number;
+      sortTop: number;
+    }>}>>();
+
+    const addToGroup = (
+      anchor: OutlineNode,
+      item: {
+        key: string;
+        label: string;
+        kind: 'note' | 'chapter';
+        color?: string;
+        note?: HighlightItem;
+        node?: OutlineNode;
+        sortPage: number;
+        sortTop: number;
+      }
+    ) => {
+      const pageIndex = typeof anchor.pageIndex === 'number' ? anchor.pageIndex : item.sortPage;
+      const topRatio = typeof anchor.topRatio === 'number' ? anchor.topRatio : 0;
+      if (!Number.isFinite(pageIndex)) return;
+      const pageMap = groupsByPage.get(pageIndex) || new Map();
+      let group = pageMap.get(anchor.id);
+      if (!group) {
+        group = { parentId: anchor.id, topRatio, items: [] };
+        pageMap.set(anchor.id, group);
+      }
+      group.items.push(item);
+      groupsByPage.set(pageIndex, pageMap);
+    };
+
+    const walk = (node: OutlineNode) => {
+      const nodes = node.items || [];
+      const notes = highlightsByChapter.get(node.id) || [];
+      const nodeMap = new Map(nodes.map((child) => [child.id, child]));
+      const noteMap = new Map(notes.map((note) => [note.id, note]));
+      const combinedEntries = sortCombinedEntries(buildCombinedEntries(nodes, notes));
+      combinedEntries.forEach((entry) => {
+        if (entry.kind === 'note') {
+          const note = noteMap.get(entry.id);
+          if (!note || !isManualHighlight(note)) return;
+          const key = getHighlightSortKey(note);
+          addToGroup(node, {
+            key: `note-${note.id}`,
+            label: note.text,
+            kind: 'note' as const,
+            color: note.color,
+            note,
+            sortPage: typeof key.pageIndex === 'number' ? key.pageIndex : 0,
+            sortTop: typeof key.top === 'number' ? key.top : 0
+          });
+          return;
+        }
+        const child = nodeMap.get(entry.id);
+        if (!child || !child.isCustom || highlightChapterNodeIdSet.has(child.id)) return;
+        const anchor = findAnchorForChapter(child);
+        addToGroup(anchor, {
+          key: `node-${child.id}`,
+          label: child.title,
+          kind: 'chapter' as const,
+          node: child,
+          sortPage: typeof child.pageIndex === 'number' ? child.pageIndex : 0,
+          sortTop: typeof child.topRatio === 'number' ? child.topRatio : 0
+        });
+      });
+      nodes.forEach((child) => walk(child));
+    };
+
+    const root = outlineDisplay[0];
+    if (root) walk(root);
+    groupsByPage.forEach((pageMap, pageIndex) => {
+      const list = Array.from(pageMap.values());
+      list.forEach((group) => {
+        group.items.sort((a, b) => {
+          if (a.sortPage !== b.sortPage) return a.sortPage - b.sortPage;
+          return a.sortTop - b.sortTop;
+        });
+      });
+      list.sort((a, b) => a.topRatio - b.topRatio);
+      map.set(pageIndex, list);
+    });
+    return map;
+  }, [outlineDisplay, highlightsByChapter, highlights, viewMode]);
 
   const highlightsByQuestion = useMemo(() => {
     const map = new Map<string, HighlightItem[]>();
@@ -2332,21 +3287,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     if (!outlineDisplay.length) return null;
     const rootNode = outlineDisplay[0];
 
-    const getNodeOrder = (node: OutlineNode, index: number) => ({
-      pageIndex: typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
-      ratio: typeof node.topRatio === 'number' ? node.topRatio : 0,
-      index
-    });
-
-    const getNoteOrder = (note: HighlightItem, index: number) => {
-      const key = getHighlightSortKey(note);
-      return {
-        pageIndex: typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
-        ratio: typeof key.top === 'number' ? key.top : 0,
-        index
-      };
-    };
-
     const buildNode = (node: OutlineNode): MindMapNode => {
       const childItems = node.items || [];
       const childNodes = childItems.map((child) => buildNode(child));
@@ -2354,32 +3294,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       const noteNodes: MindMapNode[] = noteItems.map((note) => ({
         id: `note-${note.id}`,
         text: note.text,
-        translation: note.isChapterTitle ? '' : note.translation || '',
+        translation:
+          note.isChapterTitle || isManualHighlight(note) ? '' : note.translation || '',
         kind: 'note',
         color: note.color,
         pageIndex: note.pageIndex,
         note
       }));
-      const combined = [
-        ...childNodes.map((child, index) => ({
-          node: child,
-          order: getNodeOrder(childItems[index], index)
-        })),
-        ...noteNodes.map((note, index) => ({
-          node: note,
-          order: getNoteOrder(noteItems[index], index + childNodes.length)
-        }))
-      ]
-        .sort((a, b) => {
-          if (a.order.pageIndex !== b.order.pageIndex) {
-            return a.order.pageIndex - b.order.pageIndex;
-          }
-          if (a.order.ratio !== b.order.ratio) {
-            return a.order.ratio - b.order.ratio;
-          }
-          return a.order.index - b.order.index;
-        })
-        .map((item) => item.node);
+      const childNodeMap = new Map(childItems.map((child, index) => [child.id, childNodes[index]]));
+      const noteNodeMap = new Map(noteItems.map((note, index) => [note.id, noteNodes[index]]));
+      const combinedEntries = sortCombinedEntries(buildCombinedEntries(childItems, noteItems));
+      const combined = combinedEntries
+        .map((entry) =>
+          entry.kind === 'node'
+            ? childNodeMap.get(entry.id)
+            : noteNodeMap.get(entry.id)
+        )
+        .filter(Boolean) as MindMapNode[];
 
       return {
         id: node.id,
@@ -2396,32 +3327,27 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const rootNoteNodes: MindMapNode[] = rootNotes.map((note) => ({
       id: `note-${note.id}`,
       text: note.text,
-      translation: note.isChapterTitle ? '' : note.translation || '',
+      translation:
+        note.isChapterTitle || isManualHighlight(note) ? '' : note.translation || '',
       kind: 'note',
       color: note.color,
       pageIndex: note.pageIndex,
       note
     }));
-    const combinedRoot = [
-      ...rootChildren.map((node, index) => ({
-        node,
-        order: getNodeOrder(rootNode.items?.[index] || rootNode, index)
-      })),
-      ...rootNoteNodes.map((node, index) => ({
-        node,
-        order: getNoteOrder(rootNotes[index], index + rootChildren.length)
-      }))
-    ]
-      .sort((a, b) => {
-        if (a.order.pageIndex !== b.order.pageIndex) {
-          return a.order.pageIndex - b.order.pageIndex;
-        }
-        if (a.order.ratio !== b.order.ratio) {
-          return a.order.ratio - b.order.ratio;
-        }
-        return a.order.index - b.order.index;
-      })
-      .map((item) => item.node);
+    const rootChildMap = new Map(
+      (rootNode.items || []).map((child, index) => [child.id, rootChildren[index]])
+    );
+    const rootNoteMap = new Map(rootNotes.map((note, index) => [note.id, rootNoteNodes[index]]));
+    const rootCombinedEntries = sortCombinedEntries(
+      buildCombinedEntries(rootNode.items || [], rootNotes)
+    );
+    const combinedRoot = rootCombinedEntries
+      .map((entry) =>
+        entry.kind === 'node'
+          ? rootChildMap.get(entry.id)
+          : rootNoteMap.get(entry.id)
+      )
+      .filter(Boolean) as MindMapNode[];
 
     return {
       id: rootNode.id,
@@ -2447,6 +3373,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return map;
   }, [mindmapRoot, viewMode]);
 
+  useEffect(() => {
+    if (viewMode !== ReaderMode.MIND_MAP) return;
+    if (!mindmapRoot) {
+      setActiveMindmapNodeId(null);
+      return;
+    }
+    if (activeMindmapNodeId && mindmapNodeMap.has(activeMindmapNodeId)) return;
+    setActiveMindmapNodeId(mindmapRoot.id);
+  }, [viewMode, mindmapRoot, mindmapNodeMap, activeMindmapNodeId]);
+
   const mindmapParentMap = useMemo(() => {
     if (viewMode !== ReaderMode.MIND_MAP || !mindmapRoot) return new Map<string, string | null>();
     const map = new Map<string, string | null>();
@@ -2457,6 +3393,100 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     walk(mindmapRoot, null);
     return map;
   }, [mindmapRoot, viewMode]);
+
+  const customChapterIdSet = useMemo(() => {
+    return new Set(customChapters.map((item) => item.id));
+  }, [customChapters]);
+
+  const highlightChapterIdSet = useMemo(() => {
+    const set = new Set<string>();
+    highlights.forEach((item) => {
+      if (!item.isChapterTitle) return;
+      if (isManualHighlight(item)) return;
+      const nodeId = item.chapterNodeId || item.chapterId;
+      if (nodeId) set.add(nodeId);
+    });
+    return set;
+  }, [highlights]);
+
+  const highlightParentOutline = useMemo(() => {
+    const list = getFlatOutlineByPosition(outlineDisplay);
+    if (!list.length) return list;
+    return list.filter((node) => {
+      if (node.isRoot) return true;
+      if (!node.isCustom) return true;
+      return highlightChapterIdSet.has(node.id);
+    });
+  }, [outlineDisplay, highlightChapterIdSet]);
+
+  useEffect(() => {
+    if (!outlineDisplay.length) return;
+    const notesByParent = new Map<string, HighlightItem[]>();
+    highlights.forEach((item) => {
+      if (!item.chapterId || item.isChapterTitle) return;
+      const list = notesByParent.get(item.chapterId) || [];
+      list.push(item);
+      notesByParent.set(item.chapterId, list);
+    });
+    const customIdSet = new Set(customChapters.map((item) => item.id));
+    const missingHighlightOrders = new Map<string, number>();
+    const missingCustomOrders = new Map<string, number>();
+
+    const walk = (node: OutlineNode) => {
+      const nodes = node.items || [];
+      const notes = notesByParent.get(node.id) || [];
+      if (nodes.length || notes.length) {
+        const entries = buildCombinedEntries(nodes, notes);
+        if (entries.length) {
+          const fallbackOrder = getCombinedFallbackOrder(entries);
+          entries.forEach((entry) => {
+            if (entry.kind === 'note') {
+              const note = notes.find((item) => item.id === entry.id);
+              if (note && typeof note.order !== 'number') {
+                const order = fallbackOrder.get(entry.key);
+                if (typeof order === 'number') {
+                  missingHighlightOrders.set(note.id, order);
+                }
+              }
+              return;
+            }
+            if (entry.kind === 'node' && customIdSet.has(entry.id)) {
+              const chapter = nodes.find((item) => item.id === entry.id);
+              if (chapter && typeof chapter.order !== 'number') {
+                const order = fallbackOrder.get(entry.key);
+                if (typeof order === 'number') {
+                  missingCustomOrders.set(chapter.id, order);
+                }
+              }
+            }
+          });
+        }
+      }
+      nodes.forEach((child) => walk(child));
+    };
+
+    const root = outlineDisplay[0];
+    if (root) {
+      walk(root);
+    }
+
+    if (missingHighlightOrders.size) {
+      setHighlights((prev) =>
+        prev.map((item) => {
+          const order = missingHighlightOrders.get(item.id);
+          return typeof order === 'number' ? { ...item, order } : item;
+        })
+      );
+    }
+    if (missingCustomOrders.size) {
+      setCustomChapters((prev) =>
+        prev.map((item) => {
+          const order = missingCustomOrders.get(item.id);
+          return typeof order === 'number' ? { ...item, order } : item;
+        })
+      );
+    }
+  }, [outlineDisplay, highlights, customChapters]);
 
   useEffect(() => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
@@ -2598,6 +3628,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setDragOverTocId(null);
     setDragGhost(null);
     setChapterParentOverrides({});
+    setMindmapEditing(null);
+    setMindmapEditValue('');
     setChatThreads([]);
     setActiveChatId(null);
     setInput('');
@@ -2651,6 +3683,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                 ids.push(legacyId);
               }
               const next = { ...item, questionIds: ids };
+              if (isManualHighlight(next) && !next.isChapterTitle && !next.translation) {
+                const text = String(next.text || '').trim();
+                if (text) {
+                  next.translation = text;
+                }
+              }
               delete (next as any).questionId;
               delete (next as any).questionText;
               return next;
@@ -2748,38 +3786,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const isExpanded = expandedTOC.has(item.id);
     const isDropTarget =
       dragOverTocId === item.id && (Boolean(draggingTocNoteId) || Boolean(draggingTocChapterId));
-    const combinedItems = [
-      ...((item.items || []).map((node) => ({
-        type: 'node' as const,
-        node,
-        sort: {
-          pageIndex: node.pageIndex ?? Number.POSITIVE_INFINITY,
-          top: node.topRatio ?? 1
-        }
-      }))),
-      ...(notes.map((note) => {
-        const key = getHighlightSortKey(note);
-        return {
-          type: 'note' as const,
-          note,
-          sort: {
-            pageIndex: key.pageIndex ?? Number.POSITIVE_INFINITY,
-            top: key.top ?? 1
-          }
-        };
-      }))
-    ].sort((a, b) => {
-      if (a.sort.pageIndex !== b.sort.pageIndex) {
-        return a.sort.pageIndex - b.sort.pageIndex;
-      }
-      if (a.sort.top !== b.sort.top) {
-        return a.sort.top - b.sort.top;
-      }
-      if (a.type !== b.type) {
-        return a.type === 'node' ? -1 : 1;
-      }
-      return 0;
-    });
+    const nodeMap = new Map((item.items || []).map((node) => [node.id, node]));
+    const noteMap = new Map(notes.map((note) => [note.id, note]));
+    const combinedItems = sortCombinedEntries(
+      buildCombinedEntries(item.items || [], notes)
+    ).map((entry) =>
+      entry.kind === 'note'
+        ? { type: 'note' as const, note: noteMap.get(entry.id)! }
+        : { type: 'node' as const, node: nodeMap.get(entry.id)! }
+    );
 
     return (
       <div className="select-none">
@@ -2857,46 +3872,62 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                               overflow: 'hidden'
                             };
                         return (
-                      <button
-                        type="button"
-                        data-toc-id={entry.note.id}
-                        data-toc-kind="note"
-                        onMouseDown={(event) => {
-                          handleTOCNoteMouseDown(entry.note, event);
-                        }}
-                        onClick={() => {
-                          if (Date.now() < tocSuppressClickUntilRef.current) return;
-                          if (tocDragNoteTriggeredRef.current) return;
-                          jumpToHighlight(entry.note);
-                        }}
-                        onDoubleClick={() =>
-                          {
-                            if (Date.now() < tocSuppressClickUntilRef.current) return;
-                            setExpandedHighlightIds((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(entry.note.id)) {
-                                next.delete(entry.note.id);
-                              } else {
-                                next.add(entry.note.id);
-                              }
-                              return next;
-                            });
-                          }
-                        }
-                        className={`w-full text-left text-xs rounded px-2 py-1 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
-                          entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
-                        }`}
-                        style={{ borderLeft: `3px solid ${entry.note.color}` }}
-                      >
-                        <span className="leading-4 w-full" style={clampStyle}>
-                          {entry.note.text}
-                        </span>
-                        {!entry.note.isChapterTitle && entry.note.translation ? (
+                          <div className="relative group">
+                            <button
+                              type="button"
+                              data-toc-id={entry.note.id}
+                              data-toc-kind="note"
+                              onMouseDown={(event) => {
+                                handleTOCNoteMouseDown(entry.note, event);
+                              }}
+                              onClick={() => {
+                                if (Date.now() < tocSuppressClickUntilRef.current) return;
+                                if (tocDragNoteTriggeredRef.current) return;
+                                jumpToHighlight(entry.note);
+                              }}
+                              onDoubleClick={() => {
+                                if (Date.now() < tocSuppressClickUntilRef.current) return;
+                                setExpandedHighlightIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(entry.note.id)) {
+                                    next.delete(entry.note.id);
+                                  } else {
+                                    next.add(entry.note.id);
+                                  }
+                                  return next;
+                                });
+                              }}
+                              className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start ${
+                                entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
+                              }`}
+                              style={{ borderLeft: `3px solid ${entry.note.color}` }}
+                            >
+                              <span className="leading-4 w-full" style={clampStyle}>
+                                {entry.note.text}
+                              </span>
+                        {!entry.note.isChapterTitle &&
+                        !isManualHighlight(entry.note) &&
+                        entry.note.translation ? (
                           <span className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full" style={clampStyle}>
                             {entry.note.translation}
                           </span>
                         ) : null}
-                      </button>
+                            </button>
+                            {!entry.note.isChapterTitle ? (
+                              <button
+                                type="button"
+                                onMouseDown={(event) => event.stopPropagation()}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  removeHighlightNote(entry.note);
+                                }}
+                                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                aria-label="删除笔记"
+                              >
+                                <X size={12} />
+                              </button>
+                            ) : null}
+                          </div>
                         );
                       })()}
                     </div>
@@ -2911,6 +3942,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       </div>
     );
   };
+
+  const toolbarMindmapNode =
+    viewMode === ReaderMode.MIND_MAP
+      ? activeMindmapNodeId
+        ? mindmapNodeMap.get(activeMindmapNodeId) || mindmapRoot
+        : mindmapRoot
+      : null;
+  const canToolbarAddChild =
+    viewMode === ReaderMode.MIND_MAP && !mindmapEditing && Boolean(toolbarMindmapNode);
+  const canToolbarAddSibling =
+    viewMode === ReaderMode.MIND_MAP &&
+    !mindmapEditing &&
+    Boolean(toolbarMindmapNode && toolbarMindmapNode.kind !== 'root');
 
   return (
     <div ref={containerRef} className="flex h-[calc(100vh-40px)] bg-white overflow-hidden">
@@ -2950,24 +3994,91 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       {/* SECTION E: Main Content (PDF / MindMap) */}
       <div className="flex-1 min-w-0 flex flex-col bg-gray-50 relative">
         {/* Toolbar: Matches App Title Bar Height (h-10) */}
-        <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center justify-between px-3 sticky top-0 z-10">
+        <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center px-3 sticky top-0 z-10">
           {/* Adjusted: Removed scale, increased padding for larger buttons, kept text/icon small */}
-          <div className="flex bg-gray-100 p-1 rounded-lg">
-            <button 
-              onClick={() => switchViewMode(ReaderMode.PDF)}
-              className={`flex items-center px-3 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.PDF ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500 hover:text-gray-900'}`}
-            >
-              <FileText size={12} className="mr-1.5" /> PDF
-            </button>
-            <button 
-              onClick={() => switchViewMode(ReaderMode.MIND_MAP)}
-              className={`flex items-center px-3 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.MIND_MAP ? 'bg-white shadow-sm text-gray-900' : 'text-gray-500 hover:text-gray-900'}`}
-            >
-              <Network size={12} className="mr-1.5" /> Mind Map
-            </button>
+          <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+            <Tooltip label="PDF">
+              <button 
+                onClick={() => switchViewMode(ReaderMode.PDF)}
+                className={`flex items-center p-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.PDF ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
+                aria-label="PDF"
+              >
+                <FileText size={14} />
+              </button>
+            </Tooltip>
+            <Tooltip label="Mind Map">
+              <button 
+                onClick={() => switchViewMode(ReaderMode.MIND_MAP)}
+                className={`flex items-center p-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.MIND_MAP ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
+                aria-label="Mind Map"
+              >
+                <Network size={14} />
+              </button>
+            </Tooltip>
           </div>
 
-          <div className="flex items-center gap-1 text-gray-500">
+          <div className="flex-1 flex justify-center">
+            {viewMode === ReaderMode.MIND_MAP ? (
+              <div className="flex items-center gap-2 px-1 py-1">
+              <Tooltip label="新增子节点">
+                <button
+                  type="button"
+                  disabled={!canToolbarAddChild}
+                  onClick={() => {
+                    if (!toolbarMindmapNode || !canToolbarAddChild) return;
+                    handleMindmapAddChild(toolbarMindmapNode);
+                  }}
+                  className="p-1 text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <circle cx="5" cy="12" r="2" fill="currentColor" stroke="none" />
+                    <line x1="8" y1="12" x2="12" y2="12" />
+                    <rect x="12.5" y="7" width="8.5" height="10" rx="2" ry="2" strokeDasharray="3 2" />
+                  </svg>
+                </button>
+              </Tooltip>
+              <Tooltip label="新增同级节点">
+                <button
+                  type="button"
+                  disabled={!canToolbarAddSibling}
+                  onClick={() => {
+                    if (!toolbarMindmapNode || !canToolbarAddSibling) return;
+                    handleMindmapAddSibling(toolbarMindmapNode);
+                  }}
+                  className="p-1 text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <svg
+                    className="w-4 h-4"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <circle cx="5" cy="6" r="2" fill="currentColor" stroke="none" />
+                    <line x1="7" y1="6" x2="12" y2="6" />
+                    <line x1="7" y1="6" x2="12" y2="16" />
+                    <rect x="12" y="3" width="9" height="6" rx="2" ry="2" />
+                    <rect x="12" y="13" width="9" height="6" rx="2" ry="2" strokeDasharray="3 2" />
+                  </svg>
+                </button>
+              </Tooltip>
+            </div>
+            ) : (
+              <div className="flex-1" />
+            )}
+          </div>
+
+          <div className="flex items-center gap-1 text-gray-600">
             <button
               onClick={() => {
                 if (viewMode === ReaderMode.PDF) {
@@ -2976,7 +4087,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                   setMindmapZoom((z) => Math.max(50, z - 10));
                 }
               }}
-              className="p-1 hover:bg-gray-100 rounded"
+              className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
             >
               <ZoomOut size={14} />
             </button>
@@ -2991,7 +4102,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                   setMindmapZoom((z) => Math.min(200, z + 10));
                 }
               }}
-              className="p-1 hover:bg-gray-100 rounded"
+              className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
             >
               <ZoomIn size={14} />
             </button>
@@ -3060,6 +4171,57 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                           })}
                         </div>
                       ) : null}
+                      {pdfMarginChildrenByPage.get(index)?.length ? (
+                        <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
+                          {pdfMarginChildrenByPage.get(index)!.map((group) => {
+                            const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
+                            const clampedTop = Math.max(0, Math.min(1, topRatio));
+                            return (
+                              <div
+                                key={`margin-${index}-${group.parentId}`}
+                                className="absolute left-0"
+                                style={{ top: `${clampedTop * 100}%` }}
+                              >
+                                <div className="flex flex-col gap-1">
+                                  {group.items.map((item) => {
+                                    const swatch =
+                                      item.kind === 'note' && item.color
+                                        ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
+                                          toSolidColor(item.color)
+                                        : '#9ca3af';
+                                    const label = item.label?.trim() || '（空白）';
+                                    if (item.kind === 'chapter') {
+                                      return (
+                                        <button
+                                          key={item.key}
+                                          type="button"
+                                          className="w-full text-left rounded px-2 py-1 text-sm text-gray-700 border border-transparent hover:bg-gray-200 cursor-pointer"
+                                          onMouseDown={(event) => event.stopPropagation()}
+                                          onClick={(event) => openMarginToolbar(event, item)}
+                                        >
+                                          <span className="break-words">{label}</span>
+                                        </button>
+                                      );
+                                    }
+                                    return (
+                                      <button
+                                        key={item.key}
+                                        type="button"
+                                        className="w-full text-left rounded px-2 py-1 text-xs text-gray-600 border border-transparent hover:bg-gray-200 cursor-pointer"
+                                        style={{ borderLeft: `3px solid ${swatch}` }}
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => openMarginToolbar(event, item)}
+                                      >
+                                        <span className="break-words leading-4 block">{label}</span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                 </Document>
@@ -3105,11 +4267,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                     offset={mindmapOffset}
                     dragOverId={dragOverMindmapId}
                     draggingNoteId={draggingNoteId}
+                    selectedNodeId={activeMindmapNodeId}
                     onLayoutStart={handleMindmapLayoutStart}
                     onLayout={handleMindmapLayout}
                     onNodeClick={handleMindMapNodeClick}
+                    onNodeDoubleClick={handleMindmapNodeDoubleClick}
                     onNodeMouseDown={handleMindmapNodeMouseDown}
                     onBackgroundMouseDown={handleMindmapMouseDown}
+                    onNodeToggleCollapse={handleMindmapToggleCollapse}
+                    toolbarColors={HIGHLIGHT_COLORS}
+                    onToolbarColorSelect={handleMindmapToolbarColor}
+                    onToolbarMakeChapter={handleMindmapToolbarMakeChapter}
+                    onToolbarClear={handleMindmapToolbarClear}
+                    editingNodeId={mindmapEditing?.nodeId || null}
+                    editingValue={mindmapEditValue}
+                    onEditChange={setMindmapEditValue}
+                    onEditCommit={commitMindmapEdit}
+                    onEditCancel={cancelMindmapEdit}
                     onNoteToggleExpand={(noteId) =>
                       setExpandedHighlightIds((prev) => {
                         const next = new Set(prev);
@@ -3357,7 +4531,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                                     <span className="leading-4 w-full" style={clampStyle}>
                                       {note.text}
                                     </span>
-                                    {!note.isChapterTitle && note.translation ? (
+                                    {!note.isChapterTitle &&
+                                    !isManualHighlight(note) &&
+                                    note.translation ? (
                                       <span
                                         className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
                                         style={clampStyle}

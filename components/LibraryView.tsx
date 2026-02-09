@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Folder as FolderIcon,
   FileText,
+  Network,
   Plus,
   Pencil,
   X,
@@ -34,6 +35,7 @@ type OutlineNode = {
   isRoot?: boolean;
   isCustom?: boolean;
   parentId?: string | null;
+  order?: number;
 };
 
 type HighlightRect = {
@@ -53,6 +55,16 @@ type HighlightItem = {
   chapterId: string;
   isChapterTitle: boolean;
   translation?: string;
+  source?: 'pdf' | 'manual';
+  order?: number;
+};
+
+const isManualHighlight = (item: HighlightItem) => {
+  if (item.source === 'manual') return true;
+  if (item.source === 'pdf') return false;
+  const rects = Array.isArray(item.rects) ? item.rects : [];
+  if (!rects.length) return true;
+  return rects.every((rect) => Number(rect.w || 0) === 0 && Number(rect.h || 0) === 0);
 };
 
 const resolveOutlineDestination = async (
@@ -188,6 +200,39 @@ const findChapterForPosition = (
   return candidate;
 };
 
+const sortOutlineNodes = (nodes: OutlineNode[]) => {
+  if (!nodes.length) return;
+  const baseSorted = nodes.map((node) => node);
+  baseSorted.sort((a, b) => {
+    if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+      return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+    }
+    if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
+      return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+    }
+    return a.title.localeCompare(b.title);
+  });
+  const baseOrder = new Map<string, number>();
+  baseSorted.forEach((node, index) => {
+    baseOrder.set(node.id, index);
+  });
+
+  const indexed = nodes.map((node, index) => ({ node, index }));
+  indexed.sort((a, b) => {
+    const aBase = baseOrder.get(a.node.id) ?? a.index;
+    const bBase = baseOrder.get(b.node.id) ?? b.index;
+    const aOrder = typeof a.node.order === 'number' ? a.node.order : aBase;
+    const bOrder = typeof b.node.order === 'number' ? b.node.order : bBase;
+    if (aOrder !== bOrder) return aOrder - bOrder;
+    if (aBase !== bBase) return aBase - bBase;
+    return a.node.title.localeCompare(b.node.title);
+  });
+  nodes.splice(0, nodes.length, ...indexed.map((entry) => entry.node));
+  nodes.forEach((node) => {
+    if (node.items?.length) sortOutlineNodes(node.items);
+  });
+};
+
 const mergeOutlineWithCustom = (
   outline: OutlineNode[],
   customNodes: OutlineNode[],
@@ -243,23 +288,7 @@ const mergeOutlineWithCustom = (
     rootItems.push(normalized);
   });
 
-  const sortChildren = (nodes: OutlineNode[]) => {
-    if (!nodes.length) return;
-    nodes.sort((a, b) => {
-      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
-        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
-      }
-      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
-        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
-      }
-      return a.title.localeCompare(b.title);
-    });
-    nodes.forEach((node) => {
-      if (node.items?.length) sortChildren(node.items);
-    });
-  };
-
-  sortChildren(rootItems);
+  sortOutlineNodes(rootItems);
   return rootItems;
 };
 
@@ -312,6 +341,7 @@ const applyParentOverrides = (
     idToParent.set(nodeId, nextParent);
   });
 
+  sortOutlineNodes(rootItems);
   return rootItems;
 };
 
@@ -367,7 +397,7 @@ const buildMindmapRoot = (
     const noteNodes: MindMapNode[] = noteItems.map((note) => ({
       id: `note-${note.id}`,
       text: note.text,
-      translation: note.isChapterTitle ? '' : note.translation || '',
+      translation: note.isChapterTitle || isManualHighlight(note) ? '' : note.translation || '',
       kind: 'note',
       color: note.color,
       pageIndex: note.pageIndex,
@@ -409,7 +439,7 @@ const buildMindmapRoot = (
   const rootNoteNodes: MindMapNode[] = rootNotes.map((note) => ({
     id: `note-${note.id}`,
     text: note.text,
-    translation: note.isChapterTitle ? '' : note.translation || '',
+    translation: note.isChapterTitle || isManualHighlight(note) ? '' : note.translation || '',
     kind: 'note',
     color: note.color,
     pageIndex: note.pageIndex,
@@ -927,6 +957,36 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     walk(mindmapRoot);
     return map;
   }, [mindmapRoot]);
+
+  const handleMindmapToggleCollapse = (node: MindMapNode) => {
+    const originalNode = mindmapNodeMap.get(node.id);
+    const hasChildren = Boolean(originalNode?.children && originalNode.children.length);
+    if (!hasChildren) return;
+    const layout = mindmapLayoutRef.current;
+    if (layout) {
+      const targetNode = layout.nodes.find((item) => item.id === node.id);
+      if (targetNode) {
+        mindmapAnchorRef.current = {
+          id: node.id,
+          x:
+            (targetNode.x + targetNode.width / 2 + layout.offset.x) * mindmapZoomScale +
+            mindmapOffset.x,
+          y:
+            (targetNode.y + targetNode.height / 2 + layout.offset.y) * mindmapZoomScale +
+            mindmapOffset.y
+        };
+      }
+    }
+    setCollapsedMindmapIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(node.id)) {
+        next.delete(node.id);
+      } else {
+        next.add(node.id);
+      }
+      return next;
+    });
+  };
 
   useEffect(() => {
     const activeIds = new Set(papers.map((paper) => paper.id));
@@ -1729,28 +1789,36 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         {selectedPaper ? (
           <div className="flex-1 flex flex-col overflow-hidden">
             <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-200">
-              <button
-                type="button"
-                onClick={() => setPreviewMode('pdf')}
-                className={`px-2 py-1 text-xs rounded-md ${
-                  previewMode === 'pdf'
-                    ? 'bg-white text-gray-900 shadow-sm'
-                    : 'text-gray-500 hover:bg-gray-100'
-                }`}
-              >
-                PDF
-              </button>
-              <button
-                type="button"
-                onClick={() => setPreviewMode('mindmap')}
-                className={`px-2 py-1 text-xs rounded-md ${
-                  previewMode === 'mindmap'
-                    ? 'bg-white text-gray-900 shadow-sm'
-                    : 'text-gray-500 hover:bg-gray-100'
-                }`}
-              >
-                Mind Map
-              </button>
+              <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
+                <Tooltip label="PDF">
+                  <button
+                    type="button"
+                    onClick={() => setPreviewMode('pdf')}
+                    className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                      previewMode === 'pdf'
+                        ? 'bg-gray-200 text-gray-900'
+                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                    }`}
+                    aria-label="PDF"
+                  >
+                    <FileText size={14} />
+                  </button>
+                </Tooltip>
+                <Tooltip label="Mind Map">
+                  <button
+                    type="button"
+                    onClick={() => setPreviewMode('mindmap')}
+                    className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                      previewMode === 'mindmap'
+                        ? 'bg-gray-200 text-gray-900'
+                        : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                    }`}
+                    aria-label="Mind Map"
+                  >
+                    <Network size={14} />
+                  </button>
+                </Tooltip>
+              </div>
             </div>
             <div className={`flex-1 overflow-auto ${previewMode === 'pdf' ? 'p-2' : 'p-0'}`}>
               {previewMode === 'pdf' ? (
@@ -1806,38 +1874,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         if (!anchor) return;
                         setMindmapOffset({ x: anchor.x, y: anchor.y });
                       }}
-                      onNodeClick={(node) => {
-                        if (node.kind === 'note') return;
-                        const originalNode = mindmapNodeMap.get(node.id);
-                        const hasChildren = Boolean(originalNode?.children && originalNode.children.length);
-                        if (!hasChildren) return;
-                        const layout = mindmapLayoutRef.current;
-                        if (layout) {
-                          const targetNode = layout.nodes.find((item) => item.id === node.id);
-                          if (targetNode) {
-                            mindmapAnchorRef.current = {
-                              id: node.id,
-                              x:
-                                (targetNode.x + targetNode.width / 2 + layout.offset.x) *
-                                  mindmapZoomScale +
-                                mindmapOffset.x,
-                              y:
-                                (targetNode.y + targetNode.height / 2 + layout.offset.y) *
-                                  mindmapZoomScale +
-                                mindmapOffset.y
-                            };
-                          }
-                        }
-                        setCollapsedMindmapIds((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(node.id)) {
-                            next.delete(node.id);
-                          } else {
-                            next.add(node.id);
-                          }
-                          return next;
-                        });
-                      }}
+                      onNodeToggleCollapse={handleMindmapToggleCollapse}
                       onBackgroundMouseDown={(event) => {
                         if (event.button !== 0) return;
                         mindmapPanRef.current = {

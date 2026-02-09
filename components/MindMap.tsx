@@ -1,4 +1,5 @@
 import React, { useMemo, useRef } from 'react';
+import { Ban } from 'lucide-react';
 
 const MINDMAP_GAP_X = 90;
 const MINDMAP_GAP_Y = 18;
@@ -14,10 +15,21 @@ const MINDMAP_NOTE_PADDING_X = 10;
 const MINDMAP_NOTE_PADDING_Y = 6;
 const MINDMAP_FONT_SIZE = 13;
 const MINDMAP_ROOT_FONT_SIZE = 14;
-const MINDMAP_NOTE_FONT_SIZE = 11;
+const MINDMAP_NOTE_FONT_SIZE = MINDMAP_FONT_SIZE;
 const MINDMAP_NOTE_TRANSLATION_FONT_SIZE = 10;
 const MINDMAP_LINE_HEIGHT = 16;
-const MINDMAP_NOTE_LINE_HEIGHT = 14;
+const MINDMAP_NOTE_LINE_HEIGHT = MINDMAP_LINE_HEIGHT;
+const MINDMAP_EDIT_TOOLBAR_MIN_WIDTH = 320;
+const MINDMAP_EDIT_TOOLBAR_HEIGHT = 30;
+const MINDMAP_EDIT_TOOLBAR_GAP = 8;
+
+const toSolidColor = (fill: string) => {
+  const match = fill.match(/rgba?\(([^)]+)\)/);
+  if (!match) return fill;
+  const parts = match[1].split(',').map((part) => part.trim());
+  if (parts.length < 3) return fill;
+  return `rgb(${parts[0]}, ${parts[1]}, ${parts[2]})`;
+};
 
 export type MindMapNode = {
   id: string;
@@ -102,12 +114,24 @@ interface MindMapProps {
   offset?: { x: number; y: number };
   onNodeClick?: (node: MindMapNode) => void;
   onNodeMouseDown?: (node: MindMapNode, event: React.MouseEvent<SVGGElement>) => void;
+  onNodeDoubleClick?: (node: MindMapNode, event: React.MouseEvent<SVGGElement>) => void;
   onBackgroundMouseDown?: (event: React.MouseEvent<HTMLDivElement>) => void;
   onLayout?: (layout: MindMapLayout | null) => void;
   onLayoutStart?: () => void;
   dragOverId?: string | null;
   draggingNoteId?: string | null;
+  selectedNodeId?: string | null;
   onNoteToggleExpand?: (noteId: string) => void;
+  onNodeToggleCollapse?: (node: MindMapNode) => void;
+  toolbarColors?: Array<{ id: string; swatch: string; fill: string }>;
+  onToolbarColorSelect?: (node: MindMapNode, color: string) => void;
+  onToolbarMakeChapter?: (node: MindMapNode) => void;
+  onToolbarClear?: (node: MindMapNode) => void;
+  editingNodeId?: string | null;
+  editingValue?: string;
+  onEditChange?: (value: string) => void;
+  onEditCommit?: (node: MindMapNode, value: string) => void;
+  onEditCancel?: () => void;
 }
 
 export const MindMap: React.FC<MindMapProps> = ({
@@ -118,15 +142,51 @@ export const MindMap: React.FC<MindMapProps> = ({
   offset,
   onNodeClick,
   onNodeMouseDown,
+  onNodeDoubleClick,
   onBackgroundMouseDown,
   onLayout,
   onLayoutStart,
   dragOverId,
   draggingNoteId,
-  onNoteToggleExpand
+  selectedNodeId,
+  onNoteToggleExpand,
+  onNodeToggleCollapse,
+  toolbarColors = [],
+  onToolbarColorSelect,
+  onToolbarMakeChapter,
+  onToolbarClear,
+  editingNodeId,
+  editingValue,
+  onEditChange,
+  onEditCommit,
+  onEditCancel
 }) => {
   const measureRef = useRef<CanvasRenderingContext2D | null>(null);
   const [hoveredId, setHoveredId] = React.useState<string | null>(null);
+  const [activeActionNodeId, setActiveActionNodeId] = React.useState<string | null>(null);
+  const editInputRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const nodeChildCountMap = React.useMemo(() => {
+    const map = new Map<string, number>();
+    const walk = (node: MindMapNode) => {
+      const count = node.children?.length || 0;
+      map.set(node.id, count);
+      node.children?.forEach((child) => walk(child));
+    };
+    if (root) walk(root);
+    return map;
+  }, [root]);
+
+  React.useEffect(() => {
+    if (!editingNodeId) return;
+    const handle = window.requestAnimationFrame(() => {
+      if (editInputRef.current) {
+        editInputRef.current.focus();
+        editInputRef.current.select();
+      }
+    });
+    return () => window.cancelAnimationFrame(handle);
+  }, [editingNodeId]);
 
   const layout = useMemo(() => {
     try {
@@ -141,12 +201,14 @@ export const MindMap: React.FC<MindMapProps> = ({
       const rootNode = cloneTree(root, collapsedIds) as LayoutNode;
 
     const getMetrics = (node: MindMapNode) => {
-      const text = node.text || '';
+      const isEditing = Boolean(editingNodeId && editingNodeId === node.id);
+      const text = isEditing && typeof editingValue === 'string' ? editingValue : node.text || '';
       const translation = node.translation || '';
       const isNote = node.kind === 'note';
       const isRoot = node.kind === 'root';
       const noteId = (node.note as any)?.id || null;
-      const isNoteExpanded = isNote && noteId ? expandedNoteIds.has(noteId) : false;
+      const isNoteExpanded =
+        isNote && noteId ? expandedNoteIds.has(noteId) || isEditing : false;
       const fontSize = isNote ? MINDMAP_NOTE_FONT_SIZE : isRoot ? MINDMAP_ROOT_FONT_SIZE : MINDMAP_FONT_SIZE;
       const translationFontSize = isNote ? MINDMAP_NOTE_TRANSLATION_FONT_SIZE : fontSize;
       const lineHeight = isNote ? MINDMAP_NOTE_LINE_HEIGHT : MINDMAP_LINE_HEIGHT;
@@ -158,7 +220,10 @@ export const MindMap: React.FC<MindMapProps> = ({
       if (ctx) {
         ctx.font = `${fontWeight} ${fontSize}px ${fontFamily}`;
       }
-      let lines = wrapTextLines(text, maxWidth - paddingX * 2, ctx);
+      const effectiveMaxWidth = isEditing
+        ? Math.max(maxWidth, MINDMAP_EDIT_TOOLBAR_MIN_WIDTH - paddingX * 2)
+        : maxWidth;
+      let lines = wrapTextLines(text, effectiveMaxWidth - paddingX * 2, ctx);
       let translationLines: string[] = [];
       if (translation) {
         if (ctx) {
@@ -169,6 +234,9 @@ export const MindMap: React.FC<MindMapProps> = ({
       if (isNote && !isNoteExpanded) {
         lines = clampTextLines(lines, MINDMAP_NOTE_MAX_LINES);
         translationLines = clampTextLines(translationLines, MINDMAP_NOTE_TRANSLATION_MAX_LINES);
+      }
+      if (isEditing) {
+        translationLines = [];
       }
       const lineWidths: number[] = [];
       if (lines.length) {
@@ -190,11 +258,18 @@ export const MindMap: React.FC<MindMapProps> = ({
         });
       }
       const contentWidth = Math.min(maxWidth, Math.max(...lineWidths, fontSize * 0.8));
-      const width = Math.ceil(contentWidth + paddingX * 2);
+      let width = Math.ceil(contentWidth + paddingX * 2);
+      if (isEditing) {
+        width = Math.max(width, MINDMAP_EDIT_TOOLBAR_MIN_WIDTH);
+      }
       const translationHeight = translationLines.length
         ? translationLines.length * lineHeight + MINDMAP_NOTE_TRANSLATION_GAP
         : 0;
-      const height = Math.ceil(lines.length * lineHeight + translationHeight + paddingY * 2);
+      let height = Math.ceil(lines.length * lineHeight + translationHeight + paddingY * 2);
+      if (isEditing) {
+        const contentHeight = Math.max(lines.length * lineHeight, 44) + paddingY * 2;
+        height = Math.ceil(contentHeight + MINDMAP_EDIT_TOOLBAR_HEIGHT + MINDMAP_EDIT_TOOLBAR_GAP);
+      }
       return {
         width,
         height,
@@ -288,7 +363,7 @@ export const MindMap: React.FC<MindMapProps> = ({
       console.error('[MindMap] layout error', error);
       return null;
     }
-  }, [root, collapsedIds, expandedNoteIds]);
+  }, [root, collapsedIds, expandedNoteIds, editingNodeId, editingValue, toolbarColors]);
 
   React.useEffect(() => {
     if (onLayout) onLayout(layout);
@@ -344,7 +419,26 @@ export const MindMap: React.FC<MindMapProps> = ({
                 draggingNoteId &&
                 (node.note as any).id === draggingNoteId;
               const isHovered = hoveredId === node.id;
-              const resolvedFill = isHovered ? '#e5e7eb' : fill;
+              const isEditing = Boolean(editingNodeId && editingNodeId === node.id);
+              const isSelected = Boolean(selectedNodeId && selectedNodeId === node.id);
+              const selectedStroke =
+                node.kind === 'note' && node.color
+                  ? toSolidColor(node.color)
+                  : '#94a3b8';
+              const resolvedFill = isEditing ? 'transparent' : isHovered ? '#e5e7eb' : fill;
+              const effectiveStroke = isEditing
+                ? 'transparent'
+                : isSelected
+                  ? selectedStroke
+                  : stroke;
+              const strokeWidth = isEditing ? 0 : isSelected ? 2 : 1;
+              const showActions = activeActionNodeId === node.id && !isEditing;
+              const hasChildren = (nodeChildCountMap.get(node.id) || 0) > 0;
+              const isCollapsed = collapsedIds.has(node.id);
+              const actionSize = 14;
+              const actionGap = 6;
+              const toggleX = node.width + actionGap;
+              const toggleY = Math.max(4, (node.height - actionSize) / 2);
               return (
                 <g
                   key={node.id}
@@ -354,9 +448,17 @@ export const MindMap: React.FC<MindMapProps> = ({
                   data-mindmap-node="true"
                   data-mindmap-id={node.id}
                   data-mindmap-kind={node.kind}
-                  style={{ cursor: 'pointer', userSelect: 'none' }}
-                  onClick={() => onNodeClick?.(node)}
+                  style={{ cursor: isEditing ? 'text' : 'pointer', userSelect: 'none' }}
+                  onClick={() => {
+                    if (isEditing) return;
+                    onNodeClick?.(node);
+                  }}
                   onDoubleClick={(event) => {
+                    if (isEditing) return;
+                    if (onNodeDoubleClick) {
+                      onNodeDoubleClick(node, event);
+                      if (event.defaultPrevented) return;
+                    }
                     if (node.kind !== 'note') return;
                     const noteId = (node.note as any)?.id;
                     if (!noteId || !onNoteToggleExpand) return;
@@ -370,10 +472,16 @@ export const MindMap: React.FC<MindMapProps> = ({
                     }
                   }}
                   onMouseDown={(event) => {
+                    if (isEditing) return;
+                    const target = event.target as HTMLElement | null;
+                    if (target?.closest?.('[data-mindmap-action="true"]')) return;
                     event.preventDefault();
                     onNodeMouseDown?.(node, event);
                   }}
-                  onMouseEnter={() => setHoveredId(node.id)}
+                  onMouseEnter={() => {
+                    setHoveredId(node.id);
+                    setActiveActionNodeId(node.id);
+                  }}
                   onMouseLeave={() => setHoveredId((prev) => (prev === node.id ? null : prev))}
                 >
                   <rect
@@ -382,11 +490,11 @@ export const MindMap: React.FC<MindMapProps> = ({
                     rx={8}
                     ry={8}
                     fill={resolvedFill}
-                    stroke={stroke}
-                    strokeWidth={1}
+                    stroke={effectiveStroke}
+                    strokeWidth={strokeWidth}
                     opacity={isDraggingNote ? 0.5 : 1}
                   />
-                  {node.kind === 'note' ? (
+                  {node.kind === 'note' && !isEditing ? (
                     <rect
                       x={0}
                       y={0}
@@ -397,46 +505,118 @@ export const MindMap: React.FC<MindMapProps> = ({
                       fill={node.color || '#cbd5f5'}
                     />
                   ) : null}
-                  <text
-                    x={MINDMAP_PADDING_X}
-                    y={MINDMAP_PADDING_Y}
-                    dominantBaseline="hanging"
-                    style={{
-                      fontSize: node.fontSize,
-                      fill: node.kind === 'note' ? '#4b5563' : '#111827',
-                      userSelect: 'none'
-                    }}
-                    pointerEvents="none"
-                  >
-                    {node.lines.map((line, index) => (
-                      <tspan
-                        key={`${node.id}-line-${index}`}
-                        x={MINDMAP_PADDING_X}
-                        dy={index === 0 ? 0 : node.lineHeight}
+                  {isEditing ? (
+                    <foreignObject
+                      x={0}
+                      y={0}
+                      width={node.width}
+                      height={node.height}
+                      style={{ overflow: 'visible' }}
+                    >
+                      <div
+                        xmlns="http://www.w3.org/1999/xhtml"
+                        style={{
+                          width: '100%',
+                          height: '100%',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'stretch',
+                          gap: `${MINDMAP_EDIT_TOOLBAR_GAP}px`
+                        }}
                       >
-                        {line}
-                      </tspan>
-                    ))}
-                  </text>
-                  {node.translationLines?.length ? (
+                        <div
+                          className="rounded-lg border border-gray-200 bg-white shadow-lg p-2"
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          onClick={(event) => event.stopPropagation()}
+                        >
+                          <div className="flex items-center gap-1.5">
+                              {toolbarColors.map((color) => {
+                                const isActive = node.color === color.fill;
+                                return (
+                                  <button
+                                    key={color.id}
+                                    type="button"
+                                    className="w-5 h-5 rounded-md border border-gray-300 flex items-center justify-center"
+                                    onClick={() => onToolbarColorSelect?.(node, color.fill)}
+                                    style={{
+                                      boxShadow: isActive ? `0 0 0 2px ${color.swatch}` : 'none',
+                                      borderColor: isActive ? 'transparent' : undefined
+                                    }}
+                                  >
+                                    <span
+                                      className="w-3 h-3 rounded-sm"
+                                      style={{ background: color.swatch }}
+                                    />
+                                </button>
+                              );
+                            })}
+                            <button
+                              type="button"
+                              className="w-5 h-5 rounded-md border border-gray-300 text-[10px] font-semibold text-gray-700 hover:bg-gray-50"
+                              onClick={() => onToolbarMakeChapter?.(node)}
+                              style={{
+                                boxShadow:
+                                  node.kind === 'chapter' ? '0 0 0 2px #9ca3af' : 'none',
+                                borderColor: node.kind === 'chapter' ? 'transparent' : undefined
+                              }}
+                            >
+                              T
+                            </button>
+                            <button
+                              type="button"
+                              className="w-5 h-5 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 flex items-center justify-center"
+                              onClick={() => onToolbarClear?.(node)}
+                            >
+                              <Ban size={12} />
+                            </button>
+                          </div>
+                          <textarea
+                            ref={editInputRef}
+                            value={editingValue ?? node.text}
+                            onChange={(event) => onEditChange?.(event.target.value)}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Escape') {
+                                event.preventDefault();
+                                onEditCancel?.();
+                              }
+                              if (event.key === 'Enter' && !event.shiftKey) {
+                                event.preventDefault();
+                                onEditCommit?.(node, event.currentTarget.value);
+                              }
+                            }}
+                            onBlur={(event) => {
+                              onEditCommit?.(node, event.currentTarget.value);
+                            }}
+                            className="mt-2 w-full min-h-[44px] text-[11px] text-gray-600 bg-gray-50 rounded-md p-2 resize-none outline-none"
+                            style={{
+                              fontSize: `${node.fontSize}px`,
+                              lineHeight: `${node.lineHeight}px`,
+                              fontFamily: 'inherit'
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </foreignObject>
+                  ) : node.kind === 'chapter' ? (
                     <text
                       x={MINDMAP_PADDING_X}
-                      y={
-                        MINDMAP_PADDING_Y +
-                        node.lines.length * node.lineHeight +
-                        (node.translationGap || 0)
-                      }
+                      y={MINDMAP_PADDING_Y+2}
                       dominantBaseline="hanging"
                       style={{
-                        fontSize: node.translationFontSize || node.fontSize,
-                        fill: '#6b7280',
+                        fontSize: node.fontSize,
+                        fill: '#111827',
                         userSelect: 'none'
                       }}
                       pointerEvents="none"
                     >
-                      {node.translationLines.map((line, index) => (
+                      {node.lines.map((line, index) => (
                         <tspan
-                          key={`${node.id}-translation-${index}`}
+                          key={`${node.id}-line-${index}`}
                           x={MINDMAP_PADDING_X}
                           dy={index === 0 ? 0 : node.lineHeight}
                         >
@@ -444,6 +624,91 @@ export const MindMap: React.FC<MindMapProps> = ({
                         </tspan>
                       ))}
                     </text>
+                  ) : (
+                    <>
+                      <text
+                        x={MINDMAP_PADDING_X}
+                        y={MINDMAP_PADDING_Y}
+                        dominantBaseline="hanging"
+                        style={{
+                          fontSize: node.fontSize,
+                          fill: '#111827',
+                          userSelect: 'none'
+                        }}
+                        pointerEvents="none"
+                      >
+                        {node.lines.map((line, index) => (
+                          <tspan
+                            key={`${node.id}-line-${index}`}
+                            x={MINDMAP_PADDING_X}
+                            dy={index === 0 ? 0 : node.lineHeight}
+                          >
+                            {line}
+                          </tspan>
+                        ))}
+                      </text>
+                      {node.translationLines?.length ? (
+                        <text
+                          x={MINDMAP_PADDING_X}
+                          y={
+                            MINDMAP_PADDING_Y +
+                            node.lines.length * node.lineHeight +
+                            (node.translationGap || 0)
+                          }
+                          dominantBaseline="hanging"
+                          style={{
+                            fontSize: node.translationFontSize || node.fontSize,
+                            fill: '#6b7280',
+                            userSelect: 'none'
+                          }}
+                          pointerEvents="none"
+                        >
+                          {node.translationLines.map((line, index) => (
+                            <tspan
+                              key={`${node.id}-translation-${index}`}
+                              x={MINDMAP_PADDING_X}
+                              dy={index === 0 ? 0 : node.lineHeight}
+                            >
+                              {line}
+                            </tspan>
+                          ))}
+                        </text>
+                      ) : null}
+                    </>
+                  )}
+                  {showActions && hasChildren ? (
+                    <g
+                      data-mindmap-action="true"
+                      transform={`translate(${toggleX}, ${toggleY})`}
+                      style={{ cursor: 'pointer' }}
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                      }}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onNodeToggleCollapse?.(node);
+                      }}
+                    >
+                      <rect
+                        width={actionSize}
+                        height={actionSize}
+                        rx={3}
+                        ry={3}
+                        fill="#f3f4f6"
+                        stroke="#e5e7eb"
+                      />
+                      <text
+                        x={actionSize / 2}
+                        y={actionSize / 2 + 0.5}
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        style={{ fontSize: 11, fill: '#6b7280', userSelect: 'none' }}
+                        pointerEvents="none"
+                      >
+                        {isCollapsed ? '+' : '-'}
+                      </text>
+                    </g>
                   ) : null}
                 </g>
               );
