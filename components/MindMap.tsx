@@ -61,6 +61,11 @@ export type MindMapLayout = {
   height: number;
 };
 
+type MindMapDropTarget = {
+  id: string;
+  position: 'before' | 'after';
+};
+
 type LayoutNode = MindMapNode & {
   width: number;
   height: number;
@@ -128,7 +133,7 @@ interface MindMapProps {
   onBackgroundMouseDown?: (event: React.MouseEvent<HTMLDivElement>) => void;
   onLayout?: (layout: MindMapLayout | null) => void;
   onLayoutStart?: () => void;
-  dragOverId?: string | null;
+  dropTarget?: MindMapDropTarget | null;
   draggingNoteId?: string | null;
   selectedNodeId?: string | null;
   onNoteToggleExpand?: (noteId: string) => void;
@@ -156,7 +161,7 @@ export const MindMap: React.FC<MindMapProps> = ({
   onBackgroundMouseDown,
   onLayout,
   onLayoutStart,
-  dragOverId,
+  dropTarget,
   draggingNoteId,
   selectedNodeId,
   onNoteToggleExpand,
@@ -446,6 +451,12 @@ export const MindMap: React.FC<MindMapProps> = ({
                   : stroke;
               const strokeWidth = isEditing ? 0 : isSelected ? 2 : 1;
               const showActions = activeActionNodeId === node.id && !isEditing;
+              const dropLineY =
+                dropTarget && dropTarget.id === node.id
+                  ? dropTarget.position === 'before'
+                    ? 0
+                    : node.height
+                  : null;
               const hasChildren = (nodeChildCountMap.get(node.id) || 0) > 0;
               const isCollapsed = collapsedIds.has(node.id);
               const actionSize = 14;
@@ -516,6 +527,18 @@ export const MindMap: React.FC<MindMapProps> = ({
                       rx={8}
                       ry={8}
                       fill={node.color || '#cbd5f5'}
+                    />
+                  ) : null}
+                  {dropLineY !== null ? (
+                    <line
+                      x1={-6}
+                      y1={dropLineY}
+                      x2={node.width + 6}
+                      y2={dropLineY}
+                      stroke="#2563eb"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      pointerEvents="none"
                     />
                   ) : null}
                   {isEditing ? (

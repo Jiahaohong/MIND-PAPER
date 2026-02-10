@@ -84,6 +84,19 @@ type ChatThread = {
   updatedAt: number;
 };
 
+type MindmapDropPosition = 'before' | 'after';
+type MindmapDropTarget = {
+  id: string;
+  kind: 'root' | 'chapter' | 'note';
+  position: MindmapDropPosition;
+};
+
+type MindmapDropEntry = {
+  parentId: string | null;
+  kind: 'node' | 'note';
+  id: string;
+};
+
 const HIGHLIGHT_COLORS = [
   { id: 'sun', swatch: '#facc15', fill: 'rgba(250, 204, 21, 0.45)' },
   { id: 'peach', swatch: '#fb923c', fill: 'rgba(251, 146, 60, 0.4)' },
@@ -246,7 +259,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const [isMindmapPanning, setIsMindmapPanning] = useState(false);
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [draggingChapterId, setDraggingChapterId] = useState<string | null>(null);
-  const [dragOverMindmapId, setDragOverMindmapId] = useState<string | null>(null);
+  const [dragOverMindmapTarget, setDragOverMindmapTarget] = useState<MindmapDropTarget | null>(null);
   const [draggingTocNoteId, setDraggingTocNoteId] = useState<string | null>(null);
   const [draggingTocChapterId, setDraggingTocChapterId] = useState<string | null>(null);
   const [dragOverTocId, setDragOverTocId] = useState<string | null>(null);
@@ -338,6 +351,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     lineHeight?: number;
   } | null>(null);
   const dragChapterTriggeredRef = useRef(false);
+  const dragOverMindmapTargetRef = useRef<MindmapDropTarget | null>(null);
   const tocDragNoteTimerRef = useRef<number | null>(null);
   const tocDragNoteRef = useRef<{
     id: string;
@@ -2240,6 +2254,54 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
   }, [isMindmapPanning, viewMode]);
 
+  const resolveMindmapDropTarget = (
+    clientX: number,
+    clientY: number,
+    draggingNodeId?: string | null
+  ): MindmapDropTarget | null => {
+    const target = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    const nodeEl = target?.closest?.('[data-mindmap-id]') as HTMLElement | null;
+    if (!nodeEl) return null;
+    const id = nodeEl.getAttribute('data-mindmap-id');
+    const kindValue = nodeEl.getAttribute('data-mindmap-kind');
+    if (!id || !kindValue) return null;
+    if (draggingNodeId && id === draggingNodeId) return null;
+    const kind =
+      kindValue === 'note' || kindValue === 'chapter' || kindValue === 'root'
+        ? kindValue
+        : null;
+    if (!kind) return null;
+    const rect = nodeEl.getBoundingClientRect();
+    const position: MindmapDropPosition =
+      clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+    return { id, kind, position };
+  };
+
+  const parseMindmapNoteNodeId = (mindmapNodeId: string) => {
+    if (!mindmapNodeId.startsWith('note-')) return null;
+    return mindmapNodeId.slice(5);
+  };
+
+  const resolveDropTargetEntry = (target: MindmapDropTarget | null): MindmapDropEntry | null => {
+    if (!target || target.kind === 'root') return null;
+    if (target.kind === 'note') {
+      const noteId = parseMindmapNoteNodeId(target.id);
+      if (!noteId) return null;
+      const note = highlights.find((item) => item.id === noteId && !item.isChapterTitle);
+      if (!note) return null;
+      return {
+        parentId: note.chapterId || null,
+        kind: 'note',
+        id: note.id
+      };
+    }
+    return {
+      parentId: tocParentMapRef.current.get(target.id) || null,
+      kind: 'node',
+      id: target.id
+    };
+  };
+
   useEffect(() => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
     if (!draggingNoteId) return undefined;
@@ -2248,15 +2310,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       dragNoteTimerRef.current = null;
     }
     const handleMove = (event: MouseEvent) => {
-      const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
-      const mindmapNode = target?.closest?.('[data-mindmap-id]');
-      let mindmapId = mindmapNode?.getAttribute('data-mindmap-id') || null;
-      const mindmapKind = mindmapNode?.getAttribute('data-mindmap-kind') || null;
-      if (mindmapKind === 'note') {
-        mindmapId = null;
-      }
-      setDragOverMindmapId(mindmapId);
       const dragInfo = dragNoteRef.current;
+      const draggingNodeId = dragInfo ? `note-${dragInfo.id}` : null;
+      const nextTarget = resolveMindmapDropTarget(event.clientX, event.clientY, draggingNodeId);
+      dragOverMindmapTargetRef.current = nextTarget;
+      setDragOverMindmapTarget(nextTarget);
       if (dragInfo) {
         setDragGhost((prev) => ({
           ...(prev || {}),
@@ -2275,21 +2333,51 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     const handleUp = () => {
       const dragInfo = dragNoteRef.current;
-      const targetId = dragOverMindmapId;
-      if (dragInfo && targetId && targetId !== dragInfo.chapterId) {
-        setHighlights((prev) =>
-          prev.map((item) =>
-            item.id === dragInfo.id ? { ...item, chapterId: targetId } : item
-          )
-        );
-        setExpandedTOC((prev) => {
-          const next = new Set(prev);
-          next.add(targetId);
-          return next;
-        });
+      const target = dragOverMindmapTargetRef.current;
+      const targetEntry = resolveDropTargetEntry(target);
+      if (dragInfo && target && targetEntry) {
+        const draggedParentId = dragInfo.chapterId || null;
+        const isSameParent =
+          draggedParentId === targetEntry.parentId &&
+          !(targetEntry.kind === 'note' && targetEntry.id === dragInfo.id);
+
+        if (isSameParent && targetEntry.parentId) {
+          const nextOrder =
+            target.position === 'before'
+              ? getCombinedOrderValueBefore(targetEntry.parentId, targetEntry.kind, targetEntry.id)
+              : getCombinedOrderValueAfter(targetEntry.parentId, targetEntry.kind, targetEntry.id);
+          setHighlights((prev) =>
+            prev.map((item) =>
+              item.id === dragInfo.id ? { ...item, order: nextOrder } : item
+            )
+          );
+        } else {
+          const nextParentId =
+            target.kind === 'chapter'
+              ? target.id
+              : targetEntry.parentId && targetEntry.parentId !== draggedParentId
+                ? targetEntry.parentId
+                : null;
+          if (nextParentId && nextParentId !== dragInfo.chapterId) {
+            const nextOrder = getCombinedOrderValue(nextParentId);
+            setHighlights((prev) =>
+              prev.map((item) =>
+                item.id === dragInfo.id
+                  ? { ...item, chapterId: nextParentId, order: nextOrder }
+                  : item
+              )
+            );
+            setExpandedTOC((prev) => {
+              const next = new Set(prev);
+              next.add(nextParentId);
+              return next;
+            });
+          }
+        }
       }
       setDraggingNoteId(null);
-      setDragOverMindmapId(null);
+      setDragOverMindmapTarget(null);
+      dragOverMindmapTargetRef.current = null;
       setDragGhost(null);
       dragNoteTriggeredRef.current = false;
       dragNoteRef.current = null;
@@ -2304,24 +2392,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, [draggingNoteId, dragOverMindmapId, viewMode]);
+  }, [draggingNoteId, viewMode]);
 
   useEffect(() => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
     const handleUp = () => {
-      if (draggingNoteId) return;
+      if (draggingNoteId || draggingChapterId) return;
       if (dragNoteTimerRef.current) {
         window.clearTimeout(dragNoteTimerRef.current);
         dragNoteTimerRef.current = null;
       }
       dragNoteTriggeredRef.current = false;
       dragNoteRef.current = null;
-      setDragOverMindmapId(null);
+      setDragOverMindmapTarget(null);
+      dragOverMindmapTargetRef.current = null;
       setDragGhost(null);
     };
     window.addEventListener('mouseup', handleUp);
     return () => window.removeEventListener('mouseup', handleUp);
-  }, [draggingNoteId, viewMode]);
+  }, [draggingNoteId, draggingChapterId, viewMode]);
 
   const handleMindmapNodeMouseDown = (
     node: MindMapNode,
@@ -3074,6 +3163,43 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return currentOrder + 0.0001;
   };
 
+  const getCombinedOrderValueBefore = (
+    parentId: string,
+    kind: 'node' | 'note',
+    id: string
+  ) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    const notes = highlights.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    const entries = buildCombinedEntries(nodes, notes);
+    if (!entries.length) return 0;
+    const sorted = sortCombinedEntries(entries);
+    const fallbackOrder = getCombinedFallbackOrder(entries);
+    const targetKey = `${kind}:${id}`;
+    const index = sorted.findIndex((entry) => entry.key === targetKey);
+    if (index === -1) return getCombinedOrderValue(parentId);
+    const current = sorted[index];
+    const currentOrder =
+      typeof current.order === 'number'
+        ? current.order
+        : (fallbackOrder.get(current.key) ?? index);
+    const prev = sorted[index - 1];
+    if (!prev) return currentOrder - 1;
+    const prevOrder =
+      typeof prev.order === 'number'
+        ? prev.order
+        : (fallbackOrder.get(prev.key) ?? currentOrder - 1);
+    if (currentOrder - prevOrder > 1e-6) {
+      return (currentOrder + prevOrder) / 2;
+    }
+    return currentOrder - 0.0001;
+  };
+
   const getNodeOrderValueAfter = (parentId: string, nodeId: string) => {
     const parentNode =
       parentId === outlineRootId
@@ -3768,15 +3894,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       dragChapterTimerRef.current = null;
     }
     const handleMove = (event: MouseEvent) => {
-      const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
-      const mindmapNode = target?.closest?.('[data-mindmap-id]');
-      let mindmapId = mindmapNode?.getAttribute('data-mindmap-id') || null;
-      const mindmapKind = mindmapNode?.getAttribute('data-mindmap-kind') || null;
-      if (mindmapKind === 'note') {
-        mindmapId = null;
-      }
-      setDragOverMindmapId(mindmapId);
       const dragInfo = dragChapterRef.current;
+      const draggingNodeId = dragInfo ? dragInfo.id : null;
+      const nextTarget = resolveMindmapDropTarget(event.clientX, event.clientY, draggingNodeId);
+      dragOverMindmapTargetRef.current = nextTarget;
+      setDragOverMindmapTarget(nextTarget);
       if (dragInfo) {
         setDragGhost((prev) => ({
           ...(prev || {}),
@@ -3794,25 +3916,45 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     const handleUp = () => {
       const dragInfo = dragChapterRef.current;
-      const targetId = dragOverMindmapId;
-      if (dragInfo && targetId && targetId !== dragInfo.id) {
-        const isDescendant = (() => {
-          let current = mindmapParentMap.get(targetId) || null;
-          while (current) {
-            if (current === dragInfo.id) return true;
-            current = mindmapParentMap.get(current) || null;
+      const target = dragOverMindmapTargetRef.current;
+      const targetEntry = resolveDropTargetEntry(target);
+      if (dragInfo && target && targetEntry) {
+        const draggedParentId = dragInfo.parentId || outlineRootId;
+        const isSameParent =
+          draggedParentId === targetEntry.parentId &&
+          !(targetEntry.kind === 'node' && targetEntry.id === dragInfo.id);
+        const draggedIsCustom = customChapters.some((item) => item.id === dragInfo.id);
+
+        if (isSameParent && draggedIsCustom && targetEntry.parentId) {
+          const nextOrder =
+            target.position === 'before'
+              ? getCombinedOrderValueBefore(targetEntry.parentId, targetEntry.kind, targetEntry.id)
+              : getCombinedOrderValueAfter(targetEntry.parentId, targetEntry.kind, targetEntry.id);
+          setCustomChapters((prev) =>
+            prev.map((item) =>
+              item.id === dragInfo.id ? { ...item, order: nextOrder } : item
+            )
+          );
+        } else if (target.kind === 'chapter' && target.id !== dragInfo.id) {
+          const isDescendant = (() => {
+            let current = mindmapParentMap.get(target.id) || null;
+            while (current) {
+              if (current === dragInfo.id) return true;
+              current = mindmapParentMap.get(current) || null;
+            }
+            return false;
+          })();
+          if (!isDescendant) {
+            setChapterParentOverrides((prev) => ({
+              ...prev,
+              [dragInfo.id]: target.id
+            }));
           }
-          return false;
-        })();
-        if (!isDescendant) {
-          setChapterParentOverrides((prev) => ({
-            ...prev,
-            [dragInfo.id]: targetId
-          }));
         }
       }
       setDraggingChapterId(null);
-      setDragOverMindmapId(null);
+      setDragOverMindmapTarget(null);
+      dragOverMindmapTargetRef.current = null;
       setDragGhost(null);
       dragChapterTriggeredRef.current = false;
       dragChapterRef.current = null;
@@ -3827,7 +3969,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, [draggingChapterId, dragOverMindmapId, mindmapParentMap, viewMode]);
+  }, [draggingChapterId, mindmapParentMap, customChapters, viewMode]);
 
   useEffect(() => {
     if (questionPicker.open && (!selectionRect || !selectionText)) {
@@ -3838,17 +3980,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   useEffect(() => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
     const handleUp = () => {
-      if (draggingChapterId) return;
+      if (draggingChapterId || draggingNoteId) return;
       if (dragChapterTimerRef.current) {
         window.clearTimeout(dragChapterTimerRef.current);
         dragChapterTimerRef.current = null;
       }
       dragChapterTriggeredRef.current = false;
       dragChapterRef.current = null;
+      setDragOverMindmapTarget(null);
+      dragOverMindmapTargetRef.current = null;
+      setDragGhost(null);
     };
     window.addEventListener('mouseup', handleUp);
     return () => window.removeEventListener('mouseup', handleUp);
-  }, [draggingChapterId, viewMode]);
+  }, [draggingChapterId, draggingNoteId, viewMode]);
 
   const findOutlinePath = (nodes: OutlineNode[], targetId: string, path: string[] = []): string[] | null => {
     for (const node of nodes) {
@@ -3894,7 +4039,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setIsMindmapPanning(false);
     setDraggingNoteId(null);
     setDraggingChapterId(null);
-    setDragOverMindmapId(null);
+    setDragOverMindmapTarget(null);
+    dragOverMindmapTargetRef.current = null;
     setDraggingTocNoteId(null);
     setDraggingTocChapterId(null);
     setDragOverTocId(null);
@@ -4613,7 +4759,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                     collapsedIds={collapsedMindmapIds}
                     expandedNoteIds={expandedHighlightIds}
                     offset={mindmapOffset}
-                    dragOverId={dragOverMindmapId}
+                    dropTarget={
+                      dragOverMindmapTarget
+                        ? {
+                            id: dragOverMindmapTarget.id,
+                            position: dragOverMindmapTarget.position
+                          }
+                        : null
+                    }
                     draggingNoteId={draggingNoteId}
                     selectedNodeId={activeMindmapNodeId}
                     onLayoutStart={handleMindmapLayoutStart}
