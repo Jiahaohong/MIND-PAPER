@@ -433,7 +433,7 @@ export const MindMap: React.FC<MindMapProps> = ({
               const isSelected = Boolean(selectedNodeId && selectedNodeId === node.id);
               const isManualNote = node.kind === 'note' && isManualMindmapNote(node.note);
               const isNormalChapter = node.kind === 'chapter' && Boolean(node.isNormalChapter);
-              const useDashedSelectedStroke = isSelected && (isManualNote || isNormalChapter);
+              const useItalicNodeText = isManualNote || isNormalChapter;
               const selectedStroke =
                 node.kind === 'note' && node.color
                   ? toSolidColor(node.color)
@@ -505,32 +505,18 @@ export const MindMap: React.FC<MindMapProps> = ({
                     fill={resolvedFill}
                     stroke={effectiveStroke}
                     strokeWidth={strokeWidth}
-                    strokeDasharray={useDashedSelectedStroke ? '4 3' : undefined}
                     opacity={isDraggingNote ? 0.5 : 1}
                   />
                   {node.kind === 'note' && !isEditing ? (
-                    isManualNote ? (
-                      <line
-                        x1={2}
-                        y1={4}
-                        x2={2}
-                        y2={Math.max(4, node.height - 4)}
-                        stroke={node.color || '#cbd5f5'}
-                        strokeWidth={3}
-                        strokeDasharray="4 3"
-                        strokeLinecap="butt"
-                      />
-                    ) : (
-                      <rect
-                        x={0}
-                        y={0}
-                        width={4}
-                        height={node.height}
-                        rx={8}
-                        ry={8}
-                        fill={node.color || '#cbd5f5'}
-                      />
-                    )
+                    <rect
+                      x={0}
+                      y={0}
+                      width={4}
+                      height={node.height}
+                      rx={8}
+                      ry={8}
+                      fill={node.color || '#cbd5f5'}
+                    />
                   ) : null}
                   {isEditing ? (
                     <foreignObject
@@ -623,7 +609,8 @@ export const MindMap: React.FC<MindMapProps> = ({
                             style={{
                               fontSize: `${node.fontSize}px`,
                               lineHeight: `${node.lineHeight}px`,
-                              fontFamily: 'inherit'
+                              fontFamily: 'inherit',
+                              fontStyle: useItalicNodeText ? 'italic' : 'normal'
                             }}
                           />
                         </div>
@@ -637,7 +624,8 @@ export const MindMap: React.FC<MindMapProps> = ({
                       style={{
                         fontSize: node.fontSize,
                         fill: '#111827',
-                        userSelect: 'none'
+                        userSelect: 'none',
+                        fontStyle: useItalicNodeText ? 'italic' : 'normal'
                       }}
                       pointerEvents="none"
                     >
@@ -660,7 +648,8 @@ export const MindMap: React.FC<MindMapProps> = ({
                         style={{
                           fontSize: node.fontSize,
                           fill: '#111827',
-                          userSelect: 'none'
+                          userSelect: 'none',
+                          fontStyle: useItalicNodeText ? 'italic' : 'normal'
                         }}
                         pointerEvents="none"
                       >
@@ -686,7 +675,8 @@ export const MindMap: React.FC<MindMapProps> = ({
                           style={{
                             fontSize: node.translationFontSize || node.fontSize,
                             fill: '#6b7280',
-                            userSelect: 'none'
+                            userSelect: 'none',
+                            fontStyle: useItalicNodeText ? 'italic' : 'normal'
                           }}
                           pointerEvents="none"
                         >

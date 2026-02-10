@@ -54,6 +54,7 @@ type HighlightItem = {
   rects: HighlightRect[];
   chapterId: string;
   isChapterTitle: boolean;
+  chapterNodeId?: string | null;
   translation?: string;
   source?: 'pdf' | 'manual';
   order?: number;
@@ -246,7 +247,6 @@ const mergeOutlineWithCustom = (
       items: cloneNodes(node.items || [])
     }));
   const rootItems = cloneNodes(outline);
-  const baseIds = new Set(baseFlat.map((node) => node.id));
 
   const insertIntoParent = (nodes: OutlineNode[], parentId: string, child: OutlineNode) => {
     for (const node of nodes) {
@@ -259,6 +259,19 @@ const mergeOutlineWithCustom = (
     return false;
   };
 
+  const appendToRoot = (child: OutlineNode) => {
+    const rootNode = rootItems.find((item) => item.id === rootId);
+    if (rootNode) {
+      rootNode.items = Array.isArray(rootNode.items)
+        ? [...rootNode.items, child]
+        : [child];
+      return;
+    }
+    rootItems.push(child);
+  };
+
+  const pendingByParent: Array<{ child: OutlineNode; parentId: string }> = [];
+
   customNodes.forEach((node) => {
     if (!node) return;
     const normalized: OutlineNode = {
@@ -266,27 +279,65 @@ const mergeOutlineWithCustom = (
       items: Array.isArray(node.items) ? node.items : [],
       isCustom: true
     };
-    let parentId = node.parentId || null;
-    if (!parentId || !baseIds.has(parentId)) {
+    const parentId = node.parentId || null;
+    if (parentId) {
+      if (parentId === rootId) {
+        appendToRoot(normalized);
+        return;
+      }
+      if (insertIntoParent(rootItems, parentId, normalized)) return;
+      pendingByParent.push({ child: normalized, parentId });
+      return;
+    }
+
+    const fallbackParent = (() => {
       const candidate = findChapterForPosition(
         node.pageIndex ?? 0,
         node.topRatio ?? 0,
         baseFlat
       );
-      parentId = candidate?.id || rootId;
-    }
-    if (parentId && parentId !== rootId && insertIntoParent(rootItems, parentId, normalized)) {
+      return candidate?.id || rootId;
+    })();
+    if (
+      fallbackParent &&
+      fallbackParent !== rootId &&
+      insertIntoParent(rootItems, fallbackParent, normalized)
+    ) {
       return;
     }
-    const rootNode = rootItems.find((item) => item.id === rootId);
-    if (rootNode) {
-      rootNode.items = Array.isArray(rootNode.items)
-        ? [...rootNode.items, normalized]
-        : [normalized];
-      return;
-    }
-    rootItems.push(normalized);
+    appendToRoot(normalized);
   });
+
+  if (pendingByParent.length) {
+    const unresolved = [...pendingByParent];
+    let progressed = true;
+    while (unresolved.length && progressed) {
+      progressed = false;
+      for (let i = unresolved.length - 1; i >= 0; i -= 1) {
+        const current = unresolved[i];
+        if (insertIntoParent(rootItems, current.parentId, current.child)) {
+          unresolved.splice(i, 1);
+          progressed = true;
+        }
+      }
+    }
+    unresolved.forEach(({ child }) => {
+      const candidate = findChapterForPosition(
+        child.pageIndex ?? 0,
+        child.topRatio ?? 0,
+        baseFlat
+      );
+      const fallbackParent = candidate?.id || rootId;
+      if (
+        fallbackParent &&
+        fallbackParent !== rootId &&
+        insertIntoParent(rootItems, fallbackParent, child)
+      ) {
+        return;
+      }
+      appendToRoot(child);
+    });
+  }
 
   sortOutlineNodes(rootItems);
   return rootItems;
@@ -353,12 +404,83 @@ const getHighlightSortKey = (item: HighlightItem) => {
   return { pageIndex, top };
 };
 
+type CombinedEntry = {
+  key: string;
+  kind: 'node' | 'note';
+  id: string;
+  order?: number;
+  pageIndex: number;
+  top: number;
+  index: number;
+};
+
+const buildCombinedEntries = (nodes: OutlineNode[], notes: HighlightItem[]) => {
+  const entries: CombinedEntry[] = [
+    ...nodes.map((node, index) => ({
+      key: `node:${node.id}`,
+      kind: 'node' as const,
+      id: node.id,
+      order: node.order,
+      pageIndex:
+        typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
+      top: typeof node.topRatio === 'number' ? node.topRatio : 0,
+      index
+    })),
+    ...notes.map((note, index) => {
+      const key = getHighlightSortKey(note);
+      return {
+        key: `note:${note.id}`,
+        kind: 'note' as const,
+        id: note.id,
+        order: note.order,
+        pageIndex:
+          typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
+        top: typeof key.top === 'number' ? key.top : 0,
+        index: index + nodes.length
+      };
+    })
+  ];
+  return entries;
+};
+
+const getCombinedFallbackOrder = (entries: CombinedEntry[]) => {
+  const fallbackSorted = entries.slice().sort((a, b) => {
+    if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
+    if (a.top !== b.top) return a.top - b.top;
+    return a.index - b.index;
+  });
+  const map = new Map<string, number>();
+  fallbackSorted.forEach((entry, idx) => {
+    map.set(entry.key, idx);
+  });
+  return map;
+};
+
+const sortCombinedEntries = (entries: CombinedEntry[]) => {
+  const fallbackOrder = getCombinedFallbackOrder(entries);
+  return entries.slice().sort((a, b) => {
+    const aOrder =
+      typeof a.order === 'number' ? a.order : (fallbackOrder.get(a.key) ?? 0);
+    const bOrder =
+      typeof b.order === 'number' ? b.order : (fallbackOrder.get(b.key) ?? 0);
+    if (aOrder !== bOrder) return aOrder - bOrder;
+    return (fallbackOrder.get(a.key) ?? 0) - (fallbackOrder.get(b.key) ?? 0);
+  });
+};
+
 const buildMindmapRoot = (
   outlineDisplay: OutlineNode[],
   highlights: HighlightItem[]
 ): MindMapNode | null => {
   if (!outlineDisplay.length) return null;
   const rootNode = outlineDisplay[0];
+  const highlightChapterNodeIdSet = new Set<string>();
+  highlights.forEach((item) => {
+    if (!item.isChapterTitle) return;
+    if (isManualHighlight(item)) return;
+    const nodeId = item.chapterNodeId || item.chapterId;
+    if (nodeId) highlightChapterNodeIdSet.add(nodeId);
+  });
   const highlightsByChapter = new Map<string, HighlightItem[]>();
   highlights.forEach((item) => {
     if (!item.chapterId || item.isChapterTitle) return;
@@ -366,29 +488,6 @@ const buildMindmapRoot = (
     list.push(item);
     highlightsByChapter.set(item.chapterId, list);
   });
-  highlightsByChapter.forEach((list) => {
-    list.sort((a, b) => {
-      const aKey = getHighlightSortKey(a);
-      const bKey = getHighlightSortKey(b);
-      if (aKey.pageIndex !== bKey.pageIndex) return aKey.pageIndex - bKey.pageIndex;
-      return aKey.top - bKey.top;
-    });
-  });
-
-  const getNodeOrder = (node: OutlineNode, index: number) => ({
-    pageIndex: typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
-    ratio: typeof node.topRatio === 'number' ? node.topRatio : 0,
-    index
-  });
-
-  const getNoteOrder = (note: HighlightItem, index: number) => {
-    const key = getHighlightSortKey(note);
-    return {
-      pageIndex: typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
-      ratio: typeof key.top === 'number' ? key.top : 0,
-      index
-    };
-  };
 
   const buildNode = (node: OutlineNode): MindMapNode => {
     const childItems = node.items || [];
@@ -403,31 +502,22 @@ const buildMindmapRoot = (
       pageIndex: note.pageIndex,
       note
     }));
-    const combined = [
-      ...childNodes.map((child, index) => ({
-        node: child,
-        order: getNodeOrder(childItems[index], index)
-      })),
-      ...noteNodes.map((note, index) => ({
-        node: note,
-        order: getNoteOrder(noteItems[index], index + childNodes.length)
-      }))
-    ]
-      .sort((a, b) => {
-        if (a.order.pageIndex !== b.order.pageIndex) {
-          return a.order.pageIndex - b.order.pageIndex;
-        }
-        if (a.order.ratio !== b.order.ratio) {
-          return a.order.ratio - b.order.ratio;
-        }
-        return a.order.index - b.order.index;
-      })
-      .map((item) => item.node);
+    const childNodeMap = new Map(childItems.map((child, index) => [child.id, childNodes[index]]));
+    const noteNodeMap = new Map(noteItems.map((note, index) => [note.id, noteNodes[index]]));
+    const combinedEntries = sortCombinedEntries(buildCombinedEntries(childItems, noteItems));
+    const combined = combinedEntries
+      .map((entry) =>
+        entry.kind === 'node'
+          ? childNodeMap.get(entry.id)
+          : noteNodeMap.get(entry.id)
+      )
+      .filter(Boolean) as MindMapNode[];
 
     return {
       id: node.id,
       text: node.title,
       kind: node.isRoot ? 'root' : 'chapter',
+      isNormalChapter: Boolean(node.isCustom && !highlightChapterNodeIdSet.has(node.id)),
       pageIndex: node.pageIndex,
       topRatio: node.topRatio,
       children: combined
@@ -445,26 +535,20 @@ const buildMindmapRoot = (
     pageIndex: note.pageIndex,
     note
   }));
-  const combinedRoot = [
-    ...rootChildren.map((node, index) => ({
-      node,
-      order: getNodeOrder(rootNode.items?.[index] || rootNode, index)
-    })),
-    ...rootNoteNodes.map((node, index) => ({
-      node,
-      order: getNoteOrder(rootNotes[index], index + rootChildren.length)
-    }))
-  ]
-    .sort((a, b) => {
-      if (a.order.pageIndex !== b.order.pageIndex) {
-        return a.order.pageIndex - b.order.pageIndex;
-      }
-      if (a.order.ratio !== b.order.ratio) {
-        return a.order.ratio - b.order.ratio;
-      }
-      return a.order.index - b.order.index;
-    })
-    .map((item) => item.node);
+  const rootChildMap = new Map(
+    (rootNode.items || []).map((child, index) => [child.id, rootChildren[index]])
+  );
+  const rootNoteMap = new Map(rootNotes.map((note, index) => [note.id, rootNoteNodes[index]]));
+  const rootCombinedEntries = sortCombinedEntries(
+    buildCombinedEntries(rootNode.items || [], rootNotes)
+  );
+  const combinedRoot = rootCombinedEntries
+    .map((entry) =>
+      entry.kind === 'node'
+        ? rootChildMap.get(entry.id)
+        : rootNoteMap.get(entry.id)
+    )
+    .filter(Boolean) as MindMapNode[];
 
   return {
     id: rootNode.id,
@@ -698,6 +782,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [mindmapLoading, setMindmapLoading] = useState(false);
   const [mindmapOffset, setMindmapOffset] = useState({ x: 0, y: 0 });
   const [collapsedMindmapIds, setCollapsedMindmapIds] = useState<Set<string>>(new Set());
+  const [expandedMindmapNoteIds, setExpandedMindmapNoteIds] = useState<Set<string>>(new Set());
+  const [activeMindmapNodeId, setActiveMindmapNodeId] = useState<string | null>(null);
   const mindmapCacheRef = useRef<
     Map<string, { root: MindMapNode | null; updatedAt: number | null }>
   >(new Map());
@@ -986,6 +1072,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       }
       return next;
     });
+  };
+
+  const handleMindMapNodeClick = (node: MindMapNode) => {
+    setActiveMindmapNodeId(node.id);
   };
 
   useEffect(() => {
@@ -1388,7 +1478,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   useEffect(() => {
     setMindmapOffset({ x: 0, y: 0 });
     setCollapsedMindmapIds(new Set());
+    setExpandedMindmapNoteIds(new Set());
+    setActiveMindmapNodeId(null);
   }, [selectedPaper?.id, previewMode]);
+
+  useEffect(() => {
+    if (previewMode !== 'mindmap') return;
+    if (!mindmapRoot) {
+      setActiveMindmapNodeId(null);
+      return;
+    }
+    if (activeMindmapNodeId && mindmapNodeMap.has(activeMindmapNodeId)) return;
+    setActiveMindmapNodeId(mindmapRoot.id);
+  }, [previewMode, mindmapRoot, mindmapNodeMap, activeMindmapNodeId]);
 
   useEffect(() => {
     if (!selectedPaper) {
@@ -1848,7 +1950,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       root={mindmapRoot}
                       zoomScale={mindmapZoomScale}
                       collapsedIds={collapsedMindmapIds}
+                      expandedNoteIds={expandedMindmapNoteIds}
                       offset={mindmapOffset}
+                      selectedNodeId={activeMindmapNodeId}
+                      onNodeClick={handleMindMapNodeClick}
                       onLayout={(layout) => {
                         mindmapLayoutRef.current = layout;
                         const anchor = mindmapAnchorRef.current;
@@ -1875,6 +1980,17 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         setMindmapOffset({ x: anchor.x, y: anchor.y });
                       }}
                       onNodeToggleCollapse={handleMindmapToggleCollapse}
+                      onNoteToggleExpand={(noteId) =>
+                        setExpandedMindmapNoteIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(noteId)) {
+                            next.delete(noteId);
+                          } else {
+                            next.add(noteId);
+                          }
+                          return next;
+                        })
+                      }
                       onBackgroundMouseDown={(event) => {
                         if (event.button !== 0) return;
                         mindmapPanRef.current = {

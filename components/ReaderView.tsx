@@ -4026,7 +4026,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           data-toc-id={item.id}
           data-toc-kind="chapter"
           className={`group flex items-center py-1 px-2 cursor-pointer rounded my-0.5 ${
-            isNormalChapterInToc ? 'text-xs text-gray-600' : 'text-sm text-gray-700'
+            isNormalChapterInToc ? 'text-xs text-gray-600 italic' : 'text-sm text-gray-700'
           } ${
             isDropTarget ? 'bg-gray-200' : 'hover:bg-gray-200'
           }`}
@@ -4127,10 +4127,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                               }}
                               className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 group-hover:bg-gray-200 flex flex-col items-start ${
                                 entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
-                              }`}
+                              } ${isPlainNote ? 'italic' : ''}`}
                               style={{
-                                borderLeft: `3px solid ${entry.note.color}`,
-                                borderLeftStyle: isPlainNote ? 'dashed' : 'solid'
+                                borderLeft: `3px solid ${entry.note.color}`
                               }}
                             >
                               <span className="leading-4 w-full" style={clampStyle}>
@@ -4231,7 +4230,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
             <Tooltip label="PDF">
               <button 
                 onClick={() => switchViewMode(ReaderMode.PDF)}
-                className={`flex items-center p-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.PDF ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
+                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.PDF ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
                 aria-label="PDF"
               >
                 <FileText size={14} />
@@ -4240,7 +4239,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
             <Tooltip label="Mind Map">
               <button 
                 onClick={() => switchViewMode(ReaderMode.MIND_MAP)}
-                className={`flex items-center p-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.MIND_MAP ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
+                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.MIND_MAP ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
                 aria-label="Mind Map"
               >
                 <Network size={14} />
