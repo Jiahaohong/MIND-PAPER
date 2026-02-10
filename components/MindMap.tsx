@@ -712,15 +712,15 @@ export const MindMap: React.FC<MindMapProps> = ({
                         height={actionSize}
                         rx={3}
                         ry={3}
-                        fill="#f3f4f6"
-                        stroke="#e5e7eb"
+                        fill="#ffffff"
+                        stroke="#d1d5db"
                       />
                       <text
                         x={actionSize / 2}
                         y={actionSize / 2 + 0.5}
                         textAnchor="middle"
                         dominantBaseline="middle"
-                        style={{ fontSize: 11, fill: '#6b7280', userSelect: 'none' }}
+                        style={{ fontSize: 11, fill: '#374151', userSelect: 'none' }}
                         pointerEvents="none"
                       >
                         {isCollapsed ? '+' : '-'}

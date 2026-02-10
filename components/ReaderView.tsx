@@ -2741,7 +2741,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         items: cloneNodes(node.items || [])
       }));
     const rootItems = cloneNodes(outline);
-    const baseIds = new Set(baseFlat.map((node) => node.id));
 
     const insertIntoParent = (nodes: OutlineNode[], parentId: string, child: OutlineNode) => {
       for (const node of nodes) {
@@ -2754,6 +2753,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       return false;
     };
 
+    const appendToRoot = (child: OutlineNode) => {
+      const rootNode = rootItems.find((item) => item.id === rootId);
+      if (rootNode) {
+        rootNode.items = Array.isArray(rootNode.items)
+          ? [...rootNode.items, child]
+          : [child];
+        return;
+      }
+      rootItems.push(child);
+    };
+
+    const pendingByParent: Array<{ child: OutlineNode; parentId: string }> = [];
+
     customNodes.forEach((node) => {
       if (!node) return;
       const normalized: OutlineNode = {
@@ -2761,27 +2773,64 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         items: Array.isArray(node.items) ? node.items : [],
         isCustom: true
       };
-      let parentId = node.parentId || null;
-      if (!parentId || !baseIds.has(parentId)) {
+      const parentId = node.parentId || null;
+      if (parentId) {
+        if (parentId === rootId) {
+          appendToRoot(normalized);
+          return;
+        }
+        if (insertIntoParent(rootItems, parentId, normalized)) return;
+        pendingByParent.push({ child: normalized, parentId });
+        return;
+      }
+      const fallbackParent = (() => {
         const candidate = findChapterForPosition(
           node.pageIndex ?? 0,
           node.topRatio ?? 0,
           baseFlat
         );
-        parentId = candidate?.id || rootId;
-      }
-      if (parentId && parentId !== rootId && insertIntoParent(rootItems, parentId, normalized)) {
+        return candidate?.id || rootId;
+      })();
+      if (
+        fallbackParent &&
+        fallbackParent !== rootId &&
+        insertIntoParent(rootItems, fallbackParent, normalized)
+      ) {
         return;
       }
-      const rootNode = rootItems.find((item) => item.id === rootId);
-      if (rootNode) {
-        rootNode.items = Array.isArray(rootNode.items)
-          ? [...rootNode.items, normalized]
-          : [normalized];
-        return;
-      }
-      rootItems.push(normalized);
+      appendToRoot(normalized);
     });
+
+    if (pendingByParent.length) {
+      const unresolved = [...pendingByParent];
+      let progressed = true;
+      while (unresolved.length && progressed) {
+        progressed = false;
+        for (let i = unresolved.length - 1; i >= 0; i -= 1) {
+          const current = unresolved[i];
+          if (insertIntoParent(rootItems, current.parentId, current.child)) {
+            unresolved.splice(i, 1);
+            progressed = true;
+          }
+        }
+      }
+      unresolved.forEach(({ child }) => {
+        const candidate = findChapterForPosition(
+          child.pageIndex ?? 0,
+          child.topRatio ?? 0,
+          baseFlat
+        );
+        const fallbackParent = candidate?.id || rootId;
+        if (
+          fallbackParent &&
+          fallbackParent !== rootId &&
+          insertIntoParent(rootItems, fallbackParent, child)
+        ) {
+          return;
+        }
+        appendToRoot(child);
+      });
+    }
 
     sortOutlineNodes(rootItems);
     return rootItems;
