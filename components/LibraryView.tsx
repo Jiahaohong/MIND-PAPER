@@ -17,6 +17,12 @@ import { SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from '../constants';
 import { pdfjs } from 'react-pdf';
 import { MindMap, type MindMapLayout, type MindMapNode } from './MindMap';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
+import {
+  deriveLegacyMindmapDataFromV2,
+  mergeLegacyParentOverridesIntoCustomChapters,
+  normalizeLegacyParentOverrides,
+  parseMindmapStateV2
+} from '../utils/mindmapStateV2';
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
@@ -338,59 +344,6 @@ const mergeOutlineWithCustom = (
       appendToRoot(child);
     });
   }
-
-  sortOutlineNodes(rootItems);
-  return rootItems;
-};
-
-const applyParentOverrides = (
-  outline: OutlineNode[],
-  overrides: Record<string, string>
-) => {
-  if (!overrides || !Object.keys(overrides).length) return outline;
-  const cloneNodes = (nodes: OutlineNode[]) =>
-    (nodes || []).map((node) => ({
-      ...node,
-      items: cloneNodes(node.items || [])
-    }));
-  const rootItems = cloneNodes(outline);
-  const idToNode = new Map<string, OutlineNode>();
-  const idToParent = new Map<string, OutlineNode | null>();
-
-  const walk = (nodes: OutlineNode[], parent: OutlineNode | null) => {
-    nodes.forEach((node) => {
-      idToNode.set(node.id, node);
-      idToParent.set(node.id, parent);
-      if (node.items?.length) walk(node.items, node);
-    });
-  };
-  walk(rootItems, null);
-
-  const isDescendant = (ancestorId: string, targetId: string) => {
-    let current = idToParent.get(targetId) || null;
-    while (current) {
-      if (current.id === ancestorId) return true;
-      current = idToParent.get(current.id) || null;
-    }
-    return false;
-  };
-
-  Object.entries(overrides).forEach(([nodeId, nextParentId]) => {
-    if (!nodeId || !nextParentId || nodeId === nextParentId) return;
-    const node = idToNode.get(nodeId);
-    const nextParent = idToNode.get(nextParentId);
-    if (!node || !nextParent) return;
-    if (isDescendant(nodeId, nextParentId)) return;
-    const currentParent = idToParent.get(nodeId);
-    if (currentParent) {
-      currentParent.items = (currentParent.items || []).filter((item) => item.id !== nodeId);
-    } else {
-      const rootIndex = rootItems.findIndex((item) => item.id === nodeId);
-      if (rootIndex >= 0) rootItems.splice(rootIndex, 1);
-    }
-    nextParent.items = Array.isArray(nextParent.items) ? [...nextParent.items, node] : [node];
-    idToParent.set(nodeId, nextParent);
-  });
 
   sortOutlineNodes(rootItems);
   return rootItems;
@@ -1450,12 +1403,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         };
         const baseOutline = [rootNode];
         const baseFlat = getFlatOutlineByPosition(baseOutline);
-        const customChapters = Array.isArray(state?.customChapters) ? state.customChapters : [];
-        const chapterParentOverrides = state?.chapterParentOverrides || {};
+        const parsedMindmapStateV2 = parseMindmapStateV2(state?.mindmapStateV2);
+        const legacy = parsedMindmapStateV2
+          ? deriveLegacyMindmapDataFromV2(parsedMindmapStateV2, { rootIdAlias: rootId })
+          : null;
+        const customChapters = legacy
+          ? legacy.customChapters
+          : mergeLegacyParentOverridesIntoCustomChapters(
+              Array.isArray(state?.customChapters) ? state.customChapters : [],
+              normalizeLegacyParentOverrides(state?.chapterParentOverrides)
+            );
         const highlights = Array.isArray(state?.highlights) ? state.highlights : [];
         const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlat, rootId);
-        const outlineDisplay = applyParentOverrides(merged, chapterParentOverrides);
-        const root = buildMindmapRoot(outlineDisplay, highlights);
+        const root = buildMindmapRoot(merged, highlights);
         if (!cancelled) {
           mindmapCacheRef.current.set(selectedPaper.id, { root, updatedAt: stateUpdatedAt });
           setMindmapRoot(root);

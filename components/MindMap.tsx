@@ -63,7 +63,7 @@ export type MindMapLayout = {
 
 type MindMapDropTarget = {
   id: string;
-  position: 'before' | 'after';
+  position: 'before' | 'after' | 'inside';
 };
 
 type LayoutNode = MindMapNode & {
@@ -451,11 +451,15 @@ export const MindMap: React.FC<MindMapProps> = ({
                   : stroke;
               const strokeWidth = isEditing ? 0 : isSelected ? 2 : 1;
               const showActions = activeActionNodeId === node.id && !isEditing;
+              const isDropInside =
+                Boolean(dropTarget && dropTarget.id === node.id && dropTarget.position === 'inside');
               const dropLineY =
                 dropTarget && dropTarget.id === node.id
                   ? dropTarget.position === 'before'
                     ? 0
-                    : node.height
+                    : dropTarget.position === 'after'
+                      ? node.height
+                      : null
                   : null;
               const hasChildren = (nodeChildCountMap.get(node.id) || 0) > 0;
               const isCollapsed = collapsedIds.has(node.id);
@@ -518,6 +522,21 @@ export const MindMap: React.FC<MindMapProps> = ({
                     strokeWidth={strokeWidth}
                     opacity={isDraggingNote ? 0.5 : 1}
                   />
+                  {isDropInside ? (
+                    <rect
+                      x={2}
+                      y={2}
+                      width={Math.max(0, node.width - 4)}
+                      height={Math.max(0, node.height - 4)}
+                      rx={7}
+                      ry={7}
+                      fill="none"
+                      stroke="#2563eb"
+                      strokeWidth={2}
+                      strokeDasharray="4 3"
+                      pointerEvents="none"
+                    />
+                  ) : null}
                   {node.kind === 'note' && !isEditing ? (
                     <rect
                       x={0}

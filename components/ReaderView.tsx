@@ -29,6 +29,13 @@ import {
   extractPdfFirstPageText,
   extractPdfMetadataFromTextItems
 } from '../services/pdfMetadataService';
+import {
+  buildMindmapStateV2FromOutline,
+  deriveLegacyMindmapDataFromV2,
+  mergeLegacyParentOverridesIntoCustomChapters,
+  normalizeLegacyParentOverrides,
+  parseMindmapStateV2
+} from '../utils/mindmapStateV2';
 
 const LazyMindMap = React.lazy(() =>
   import('./MindMap').then((mod) => ({ default: mod.MindMap }))
@@ -84,7 +91,7 @@ type ChatThread = {
   updatedAt: number;
 };
 
-type MindmapDropPosition = 'before' | 'after';
+type MindmapDropPosition = 'before' | 'after' | 'inside';
 type MindmapDropTarget = {
   id: string;
   kind: 'root' | 'chapter' | 'note';
@@ -104,6 +111,7 @@ const HIGHLIGHT_COLORS = [
   { id: 'sky', swatch: '#60a5fa', fill: 'rgba(96, 165, 250, 0.35)' },
   { id: 'rose', swatch: '#f87171', fill: 'rgba(248, 113, 113, 0.35)' }
 ];
+const SHOW_MINDMAP_DROP_DEBUG = false;
 
 const toSolidColor = (fill: string) => {
   const match = fill.match(/rgba?\(([^)]+)\)/);
@@ -260,6 +268,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const [draggingNoteId, setDraggingNoteId] = useState<string | null>(null);
   const [draggingChapterId, setDraggingChapterId] = useState<string | null>(null);
   const [dragOverMindmapTarget, setDragOverMindmapTarget] = useState<MindmapDropTarget | null>(null);
+  const [mindmapDropLastHit, setMindmapDropLastHit] = useState('none');
+  const [mindmapDropOrderDebug, setMindmapDropOrderDebug] = useState('');
   const [draggingTocNoteId, setDraggingTocNoteId] = useState<string | null>(null);
   const [draggingTocChapterId, setDraggingTocChapterId] = useState<string | null>(null);
   const [dragOverTocId, setDragOverTocId] = useState<string | null>(null);
@@ -281,7 +291,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     fontSize?: number;
     lineHeight?: number;
   } | null>(null);
-  const [chapterParentOverrides, setChapterParentOverrides] = useState<Record<string, string>>({});
   const [expandedHighlightIds, setExpandedHighlightIds] = useState<Set<string>>(new Set());
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
@@ -320,7 +329,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const mindmapStateRef = useRef<{
     collapsedIds: string[];
     offset: { x: number; y: number };
-    chapterParentOverrides: Record<string, string>;
   } | null>(null);
   const dragNoteTimerRef = useRef<number | null>(null);
   const dragNoteRef = useRef<{
@@ -352,6 +360,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   } | null>(null);
   const dragChapterTriggeredRef = useRef(false);
   const dragOverMindmapTargetRef = useRef<MindmapDropTarget | null>(null);
+  const mindmapParentMapRef = useRef<Map<string, string | null>>(new Map());
   const tocDragNoteTimerRef = useRef<number | null>(null);
   const tocDragNoteRef = useRef<{
     id: string;
@@ -457,14 +466,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       if (saved) {
         setCollapsedMindmapIds(new Set(saved.collapsedIds));
         setMindmapOffset(saved.offset);
-        setChapterParentOverrides(saved.chapterParentOverrides);
       }
       return;
     }
     mindmapStateRef.current = {
       collapsedIds: Array.from(collapsedMindmapIds),
-      offset: mindmapOffset,
-      chapterParentOverrides
+      offset: mindmapOffset
     };
   }, [viewMode]);
 
@@ -1877,10 +1884,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       next.add(newId);
       return next;
     });
-    setChapterParentOverrides((prev) => ({
-      ...prev,
-      [newId]: parentId
-    }));
     setCollapsedMindmapIds((prev) => {
       if (!prev.has(parentId)) return prev;
       const next = new Set(prev);
@@ -1969,10 +1972,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         next.add(newId);
         return next;
       });
-      setChapterParentOverrides((prev) => ({
-        ...prev,
-        [newId]: parentId
-      }));
       setCollapsedMindmapIds((prev) => {
         if (!prev.has(parentId)) return prev;
         const next = new Set(prev);
@@ -2154,10 +2153,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       next.add(newId);
       return next;
     });
-    setChapterParentOverrides((prev) => ({
-      ...prev,
-      [newId]: parentId
-    }));
     setHighlights((prev) =>
       prev.map((item) =>
         item.id === note.id
@@ -2259,21 +2254,74 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     clientY: number,
     draggingNodeId?: string | null
   ): MindmapDropTarget | null => {
+    const resolveKind = (value: string | null) => {
+      if (value === 'note' || value === 'chapter' || value === 'root') return value;
+      return null;
+    };
     const target = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
-    const nodeEl = target?.closest?.('[data-mindmap-id]') as HTMLElement | null;
+    let nodeEl = target?.closest?.('[data-mindmap-id]') as HTMLElement | null;
+    if (!nodeEl) {
+      const candidates = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-mindmap-id][data-mindmap-kind]')
+      );
+      let nearest: { el: HTMLElement; score: number } | null = null;
+      candidates.forEach((el) => {
+        const idValue = el.getAttribute('data-mindmap-id');
+        const kindValue = el.getAttribute('data-mindmap-kind');
+        const kind = resolveKind(kindValue);
+        if (!idValue || !kind) return;
+        if (draggingNodeId && idValue === draggingNodeId) return;
+        const rect = el.getBoundingClientRect();
+        const dx =
+          clientX < rect.left
+            ? rect.left - clientX
+            : clientX > rect.right
+              ? clientX - rect.right
+              : 0;
+        const dy =
+          clientY < rect.top
+            ? rect.top - clientY
+            : clientY > rect.bottom
+              ? clientY - rect.bottom
+              : 0;
+        if (dx > Math.max(96, rect.width * 1.2)) return;
+        const score = dy * 3 + dx;
+        if (!nearest || score < nearest.score) {
+          nearest = { el, score };
+        }
+      });
+      if (nearest && nearest.score <= 240) {
+        nodeEl = nearest.el;
+      }
+    }
     if (!nodeEl) return null;
     const id = nodeEl.getAttribute('data-mindmap-id');
     const kindValue = nodeEl.getAttribute('data-mindmap-kind');
     if (!id || !kindValue) return null;
     if (draggingNodeId && id === draggingNodeId) return null;
-    const kind =
-      kindValue === 'note' || kindValue === 'chapter' || kindValue === 'root'
-        ? kindValue
-        : null;
+    const kind = resolveKind(kindValue);
     if (!kind) return null;
     const rect = nodeEl.getBoundingClientRect();
-    const position: MindmapDropPosition =
-      clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+    let position: MindmapDropPosition;
+    if (clientY < rect.top) {
+      position = 'before';
+    } else if (clientY > rect.bottom) {
+      position = 'after';
+    } else {
+      if (kind === 'chapter' || kind === 'root') {
+        const topThreshold = rect.top + rect.height * 0.25;
+        const bottomThreshold = rect.bottom - rect.height * 0.25;
+        if (clientY <= topThreshold) {
+          position = 'before';
+        } else if (clientY >= bottomThreshold) {
+          position = 'after';
+        } else {
+          position = 'inside';
+        }
+      } else {
+        position = clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+      }
+    }
     return { id, kind, position };
   };
 
@@ -2282,8 +2330,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return mindmapNodeId.slice(5);
   };
 
+  const formatMindmapDropTarget = (target: MindmapDropTarget | null) =>
+    target ? `${target.id} | ${target.position}` : 'none';
+
   const resolveDropTargetEntry = (target: MindmapDropTarget | null): MindmapDropEntry | null => {
-    if (!target || target.kind === 'root') return null;
+    if (!target) return null;
+    if (target.kind === 'root') {
+      return {
+        parentId: null,
+        kind: 'node',
+        id: target.id
+      };
+    }
     if (target.kind === 'note') {
       const noteId = parseMindmapNoteNodeId(target.id);
       if (!noteId) return null;
@@ -2295,8 +2353,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         id: note.id
       };
     }
+    const resolvedParentId =
+      mindmapParentMapRef.current.get(target.id) ?? tocParentMapRef.current.get(target.id) ?? null;
     return {
-      parentId: tocParentMapRef.current.get(target.id) || null,
+      parentId: resolvedParentId,
       kind: 'node',
       id: target.id
     };
@@ -2331,13 +2391,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         }));
       }
     };
-    const handleUp = () => {
+    const handleUp = (event: MouseEvent) => {
       const dragInfo = dragNoteRef.current;
-      const target = dragOverMindmapTargetRef.current;
+      const draggingNodeId = dragInfo ? `note-${dragInfo.id}` : null;
+      const target = resolveMindmapDropTarget(event.clientX, event.clientY, draggingNodeId);
+      setMindmapDropLastHit(formatMindmapDropTarget(target));
+      setMindmapDropOrderDebug('');
       const targetEntry = resolveDropTargetEntry(target);
       if (dragInfo && target && targetEntry) {
         const draggedParentId = dragInfo.chapterId || null;
         const isSameParent =
+          target.position !== 'inside' &&
           draggedParentId === targetEntry.parentId &&
           !(targetEntry.kind === 'note' && targetEntry.id === dragInfo.id);
 
@@ -2353,13 +2417,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           );
         } else {
           const nextParentId =
-            target.kind === 'chapter'
-              ? target.id
-              : targetEntry.parentId && targetEntry.parentId !== draggedParentId
-                ? targetEntry.parentId
-                : null;
+            target.position === 'inside'
+              ? target.kind === 'chapter' || target.kind === 'root'
+                ? target.id
+                : targetEntry.parentId
+              : targetEntry.parentId;
           if (nextParentId && nextParentId !== dragInfo.chapterId) {
-            const nextOrder = getCombinedOrderValue(nextParentId);
+            const nextOrder =
+              target.position === 'before' && targetEntry.parentId === nextParentId
+                ? getCombinedOrderValueBefore(nextParentId, targetEntry.kind, targetEntry.id)
+                : target.position === 'after' && targetEntry.parentId === nextParentId
+                  ? getCombinedOrderValueAfter(nextParentId, targetEntry.kind, targetEntry.id)
+                  : getCombinedOrderValue(nextParentId);
             setHighlights((prev) =>
               prev.map((item) =>
                 item.id === dragInfo.id
@@ -2463,6 +2532,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     }
 
     if (node.kind === 'chapter') {
+      if (!customChapterIdSet.has(node.id)) return;
       dragChapterTriggeredRef.current = false;
       dragChapterRef.current = {
         id: node.id,
@@ -2545,6 +2615,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     if (viewMode !== ReaderMode.PDF) return;
     if (event.button !== 0) return;
     if (item.isRoot) return;
+    if (!item.isCustom) return;
     event.preventDefault();
     const target = event.currentTarget;
     const rect = target.getBoundingClientRect();
@@ -2678,10 +2749,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           return false;
         })();
         if (!isDescendant) {
-          setChapterParentOverrides((prev) => ({
-            ...prev,
-            [dragInfo.id]: targetId
-          }));
+          setCustomChapters((prev) =>
+            prev.map((item) =>
+              item.id === dragInfo.id ? { ...item, parentId: targetId } : item
+            )
+          );
           setExpandedTOC((prev) => {
             const next = new Set(prev);
             next.add(targetId);
@@ -2743,7 +2815,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           items: item.children ? convert(item.children, id) : []
         };
       });
-    const rootId = `outline-root-fallback-${paper.id}`;
+    const rootId = `outline-root-${paper.id}`;
     return [
       {
         id: rootId,
@@ -2784,34 +2856,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
   const baseFlatOutline = useMemo(() => getFlatOutlineByPosition(baseOutline), [baseOutline]);
 
-  const sortOutlineNodes = (nodes: OutlineNode[]) => {
-    if (!nodes.length) return;
-    const baseSorted = nodes.map((node) => node);
-    baseSorted.sort((a, b) => {
-      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
-        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
-      }
-      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
-        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
-      }
-      return a.title.localeCompare(b.title);
+  const getChapterFallbackOrderMap = (nodes: OutlineNode[]) => {
+    const map = new Map<string, number>();
+    let index = 0;
+    nodes.forEach((node) => {
+      if (typeof node.order === 'number') return;
+      map.set(node.id, index);
+      index += 1;
     });
-    const baseOrder = new Map<string, number>();
-    baseSorted.forEach((node, index) => {
-      baseOrder.set(node.id, index);
-    });
+    return map;
+  };
 
+  const sortChapterNodes = (nodes: OutlineNode[]) => {
+    const fallbackOrder = getChapterFallbackOrderMap(nodes);
     const indexed = nodes.map((node, index) => ({ node, index }));
     indexed.sort((a, b) => {
-      const aBase = baseOrder.get(a.node.id) ?? a.index;
-      const bBase = baseOrder.get(b.node.id) ?? b.index;
-      const aOrder = typeof a.node.order === 'number' ? a.node.order : aBase;
-      const bOrder = typeof b.node.order === 'number' ? b.node.order : bBase;
+      const aHasOrder = typeof a.node.order === 'number';
+      const bHasOrder = typeof b.node.order === 'number';
+      const aFallback = fallbackOrder.get(a.node.id) ?? a.index;
+      const bFallback = fallbackOrder.get(b.node.id) ?? b.index;
+      const aOrder = aHasOrder ? (a.node.order as number) : aFallback;
+      const bOrder = bHasOrder ? (b.node.order as number) : bFallback;
       if (aOrder !== bOrder) return aOrder - bOrder;
-      if (aBase !== bBase) return aBase - bBase;
-      return a.node.title.localeCompare(b.node.title);
+      if (!aHasOrder && !bHasOrder) {
+        if (aFallback !== bFallback) return aFallback - bFallback;
+      }
+      return a.index - b.index;
     });
-    nodes.splice(0, nodes.length, ...indexed.map((entry) => entry.node));
+    return indexed.map((entry) => entry.node);
+  };
+
+  const sortOutlineNodes = (nodes: OutlineNode[]) => {
+    if (!nodes.length) return;
+    nodes.splice(0, nodes.length, ...sortChapterNodes(nodes));
     nodes.forEach((node) => {
       if (node.items?.length) sortOutlineNodes(node.items);
     });
@@ -2925,64 +3002,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return rootItems;
   };
 
-  const applyParentOverrides = (
-    outline: OutlineNode[],
-    overrides: Record<string, string>
-  ) => {
-    if (!overrides || !Object.keys(overrides).length) return outline;
-    const cloneNodes = (nodes: OutlineNode[]) =>
-      (nodes || []).map((node) => ({
-        ...node,
-        items: cloneNodes(node.items || [])
-      }));
-    const rootItems = cloneNodes(outline);
-    const idToNode = new Map<string, OutlineNode>();
-    const idToParent = new Map<string, OutlineNode | null>();
-
-    const walk = (nodes: OutlineNode[], parent: OutlineNode | null) => {
-      nodes.forEach((node) => {
-        idToNode.set(node.id, node);
-        idToParent.set(node.id, parent);
-        if (node.items?.length) walk(node.items, node);
-      });
-    };
-    walk(rootItems, null);
-
-    const isDescendant = (ancestorId: string, targetId: string) => {
-      let current = idToParent.get(targetId) || null;
-      while (current) {
-        if (current.id === ancestorId) return true;
-        current = idToParent.get(current.id) || null;
-      }
-      return false;
-    };
-
-    Object.entries(overrides).forEach(([nodeId, nextParentId]) => {
-      if (!nodeId || !nextParentId || nodeId === nextParentId) return;
-      const node = idToNode.get(nodeId);
-      const nextParent = idToNode.get(nextParentId);
-      if (!node || !nextParent) return;
-      if (isDescendant(nodeId, nextParentId)) return;
-      const currentParent = idToParent.get(nodeId);
-      if (currentParent) {
-        currentParent.items = (currentParent.items || []).filter((item) => item.id !== nodeId);
-      } else {
-        const rootIndex = rootItems.findIndex((item) => item.id === nodeId);
-        if (rootIndex >= 0) rootItems.splice(rootIndex, 1);
-      }
-      nextParent.items = Array.isArray(nextParent.items) ? [...nextParent.items, node] : [node];
-      idToParent.set(nodeId, nextParent);
-    });
-
-    return rootItems;
-  };
-
   const outlineDisplay = useMemo(() => {
     const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlatOutline, outlineRootId);
-    const applied = applyParentOverrides(merged, chapterParentOverrides);
-    sortOutlineNodes(applied);
-    return applied;
-  }, [baseOutline, customChapters, baseFlatOutline, outlineRootId, chapterParentOverrides]);
+    sortOutlineNodes(merged);
+    return merged;
+  }, [baseOutline, customChapters, baseFlatOutline, outlineRootId]);
 
   const findOutlineNodeById = (nodes: OutlineNode[], targetId: string): OutlineNode | null => {
     for (const node of nodes) {
@@ -3057,11 +3081,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   const getCombinedFallbackOrder = (entries: CombinedEntry[]) => {
-    const fallbackSorted = entries.slice().sort((a, b) => {
-      if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
-      if (a.top !== b.top) return a.top - b.top;
-      return a.index - b.index;
-    });
+    const fallbackSorted = entries
+      .filter((entry) => typeof entry.order !== 'number')
+      .slice()
+      .sort((a, b) => {
+        if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
+        if (a.top !== b.top) return a.top - b.top;
+        return a.index - b.index;
+      });
     const map = new Map<string, number>();
     fallbackSorted.forEach((entry, idx) => {
       map.set(entry.key, idx);
@@ -3072,13 +3099,67 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const sortCombinedEntries = (entries: CombinedEntry[]) => {
     const fallbackOrder = getCombinedFallbackOrder(entries);
     return entries.slice().sort((a, b) => {
+      const aFallback = fallbackOrder.get(a.key) ?? a.index;
+      const bFallback = fallbackOrder.get(b.key) ?? b.index;
       const aOrder =
-        typeof a.order === 'number' ? a.order : (fallbackOrder.get(a.key) ?? 0);
+        typeof a.order === 'number' ? a.order : aFallback;
       const bOrder =
-        typeof b.order === 'number' ? b.order : (fallbackOrder.get(b.key) ?? 0);
+        typeof b.order === 'number' ? b.order : bFallback;
       if (aOrder !== bOrder) return aOrder - bOrder;
-      return (fallbackOrder.get(a.key) ?? 0) - (fallbackOrder.get(b.key) ?? 0);
+      return aFallback - bFallback;
     });
+  };
+
+  const formatCombinedOrderEntries = (entries: CombinedEntry[]) =>
+    entries
+      .map((entry) => {
+        const orderText =
+          typeof entry.order === 'number' ? entry.order.toFixed(4) : '-';
+        return `${entry.kind === 'node' ? 'n' : 'h'}:${entry.id}(${orderText})`;
+      })
+      .join(' > ');
+
+  const getCombinedOrderDebugSnapshot = (
+    parentId: string,
+    patch?: {
+      chapterId: string;
+      fromParentId: string;
+      toParentId: string;
+      order: number;
+    }
+  ) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    if (!parentNode) return '(parent-missing)';
+    let nodes = [...(parentNode.items || [])];
+    if (patch) {
+      if (patch.fromParentId === parentId && patch.toParentId !== parentId) {
+        nodes = nodes.filter((item) => item.id !== patch.chapterId);
+      }
+      if (patch.toParentId === parentId) {
+        const currentIndex = nodes.findIndex((item) => item.id === patch.chapterId);
+        if (currentIndex >= 0) {
+          nodes = nodes.map((item) =>
+            item.id === patch.chapterId ? { ...item, order: patch.order } : item
+          );
+        } else {
+          const sourceNode =
+            findOutlineNodeById(outlineDisplay, patch.chapterId) ||
+            customChapters.find((item) => item.id === patch.chapterId) ||
+            null;
+          if (sourceNode) {
+            nodes = [...nodes, { ...sourceNode, order: patch.order }];
+          }
+        }
+      }
+    }
+    const notes = highlights.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    const entries = sortCombinedEntries(buildCombinedEntries(nodes, notes));
+    return formatCombinedOrderEntries(entries);
   };
 
   const getCombinedOrderValue = (parentId: string) => {
@@ -3096,7 +3177,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     let maxOrder = -Infinity;
     entries.forEach((entry) => {
       const value =
-        typeof entry.order === 'number' ? entry.order : (fallbackOrder.get(entry.key) ?? 0);
+        typeof entry.order === 'number' ? entry.order : (fallbackOrder.get(entry.key) ?? entry.index);
       if (value > maxOrder) maxOrder = value;
     });
     if (!Number.isFinite(maxOrder)) return 0;
@@ -3123,7 +3204,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const target = entries.find((entry) => entry.key === targetKey);
     if (!target) return undefined;
     if (typeof target.order === 'number') return target.order;
-    return fallbackOrder.get(target.key);
+    return fallbackOrder.get(target.key) ?? target.index;
   };
 
   const getCombinedOrderValueAfter = (
@@ -3150,13 +3231,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const currentOrder =
       typeof current.order === 'number'
         ? current.order
-        : (fallbackOrder.get(current.key) ?? index);
+        : (fallbackOrder.get(current.key) ?? current.index);
     const next = sorted[index + 1];
     if (!next) return currentOrder + 1;
     const nextOrder =
       typeof next.order === 'number'
         ? next.order
-        : (fallbackOrder.get(next.key) ?? currentOrder + 1);
+        : (fallbackOrder.get(next.key) ?? next.index);
     if (nextOrder - currentOrder > 1e-6) {
       return (currentOrder + nextOrder) / 2;
     }
@@ -3187,13 +3268,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     const currentOrder =
       typeof current.order === 'number'
         ? current.order
-        : (fallbackOrder.get(current.key) ?? index);
+        : (fallbackOrder.get(current.key) ?? current.index);
     const prev = sorted[index - 1];
     if (!prev) return currentOrder - 1;
     const prevOrder =
       typeof prev.order === 'number'
         ? prev.order
-        : (fallbackOrder.get(prev.key) ?? currentOrder - 1);
+        : (fallbackOrder.get(prev.key) ?? prev.index);
     if (currentOrder - prevOrder > 1e-6) {
       return (currentOrder + prevOrder) / 2;
     }
@@ -3207,45 +3288,49 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         : findOutlineNodeById(outlineDisplay, parentId);
     const nodes = parentNode?.items || [];
     if (!nodes.length) return 0;
-    const baseSorted = nodes.slice().sort((a, b) => {
-      if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
-        return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
-      }
-      if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) {
-        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
-      }
-      return a.title.localeCompare(b.title);
-    });
-    const baseOrder = new Map<string, number>();
-    baseSorted.forEach((node, index) => {
-      baseOrder.set(node.id, index);
-    });
-    const indexed = nodes.map((node, index) => ({ node, index }));
-    indexed.sort((a, b) => {
-      const aBase = baseOrder.get(a.node.id) ?? a.index;
-      const bBase = baseOrder.get(b.node.id) ?? b.index;
-      const aOrder = typeof a.node.order === 'number' ? a.node.order : aBase;
-      const bOrder = typeof b.node.order === 'number' ? b.node.order : bBase;
-      if (aOrder !== bOrder) return aOrder - bOrder;
-      if (aBase !== bBase) return aBase - bBase;
-      return a.node.title.localeCompare(b.node.title);
-    });
-    const sorted = indexed.map((entry) => entry.node);
+    const fallbackOrder = getChapterFallbackOrderMap(nodes);
+    const sorted = sortChapterNodes(nodes);
     const index = sorted.findIndex((node) => node.id === nodeId);
     if (index === -1) return getCombinedOrderValue(parentId);
     const current = sorted[index];
-    const currentBase = baseOrder.get(current.id) ?? index;
+    const currentBase = fallbackOrder.get(current.id) ?? index;
     const currentOrder =
       typeof current.order === 'number' ? current.order : currentBase;
     const next = sorted[index + 1];
     if (!next) return currentOrder + 1;
-    const nextBase = baseOrder.get(next.id) ?? currentOrder + 1;
+    const nextBase = fallbackOrder.get(next.id) ?? currentOrder + 1;
     const nextOrder =
       typeof next.order === 'number' ? next.order : nextBase;
     if (nextOrder - currentOrder > 1e-6) {
       return (currentOrder + nextOrder) / 2;
     }
     return currentOrder + 0.0001;
+  };
+
+  const getNodeOrderValueBefore = (parentId: string, nodeId: string) => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    if (!nodes.length) return 0;
+    const fallbackOrder = getChapterFallbackOrderMap(nodes);
+    const sorted = sortChapterNodes(nodes);
+    const index = sorted.findIndex((node) => node.id === nodeId);
+    if (index === -1) return getCombinedOrderValue(parentId);
+    const current = sorted[index];
+    const currentBase = fallbackOrder.get(current.id) ?? index;
+    const currentOrder =
+      typeof current.order === 'number' ? current.order : currentBase;
+    const prev = sorted[index - 1];
+    if (!prev) return currentOrder - 1;
+    const prevBase = fallbackOrder.get(prev.id) ?? currentOrder - 1;
+    const prevOrder =
+      typeof prev.order === 'number' ? prev.order : prevBase;
+    if (currentOrder - prevOrder > 1e-6) {
+      return (currentOrder + prevOrder) / 2;
+    }
+    return currentOrder - 0.0001;
   };
 
   const highlightsByChapter = useMemo(() => {
@@ -3649,6 +3734,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return map;
   }, [highlights]);
 
+  const mindmapStateV2ForSave = useMemo(
+    () => buildMindmapStateV2FromOutline(outlineDisplay[0] || null),
+    [outlineDisplay]
+  );
+
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
     if (!paper?.id) return;
@@ -3660,6 +3750,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       window.electronAPI?.library?.savePaperState?.(paper.id, {
         highlights,
         customChapters,
+        mindmapStateV2: mindmapStateV2ForSave,
         questions,
         aiConversations: chatThreads,
         activeChatId,
@@ -3671,7 +3762,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         window.clearTimeout(saveStateTimerRef.current);
       }
     };
-  }, [paper?.id, highlights, customChapters, questions, chatThreads, activeChatId]);
+  }, [paper?.id, highlights, customChapters, mindmapStateV2ForSave, questions, chatThreads, activeChatId]);
 
   const buildMindmapRoot = useCallback((): MindMapNode | null => {
     if (!outlineDisplay.length) return null;
@@ -3791,6 +3882,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     walk(mindmapRoot, null);
     return map;
   }, [mindmapRoot, viewMode]);
+
+  useEffect(() => {
+    mindmapParentMapRef.current = mindmapParentMap;
+  }, [mindmapParentMap]);
 
   const customChapterIdSet = useMemo(() => {
     return new Set(customChapters.map((item) => item.id));
@@ -3914,13 +4009,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         }));
       }
     };
-    const handleUp = () => {
+    const handleUp = (event: MouseEvent) => {
       const dragInfo = dragChapterRef.current;
-      const target = dragOverMindmapTargetRef.current;
+      const draggingNodeId = dragInfo ? dragInfo.id : null;
+      const target = resolveMindmapDropTarget(event.clientX, event.clientY, draggingNodeId);
+      setMindmapDropLastHit(formatMindmapDropTarget(target));
       const targetEntry = resolveDropTargetEntry(target);
       if (dragInfo && target && targetEntry) {
         const draggedParentId = dragInfo.parentId || outlineRootId;
         const isSameParent =
+          target.position !== 'inside' &&
           draggedParentId === targetEntry.parentId &&
           !(targetEntry.kind === 'node' && targetEntry.id === dragInfo.id);
         const draggedIsCustom = customChapters.some((item) => item.id === dragInfo.id);
@@ -3930,14 +4028,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
             target.position === 'before'
               ? getCombinedOrderValueBefore(targetEntry.parentId, targetEntry.kind, targetEntry.id)
               : getCombinedOrderValueAfter(targetEntry.parentId, targetEntry.kind, targetEntry.id);
+          const fromParentId = dragInfo.parentId || outlineRootId;
+          const beforeSnapshot = getCombinedOrderDebugSnapshot(targetEntry.parentId);
+          const afterSnapshot = getCombinedOrderDebugSnapshot(targetEntry.parentId, {
+            chapterId: dragInfo.id,
+            fromParentId,
+            toParentId: targetEntry.parentId,
+            order: nextOrder
+          });
+          setMindmapDropOrderDebug(
+            `parent:${targetEntry.parentId}\nnext:${nextOrder.toFixed(4)}\nbefore:${beforeSnapshot}\nafter:${afterSnapshot}`
+          );
           setCustomChapters((prev) =>
             prev.map((item) =>
               item.id === dragInfo.id ? { ...item, order: nextOrder } : item
             )
           );
-        } else if (target.kind === 'chapter' && target.id !== dragInfo.id) {
+        } else {
+          const nextParentId =
+            target.position === 'inside'
+              ? target.kind === 'chapter' || target.kind === 'root'
+                ? target.id
+                : targetEntry.parentId
+              : targetEntry.parentId;
+          if (!nextParentId || nextParentId === dragInfo.id) {
+            // no-op
+          } else {
           const isDescendant = (() => {
-            let current = mindmapParentMap.get(target.id) || null;
+            let current = nextParentId;
             while (current) {
               if (current === dragInfo.id) return true;
               current = mindmapParentMap.get(current) || null;
@@ -3945,10 +4063,33 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
             return false;
           })();
           if (!isDescendant) {
-            setChapterParentOverrides((prev) => ({
-              ...prev,
-              [dragInfo.id]: target.id
-            }));
+              if (draggedIsCustom) {
+                const nextOrder =
+                  target.position === 'before' && targetEntry.parentId === nextParentId
+                    ? getCombinedOrderValueBefore(nextParentId, targetEntry.kind, targetEntry.id)
+                    : target.position === 'after' && targetEntry.parentId === nextParentId
+                      ? getCombinedOrderValueAfter(nextParentId, targetEntry.kind, targetEntry.id)
+                      : getCombinedOrderValue(nextParentId);
+                const fromParentId = dragInfo.parentId || outlineRootId;
+                const beforeSnapshot = getCombinedOrderDebugSnapshot(nextParentId);
+                const afterSnapshot = getCombinedOrderDebugSnapshot(nextParentId, {
+                  chapterId: dragInfo.id,
+                  fromParentId,
+                  toParentId: nextParentId,
+                  order: nextOrder
+                });
+                setMindmapDropOrderDebug(
+                  `parent:${nextParentId}\nnext:${nextOrder.toFixed(4)}\nbefore:${beforeSnapshot}\nafter:${afterSnapshot}`
+                );
+                setCustomChapters((prev) =>
+                  prev.map((item) =>
+                    item.id === dragInfo.id
+                      ? { ...item, parentId: nextParentId, order: nextOrder }
+                      : item
+                  )
+                );
+              }
+            }
           }
         }
       }
@@ -4040,12 +4181,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setDraggingNoteId(null);
     setDraggingChapterId(null);
     setDragOverMindmapTarget(null);
+    setMindmapDropLastHit('none');
+    setMindmapDropOrderDebug('');
     dragOverMindmapTargetRef.current = null;
     setDraggingTocNoteId(null);
     setDraggingTocChapterId(null);
     setDragOverTocId(null);
     setDragGhost(null);
-    setChapterParentOverrides({});
     setMindmapEditing(null);
     setMindmapEditValue('');
     setChatThreads([]);
@@ -4113,7 +4255,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
             })
           : [];
         setHighlights(normalizedHighlights);
-        setCustomChapters(Array.isArray(saved.customChapters) ? saved.customChapters : []);
+        const parsedMindmapStateV2 = parseMindmapStateV2((saved as any).mindmapStateV2);
+        if (parsedMindmapStateV2) {
+          const legacy = deriveLegacyMindmapDataFromV2(parsedMindmapStateV2, {
+            rootIdAlias: `outline-root-${paper.id}`
+          });
+          setCustomChapters(Array.isArray(legacy.customChapters) ? (legacy.customChapters as OutlineNode[]) : []);
+        } else {
+          const savedCustomChapters = Array.isArray(saved.customChapters)
+            ? (saved.customChapters as OutlineNode[])
+            : [];
+          const legacyOverrides = normalizeLegacyParentOverrides((saved as any).chapterParentOverrides);
+          setCustomChapters(
+            mergeLegacyParentOverridesIntoCustomChapters(savedCustomChapters, legacyOverrides)
+          );
+        }
         const savedQuestions = Array.isArray(saved.questions) ? saved.questions : [];
         setQuestions(savedQuestions);
         const savedChats = Array.isArray(saved.aiConversations)
@@ -4743,7 +4899,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
               </div>
             )}
           </div>
-          <div className={viewMode === ReaderMode.MIND_MAP ? 'block h-full' : 'hidden'}>
+          <div className={viewMode === ReaderMode.MIND_MAP ? 'block h-full relative' : 'hidden'}>
             {viewMode === ReaderMode.MIND_MAP ? (
               <>
                 <React.Suspense
@@ -4798,6 +4954,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                     }
                   />
                 </React.Suspense>
+                {SHOW_MINDMAP_DROP_DEBUG ? (
+                  <div className="pointer-events-none absolute top-2 right-2 z-40 rounded-md bg-black/75 text-white text-[10px] leading-4 px-2 py-1 font-mono">
+                    <div>{`hit: ${formatMindmapDropTarget(dragOverMindmapTarget)}`}</div>
+                    <div>{`last: ${mindmapDropLastHit}`}</div>
+                    <div className="mt-1 max-w-[460px] whitespace-pre-wrap break-all text-[9px] leading-3">
+                      {mindmapDropOrderDebug || 'order: -'}
+                    </div>
+                  </div>
+                ) : null}
                 {dragGhost ? (
                   <div
                     className="fixed z-40 pointer-events-none"
