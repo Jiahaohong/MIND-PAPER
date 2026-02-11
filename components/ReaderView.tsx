@@ -1358,7 +1358,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     if (!rects.length || selectionInfo.pageIndex == null) return;
     const topRatio = Math.min(...rects.map((rect) => rect.y ?? 0));
     const pageIndex = selectionInfo.pageIndex;
-    const parentChapter = findChapterForPosition(pageIndex, topRatio, highlightParentOutline);
+    const parentChapter = findChapterForPosition(pageIndex, topRatio, nativeChapterParentOutline);
     const parentId = parentChapter && !parentChapter.isRoot ? parentChapter.id : outlineRootId;
     const activeHighlight = activeHighlightId
       ? highlights.find((item) => item.id === activeHighlightId)
@@ -3911,6 +3911,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       return highlightChapterIdSet.has(node.id);
     });
   }, [outlineDisplay, highlightChapterIdSet]);
+
+  const nativeChapterParentOutline = useMemo(() => {
+    const list = getFlatOutlineByPosition(baseOutline);
+    if (!list.length) return list;
+    return list.filter((node) => node.isRoot || !node.isCustom);
+  }, [baseOutline]);
 
   useEffect(() => {
     if (!outlineDisplay.length) return;
