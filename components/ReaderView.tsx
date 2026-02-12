@@ -209,14 +209,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const MIN_CENTER_WIDTH = 120;
   const RESIZE_HANDLE_WIDTH = 4;
   const DEFAULT_LEFT_RATIO = 0.2;
-  const DEFAULT_RIGHT_RATIO = 0.3;
+  const DEFAULT_RIGHT_RATIO = 0.2;
   const CHAPTER_START_TOLERANCE = 0.03;
 
   // State
   const [viewMode, setViewMode] = useState<ReaderMode>(ReaderMode.PDF);
   const [activeTab, setActiveTab] = useState<AssistantTab>(AssistantTab.QUESTIONS);
   const [pdfZoom, setPdfZoom] = useState(100);
-  const [mindmapZoom, setMindmapZoom] = useState(100);
+  const [mindmapZoom, setMindmapZoom] = useState(80);
   const [expandedTOC, setExpandedTOC] = useState<Set<string>>(new Set(['1', '2']));
   const [leftWidth, setLeftWidth] = useState(200);
   const [rightWidth, setRightWidth] = useState(200);
@@ -394,10 +394,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const tocParentMapRef = useRef<Map<string, string | null>>(new Map());
   const dragStateRef = useRef<{ side: 'left' | 'right'; startX: number; start: number } | null>(null);
   const hasInitWidthsRef = useRef(false);
+  const tocEditInputRef = useRef<HTMLTextAreaElement | null>(null);
   const pageRefs = useRef<Array<HTMLDivElement | null>>([]);
   const selectionToolbarRef = useRef<HTMLDivElement>(null);
   const questionPickerRef = useRef<HTMLDivElement>(null);
   const pdfDocRef = useRef<PDFDocumentProxy | null>(null);
+  const pdfDataMasterRef = useRef<ArrayBuffer | null>(null);
+  const [pdfFileForRender, setPdfFileForRender] = useState<{ data: ArrayBuffer } | string | null>(null);
   const paperContextCacheRef = useRef<Map<string, Promise<string>>>(new Map());
   const activeChat = useMemo(
     () => chatThreads.find((thread) => thread.id === activeChatId) || null,
@@ -407,6 +410,63 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     () => [...chatThreads].sort((a, b) => b.updatedAt - a.updatedAt),
     [chatThreads]
   );
+
+  const clonePdfBuffer = useCallback((value: unknown): ArrayBuffer | null => {
+    if (value instanceof ArrayBuffer) {
+      try {
+        return value.slice(0);
+      } catch {
+        return null;
+      }
+    }
+    if (ArrayBuffer.isView(value)) {
+      try {
+        const view = value as ArrayBufferView;
+        return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }, []);
+
+  useEffect(() => {
+    if (!pdfFile) {
+      pdfDataMasterRef.current = null;
+      setPdfFileForRender(null);
+      return;
+    }
+
+    if (typeof pdfFile === 'string') {
+      pdfDataMasterRef.current = null;
+      setPdfFileForRender(pdfFile);
+      return;
+    }
+
+    const master = clonePdfBuffer((pdfFile as any).data);
+    if (master) {
+      pdfDataMasterRef.current = master;
+      setPdfFileForRender({ data: master.slice(0) });
+      return;
+    }
+
+    if (pdfDataMasterRef.current) {
+      setPdfFileForRender({ data: pdfDataMasterRef.current.slice(0) });
+      return;
+    }
+
+    setPdfFileForRender(null);
+  }, [paper.id, pdfFile, clonePdfBuffer]);
+
+  const getPdfBufferForParsing = useCallback(() => {
+    if (pdfDataMasterRef.current) {
+      return pdfDataMasterRef.current.slice(0);
+    }
+    if (pdfFile && typeof pdfFile !== 'string') {
+      return clonePdfBuffer((pdfFile as any).data);
+    }
+    return null;
+  }, [pdfFile, clonePdfBuffer]);
 
   // Scroll to bottom of chat
   useEffect(() => {
@@ -476,7 +536,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   }, [viewMode]);
 
   const handleContentScroll = () => {
-    if (viewMode !== ReaderMode.PDF) return;
     const container = contentAreaRef.current;
     if (container) {
       pdfScrollTopRef.current = container.scrollTop;
@@ -819,12 +878,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           const textContent = await page.getTextContent();
           const parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
           firstPageText = parsed.firstPageText;
-        } else if (pdfFile && typeof pdfFile !== 'string' && pdfFile.data) {
-          firstPageText = await extractPdfFirstPageText(pdfFile.data);
-        } else if (typeof pdfFile === 'string') {
-          const response = await fetch(pdfFile);
-          const buffer = await response.arrayBuffer();
-          firstPageText = await extractPdfFirstPageText(buffer);
+        } else {
+          const directBuffer = getPdfBufferForParsing();
+          if (directBuffer) {
+            firstPageText = await extractPdfFirstPageText(directBuffer);
+          } else if (typeof pdfFile === 'string') {
+            const response = await fetch(pdfFile);
+            const buffer = await response.arrayBuffer();
+            firstPageText = await extractPdfFirstPageText(buffer);
+          }
         }
 
         if (!firstPageText) {
@@ -845,12 +907,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           const page = await pdfDocRef.current.getPage(1);
           const textContent = await page.getTextContent();
           parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
-        } else if (pdfFile && typeof pdfFile !== 'string' && pdfFile.data) {
-          parsed = await extractPdfFirstPageMetadata(pdfFile.data, fallbackTitle);
-        } else if (typeof pdfFile === 'string') {
-          const response = await fetch(pdfFile);
-          const buffer = await response.arrayBuffer();
-          parsed = await extractPdfFirstPageMetadata(buffer, fallbackTitle);
+        } else {
+          const directBuffer = getPdfBufferForParsing();
+          if (directBuffer) {
+            parsed = await extractPdfFirstPageMetadata(directBuffer, fallbackTitle);
+          } else if (typeof pdfFile === 'string') {
+            const response = await fetch(pdfFile);
+            const buffer = await response.arrayBuffer();
+            parsed = await extractPdfFirstPageMetadata(buffer, fallbackTitle);
+          }
         }
         if (!parsed) {
           throw new Error('无法读取PDF首页内容');
@@ -1536,7 +1601,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   const handleHighlightClick = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (isPointInNativeSelection(event.clientX, event.clientY)) {
       return;
     }
@@ -1612,7 +1676,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   useEffect(() => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (!selectionText || !selectionRect) return;
     const handleMouseDown = (event: MouseEvent) => {
       const target = event.target as Node | null;
@@ -1625,7 +1688,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     window.addEventListener('mousedown', handleMouseDown);
     return () => window.removeEventListener('mousedown', handleMouseDown);
-  }, [viewMode, selectionText, selectionRect, highlights]);
+  }, [selectionText, selectionRect, highlights]);
 
   const toolbarStyle = useMemo(() => {
     if (!selectionRect || typeof window === 'undefined') return null;
@@ -1744,12 +1807,64 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     }
   };
 
+  const beginNodeEditing = (payload: {
+    nodeId: string;
+    kind: 'note' | 'chapter';
+    targetId: string;
+    text: string;
+  }) => {
+    setMindmapEditing({
+      nodeId: payload.nodeId,
+      kind: payload.kind,
+      targetId: payload.targetId
+    });
+    setMindmapEditValue(payload.text || '');
+  };
+
+  const handleTOCChapterDoubleClick = (
+    item: MindMapNode,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    if (Date.now() < tocSuppressClickUntilRef.current) return;
+    if (tocDragChapterTriggeredRef.current) return;
+    if (item.kind !== 'chapter') return;
+    if (!customChapterIdSet.has(item.id)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setActiveMindmapNodeId(item.id);
+    beginNodeEditing({
+      nodeId: item.id,
+      kind: 'chapter',
+      targetId: item.id,
+      text: item.text || ''
+    });
+  };
+
+  const handleTOCNoteDoubleClick = (
+    note: HighlightItem,
+    event: React.MouseEvent<HTMLButtonElement>
+  ) => {
+    if (Date.now() < tocSuppressClickUntilRef.current) return;
+    if (tocDragNoteTriggeredRef.current) return;
+    if (note.isChapterTitle) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const nodeId = `note-${note.id}`;
+    setActiveMindmapNodeId(nodeId);
+    beginNodeEditing({
+      nodeId,
+      kind: 'note',
+      targetId: note.id,
+      text: note.text || ''
+    });
+  };
+
   const cancelMindmapEdit = () => {
     setMindmapEditing(null);
     setMindmapEditValue('');
   };
 
-  const commitMindmapEdit = (node: MindMapNode, value: string) => {
+  const commitMindmapEdit = (_node: MindMapNode | null, value: string) => {
     if (!mindmapEditing) return;
     const nextText = String(value || '').trim();
     if (!nextText) {
@@ -1805,13 +1920,38 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     }
   };
 
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (!mindmapEditing) return;
+    const handlePointerDownOutsideEdit = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('[data-toc-editing-node="true"]')) return;
+      commitMindmapEdit(null, mindmapEditValue);
+    };
+    window.addEventListener('mousedown', handlePointerDownOutsideEdit, true);
+    return () => {
+      window.removeEventListener('mousedown', handlePointerDownOutsideEdit, true);
+    };
+  }, [viewMode, mindmapEditing, mindmapEditValue, commitMindmapEdit]);
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.PDF) return;
+    if (!mindmapEditing) return;
+    const handle = window.requestAnimationFrame(() => {
+      if (!tocEditInputRef.current) return;
+      tocEditInputRef.current.focus();
+      const cursor = tocEditInputRef.current.value.length;
+      tocEditInputRef.current.setSelectionRange(cursor, cursor);
+    });
+    return () => window.cancelAnimationFrame(handle);
+  }, [viewMode, mindmapEditing?.nodeId]);
+
   const getMindmapDraftText = (nodeId: string, fallback: string) => {
     if (mindmapEditing?.nodeId === nodeId) return mindmapEditValue;
     return fallback;
   };
 
   const handleMindmapAddChild = (node: MindMapNode) => {
-    if (viewMode !== ReaderMode.MIND_MAP) return;
     if (node.kind === 'note' && node.note) {
       const note = node.note as HighlightItem;
       const chapterId = note.chapterId || outlineRootId;
@@ -1856,8 +1996,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         next.delete(chapterId);
         return next;
       });
-      setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
-      setMindmapEditValue(newNote.text);
+      if (viewMode === ReaderMode.MIND_MAP) {
+        setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
+        setMindmapEditValue(newNote.text);
+      }
       return;
     }
 
@@ -1890,12 +2032,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       next.delete(parentId);
       return next;
     });
-    setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
-    setMindmapEditValue(chapterNode.title);
+    if (viewMode === ReaderMode.MIND_MAP) {
+      setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
+      setMindmapEditValue(chapterNode.title);
+    }
   };
 
   const handleMindmapAddSibling = (node: MindMapNode) => {
-    if (viewMode !== ReaderMode.MIND_MAP) return;
     if (node.kind === 'root') return;
     if (node.kind === 'note' && node.note) {
       const note = node.note as HighlightItem;
@@ -1941,8 +2084,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         next.delete(chapterId);
         return next;
       });
-      setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
-      setMindmapEditValue(newNote.text);
+      if (viewMode === ReaderMode.MIND_MAP) {
+        setMindmapEditing({ nodeId: `note-${newNote.id}`, kind: 'note', targetId: newNote.id });
+        setMindmapEditValue(newNote.text);
+      }
       return;
     }
 
@@ -1978,8 +2123,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         next.delete(parentId);
         return next;
       });
-      setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
-      setMindmapEditValue(chapterNode.title);
+      if (viewMode === ReaderMode.MIND_MAP) {
+        setMindmapEditing({ nodeId: newId, kind: 'chapter', targetId: newId });
+        setMindmapEditValue(chapterNode.title);
+      }
     }
   };
 
@@ -2001,7 +2148,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   const handleMindmapDelete = (node: MindMapNode) => {
-    if (viewMode !== ReaderMode.MIND_MAP) return;
     if (node.kind === 'note' && node.note) {
       const note = node.note as HighlightItem;
       removeHighlightNote(note);
@@ -2175,12 +2321,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const handleMindmapToolbarClear = (node: MindMapNode) => {
     handleMindmapDelete(node);
   };
-
-  useEffect(() => {
-    if (viewMode !== ReaderMode.MIND_MAP && mindmapEditing) {
-      cancelMindmapEdit();
-    }
-  }, [viewMode, mindmapEditing]);
 
   const handleMindmapLayout = (layout: MindMapLayout | null) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
@@ -2571,7 +2711,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     note: HighlightItem,
     event: React.MouseEvent<HTMLButtonElement>
   ) => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (event.button !== 0) return;
     event.preventDefault();
     const target = event.currentTarget;
@@ -2609,13 +2748,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   const handleTOCChapterMouseDown = (
-    item: OutlineNode,
+    item: MindMapNode,
     event: React.MouseEvent<HTMLDivElement>
   ) => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (event.button !== 0) return;
-    if (item.isRoot) return;
-    if (!item.isCustom) return;
+    if (item.kind !== 'chapter') return;
+    if (!customChapterIdSet.has(item.id)) return;
     event.preventDefault();
     const target = event.currentTarget;
     const rect = target.getBoundingClientRect();
@@ -2625,7 +2763,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     tocDragChapterRef.current = {
         id: item.id,
         parentId: tocParentMapRef.current.get(item.id) || null,
-        text: item.title,
+        text: item.text,
         offsetX,
         offsetY,
       width: rect.width,
@@ -2640,7 +2778,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       setDraggingTocChapterId(item.id);
       setDragGhost({
         id: item.id,
-        text: item.title,
+        text: item.text,
         x: rect.left,
         y: rect.top,
         width: rect.width,
@@ -2650,7 +2788,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   useEffect(() => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (!draggingTocNoteId) return undefined;
     if (tocDragNoteTimerRef.current) {
       window.clearTimeout(tocDragNoteTimerRef.current);
@@ -2708,10 +2845,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, [draggingTocNoteId, dragOverTocId, viewMode]);
+  }, [draggingTocNoteId, dragOverTocId]);
 
   useEffect(() => {
-    if (viewMode !== ReaderMode.PDF) return;
     if (!draggingTocChapterId) return undefined;
     if (tocDragChapterTimerRef.current) {
       window.clearTimeout(tocDragChapterTimerRef.current);
@@ -2778,10 +2914,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, [draggingTocChapterId, dragOverTocId, viewMode]);
+  }, [draggingTocChapterId, dragOverTocId]);
 
   useEffect(() => {
-    if (viewMode !== ReaderMode.PDF) return;
     const handleUp = () => {
       if (draggingTocNoteId || draggingTocChapterId) return;
       if (tocDragNoteTimerRef.current) {
@@ -2801,7 +2936,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     window.addEventListener('mouseup', handleUp);
     return () => window.removeEventListener('mouseup', handleUp);
-  }, [draggingTocNoteId, draggingTocChapterId, viewMode]);
+  }, [draggingTocNoteId, draggingTocChapterId]);
 
   const fallbackOutline = useMemo<OutlineNode[]>(() => {
     const convert = (items: TOCItem[], parentId = 'mock') =>
@@ -3031,6 +3166,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     walk(outlineDisplay, null);
     tocParentMapRef.current = map;
+  }, [outlineDisplay]);
+
+  const outlineNodeMap = useMemo(() => {
+    const map = new Map<string, OutlineNode>();
+    const walk = (nodes: OutlineNode[]) => {
+      nodes.forEach((node) => {
+        map.set(node.id, node);
+        if (node.items?.length) walk(node.items);
+      });
+    };
+    walk(outlineDisplay);
+    return map;
   }, [outlineDisplay]);
 
   const getHighlightSortKey = (item: HighlightItem) => {
@@ -3846,13 +3993,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
   }, [outlineDisplay, highlightsByChapter]);
 
-  const mindmapRoot = useMemo(() => {
-    if (viewMode !== ReaderMode.MIND_MAP) return null;
-    return buildMindmapRoot();
-  }, [viewMode, buildMindmapRoot]);
+  const mindmapRoot = useMemo(() => buildMindmapRoot(), [buildMindmapRoot]);
 
   const mindmapNodeMap = useMemo(() => {
-    if (viewMode !== ReaderMode.MIND_MAP || !mindmapRoot) return new Map<string, MindMapNode>();
+    if (!mindmapRoot) return new Map<string, MindMapNode>();
     const map = new Map<string, MindMapNode>();
     const walk = (node: MindMapNode) => {
       map.set(node.id, node);
@@ -3860,20 +4004,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     walk(mindmapRoot);
     return map;
-  }, [mindmapRoot, viewMode]);
+  }, [mindmapRoot]);
 
   useEffect(() => {
-    if (viewMode !== ReaderMode.MIND_MAP) return;
     if (!mindmapRoot) {
       setActiveMindmapNodeId(null);
       return;
     }
     if (activeMindmapNodeId && mindmapNodeMap.has(activeMindmapNodeId)) return;
     setActiveMindmapNodeId(mindmapRoot.id);
-  }, [viewMode, mindmapRoot, mindmapNodeMap, activeMindmapNodeId]);
+  }, [mindmapRoot, mindmapNodeMap, activeMindmapNodeId]);
 
   const mindmapParentMap = useMemo(() => {
-    if (viewMode !== ReaderMode.MIND_MAP || !mindmapRoot) return new Map<string, string | null>();
+    if (!mindmapRoot) return new Map<string, string | null>();
     const map = new Map<string, string | null>();
     const walk = (node: MindMapNode, parentId: string | null) => {
       map.set(node.id, parentId);
@@ -3881,7 +4024,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     };
     walk(mindmapRoot, null);
     return map;
-  }, [mindmapRoot, viewMode]);
+  }, [mindmapRoot]);
 
   useEffect(() => {
     mindmapParentMapRef.current = mindmapParentMap;
@@ -4359,41 +4502,49 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
   // --- Components ---
 
-  // Fix: Typed as React.FC to support 'key' prop in recursive calls and list rendering
-  const TOCNode: React.FC<{ item: OutlineNode, level: number }> = ({ item, level }) => {
-    const notes = highlightsByChapter.get(item.id) || [];
-    const hasChildren = (item.items && item.items.length > 0) || notes.length > 0;
+  const TOCNode: React.FC<{ item: MindMapNode, level: number }> = ({ item, level }) => {
+    const outlineItem = outlineNodeMap.get(item.id) || null;
+    const childItems = item.children || [];
+    const hasChildren = childItems.length > 0;
     const isExpanded = expandedTOC.has(item.id);
-    const isNormalChapterInToc = item.isCustom && !highlightChapterIdSet.has(item.id);
+    const isNormalChapterInToc = item.kind === 'chapter' && Boolean(item.isNormalChapter);
     const isDropTarget =
       dragOverTocId === item.id && (Boolean(draggingTocNoteId) || Boolean(draggingTocChapterId));
-    const nodeMap = new Map((item.items || []).map((node) => [node.id, node]));
-    const noteMap = new Map(notes.map((note) => [note.id, note]));
-    const combinedItems = sortCombinedEntries(
-      buildCombinedEntries(item.items || [], notes)
-    ).map((entry) =>
-      entry.kind === 'note'
-        ? { type: 'note' as const, note: noteMap.get(entry.id)! }
-        : { type: 'node' as const, node: nodeMap.get(entry.id)! }
-    );
+    const isActiveChapter = activeMindmapNodeId === item.id;
+    const isEditingChapter = item.kind === 'chapter' && mindmapEditing?.nodeId === item.id;
+    const editingChapterNode = isEditingChapter ? mindmapNodeMap.get(item.id) || null : null;
+    const chapterLabel = item.text || '';
 
     return (
       <div className="select-none">
         <div 
           data-toc-id={item.id}
           data-toc-kind="chapter"
-          className={`group flex items-center py-1 px-2 cursor-pointer rounded my-0.5 ${
+          className={`group flex py-1 px-2 cursor-pointer rounded my-0.5 ${
+            isEditingChapter ? 'items-start' : 'items-center'
+          } ${
             isNormalChapterInToc ? 'text-xs text-gray-600 italic' : 'text-sm text-gray-700'
           } ${
-            isDropTarget ? 'bg-gray-200' : 'hover:bg-gray-200'
+            isEditingChapter
+              ? ''
+              : isDropTarget
+              ? 'bg-gray-200'
+              : isActiveChapter
+                ? 'bg-blue-50 text-blue-700 ring-1 ring-blue-200'
+                : 'hover:bg-gray-200'
           }`}
           style={{ paddingLeft: `${level * 12 + 8}px` }}
           onMouseDown={(event) => {
+            if (isEditingChapter) return;
             handleTOCChapterMouseDown(item, event);
           }}
           onClick={() => {
+            if (isEditingChapter) return;
             if (Date.now() < tocSuppressClickUntilRef.current) return;
             if (tocDragChapterTriggeredRef.current) return;
+            if (mindmapNodeMap.has(item.id)) {
+              setActiveMindmapNodeId(item.id);
+            }
             if (typeof item.pageIndex === 'number') {
               const target = pageRefs.current[item.pageIndex];
               const container = contentAreaRef.current;
@@ -4404,6 +4555,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                 container.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
               }
             }
+          }}
+          onDoubleClick={(event) => {
+            handleTOCChapterDoubleClick(item, event);
           }}
         >
            <button
@@ -4420,8 +4574,109 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                 isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />
              )}
            </button>
-           <span className="truncate flex-1">{item.title}</span>
-           {item.isCustom ? (
+           {isEditingChapter ? (
+             <div
+               data-toc-editing-node="true"
+               className="flex-1 min-w-0 rounded-lg border border-gray-200 bg-white shadow-lg p-2"
+               onMouseDown={(event) => {
+                 event.preventDefault();
+                 event.stopPropagation();
+               }}
+               onClick={(event) => event.stopPropagation()}
+             >
+               <div className="flex items-center gap-1.5">
+                 {HIGHLIGHT_COLORS.map((color) => {
+                   const isActive = editingChapterNode?.color === color.fill;
+                   return (
+                     <button
+                       key={`${item.id}-${color.id}`}
+                       type="button"
+                       data-toc-editing-node="true"
+                       className="w-5 h-5 rounded-md border border-gray-300 flex items-center justify-center"
+                       onMouseDown={(event) => {
+                         event.preventDefault();
+                         event.stopPropagation();
+                       }}
+                       onClick={() => {
+                         if (!editingChapterNode) return;
+                         handleMindmapToolbarColor(editingChapterNode, color.fill);
+                       }}
+                       style={{
+                         boxShadow: isActive ? `0 0 0 2px ${color.swatch}` : 'none',
+                         borderColor: isActive ? 'transparent' : undefined
+                       }}
+                     >
+                       <span
+                         className="w-3 h-3 rounded-sm"
+                         style={{ background: color.swatch }}
+                       />
+                     </button>
+                   );
+                 })}
+                 <button
+                   type="button"
+                   data-toc-editing-node="true"
+                   className="w-5 h-5 rounded-md border border-gray-300 text-[10px] font-semibold text-gray-700 hover:bg-gray-50"
+                   onMouseDown={(event) => {
+                     event.preventDefault();
+                     event.stopPropagation();
+                   }}
+                   onClick={() => {
+                     if (!editingChapterNode) return;
+                     handleMindmapToolbarMakeChapter(editingChapterNode);
+                   }}
+                   style={{
+                     boxShadow: editingChapterNode?.kind === 'chapter' ? '0 0 0 2px #9ca3af' : 'none',
+                     borderColor: editingChapterNode?.kind === 'chapter' ? 'transparent' : undefined
+                   }}
+                 >
+                   T
+                 </button>
+                 <button
+                   type="button"
+                   data-toc-editing-node="true"
+                   className="w-5 h-5 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 flex items-center justify-center"
+                   onMouseDown={(event) => {
+                     event.preventDefault();
+                     event.stopPropagation();
+                   }}
+                   onClick={() => {
+                     if (!editingChapterNode) return;
+                     handleMindmapToolbarClear(editingChapterNode);
+                   }}
+                 >
+                   <Ban size={12} />
+                 </button>
+               </div>
+               <textarea
+                 ref={tocEditInputRef}
+                 autoFocus
+                 data-toc-editing-node="true"
+                 value={mindmapEditValue}
+                 onChange={(event) => setMindmapEditValue(event.target.value)}
+                 onMouseDown={(event) => event.stopPropagation()}
+                 onClick={(event) => event.stopPropagation()}
+                 onDoubleClick={(event) => event.stopPropagation()}
+                 onKeyDown={(event) => {
+                   if (event.key === 'Escape') {
+                     event.preventDefault();
+                     cancelMindmapEdit();
+                   }
+                   if (event.key === 'Enter' && !event.shiftKey) {
+                     event.preventDefault();
+                     commitMindmapEdit(null, event.currentTarget.value);
+                   }
+                 }}
+                 onBlur={(event) => {
+                   commitMindmapEdit(null, event.currentTarget.value);
+                 }}
+                 className="mt-2 w-full min-h-[44px] text-[11px] text-gray-600 bg-gray-50 rounded-md p-2 resize-none outline-none focus:ring-2 focus:ring-blue-200"
+               />
+             </div>
+           ) : (
+             <span className="truncate flex-1">{chapterLabel}</span>
+           )}
+           {outlineItem?.isCustom && !isEditingChapter ? (
              <Tooltip label="取消自定义章节">
                <button
                  type="button"
@@ -4441,87 +4696,203 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           <div>
             {hasChildren ? (
               <div className="space-y-1">
-                {combinedItems.map((entry) =>
-                  entry.type === 'note' ? (
-                    <div key={entry.note.id} style={{ paddingLeft: `${level * 12 + 14}px` }}>
-                      {(() => {
-                        const isExpanded = expandedHighlightIds.has(entry.note.id);
-                        const isPlainNote =
-                          isManualHighlight(entry.note) && !entry.note.isChapterTitle;
-                        const clampStyle = isExpanded
-                          ? { whiteSpace: 'pre-wrap' as const }
-                          : {
-                              display: '-webkit-box',
-                              WebkitLineClamp: 2,
-                              WebkitBoxOrient: 'vertical',
-                              overflow: 'hidden'
-                            };
-                        return (
-                          <div className="relative group">
+                {childItems.map((child) => {
+                  if (child.kind === 'note') {
+                    const note = child.note as HighlightItem | undefined;
+                    if (!note) return null;
+                    const noteNodeId = `note-${note.id}`;
+                    const isExpanded = expandedHighlightIds.has(note.id);
+                    const isActiveNote = activeMindmapNodeId === noteNodeId;
+                    const isEditingNote = mindmapEditing?.nodeId === noteNodeId;
+                    const editingNoteNode = isEditingNote
+                      ? mindmapNodeMap.get(noteNodeId) || null
+                      : null;
+                    const isPlainNote = isManualHighlight(note) && !note.isChapterTitle;
+                    const clampStyle = isExpanded
+                      ? { whiteSpace: 'pre-wrap' as const }
+                      : {
+                          display: '-webkit-box',
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden'
+                        };
+
+                    return (
+                      <div key={note.id} style={{ paddingLeft: `${level * 12 + 14}px` }}>
+                        <div className="relative group">
+                          {isEditingNote ? (
+                            <div
+                              data-toc-editing-node="true"
+                              className="w-full rounded-lg border border-gray-200 bg-white shadow-lg p-2"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                event.stopPropagation();
+                              }}
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              <div
+                                data-toc-editing-node="true"
+                                className="w-full flex items-center gap-1.5"
+                              >
+                                {HIGHLIGHT_COLORS.map((color) => {
+                                  const isActive = editingNoteNode?.color === color.fill;
+                                  return (
+                                    <button
+                                      key={`${note.id}-${color.id}`}
+                                      type="button"
+                                      data-toc-editing-node="true"
+                                      className="w-5 h-5 rounded-md border border-gray-300 flex items-center justify-center"
+                                      onMouseDown={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                      }}
+                                      onClick={() => {
+                                        if (!editingNoteNode) return;
+                                        handleMindmapToolbarColor(editingNoteNode, color.fill);
+                                      }}
+                                      style={{
+                                        boxShadow: isActive ? `0 0 0 2px ${color.swatch}` : 'none',
+                                        borderColor: isActive ? 'transparent' : undefined
+                                      }}
+                                    >
+                                      <span
+                                        className="w-3 h-3 rounded-sm"
+                                        style={{ background: color.swatch }}
+                                      />
+                                    </button>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  data-toc-editing-node="true"
+                                  className="w-5 h-5 rounded-md border border-gray-300 text-[10px] font-semibold text-gray-700 hover:bg-gray-50"
+                                  onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={() => {
+                                    if (!editingNoteNode) return;
+                                    handleMindmapToolbarMakeChapter(editingNoteNode);
+                                  }}
+                                  style={{
+                                    boxShadow:
+                                      editingNoteNode?.kind === 'chapter' ? '0 0 0 2px #9ca3af' : 'none',
+                                    borderColor:
+                                      editingNoteNode?.kind === 'chapter' ? 'transparent' : undefined
+                                  }}
+                                >
+                                  T
+                                </button>
+                                <button
+                                  type="button"
+                                  data-toc-editing-node="true"
+                                  className="w-5 h-5 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 flex items-center justify-center"
+                                  onMouseDown={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={() => {
+                                    if (!editingNoteNode) return;
+                                    handleMindmapToolbarClear(editingNoteNode);
+                                  }}
+                                >
+                                  <Ban size={12} />
+                                </button>
+                              </div>
+                              <textarea
+                                ref={tocEditInputRef}
+                                autoFocus
+                                data-toc-editing-node="true"
+                                value={mindmapEditValue}
+                                onChange={(event) => setMindmapEditValue(event.target.value)}
+                                onMouseDown={(event) => event.stopPropagation()}
+                                onClick={(event) => event.stopPropagation()}
+                                onDoubleClick={(event) => event.stopPropagation()}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Escape') {
+                                    event.preventDefault();
+                                    cancelMindmapEdit();
+                                  }
+                                  if (event.key === 'Enter' && !event.shiftKey) {
+                                    event.preventDefault();
+                                    commitMindmapEdit(null, event.currentTarget.value);
+                                  }
+                                }}
+                                onBlur={(event) => {
+                                  commitMindmapEdit(null, event.currentTarget.value);
+                                }}
+                                className="mt-2 w-full min-h-[44px] text-[11px] text-gray-600 bg-gray-50 rounded-md p-2 resize-none outline-none focus:ring-2 focus:ring-blue-200"
+                                style={{
+                                  fontStyle: isPlainNote ? 'italic' : 'normal'
+                                }}
+                              />
+                            </div>
+                          ) : (
                             <button
                               type="button"
-                              data-toc-id={entry.note.id}
+                              data-toc-id={note.id}
                               data-toc-kind="note"
                               onMouseDown={(event) => {
-                                handleTOCNoteMouseDown(entry.note, event);
+                                handleTOCNoteMouseDown(note, event);
                               }}
                               onClick={() => {
                                 if (Date.now() < tocSuppressClickUntilRef.current) return;
                                 if (tocDragNoteTriggeredRef.current) return;
-                                jumpToHighlight(entry.note);
+                                setActiveMindmapNodeId(noteNodeId);
+                                jumpToHighlight(note);
                               }}
-                              onDoubleClick={() => {
-                                if (Date.now() < tocSuppressClickUntilRef.current) return;
-                                setExpandedHighlightIds((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(entry.note.id)) {
-                                    next.delete(entry.note.id);
-                                  } else {
-                                    next.add(entry.note.id);
-                                  }
-                                  return next;
-                                });
+                              onDoubleClick={(event) => {
+                                handleTOCNoteDoubleClick(note, event);
                               }}
-                              className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 group-hover:bg-gray-200 flex flex-col items-start ${
-                                entry.note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
+                              className={`w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent flex flex-col items-start ${
+                                note.isChapterTitle ? 'font-semibold text-gray-800' : 'text-gray-600'
+                              } ${
+                                isActiveNote
+                                  ? 'bg-blue-50 text-blue-700 ring-1 ring-blue-200'
+                                  : 'hover:bg-gray-200 group-hover:bg-gray-200'
                               } ${isPlainNote ? 'italic' : ''}`}
                               style={{
-                                borderLeft: `3px solid ${entry.note.color}`
+                                borderLeft: `3px solid ${note.color}`
                               }}
                             >
                               <span className="leading-4 w-full" style={clampStyle}>
-                                {entry.note.text}
+                                {note.text}
                               </span>
-                        {!entry.note.isChapterTitle &&
-                        !isManualHighlight(entry.note) &&
-                        entry.note.translation ? (
-                          <span className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full" style={clampStyle}>
-                            {entry.note.translation}
-                          </span>
-                        ) : null}
+                              {!note.isChapterTitle &&
+                              !isManualHighlight(note) &&
+                              note.translation ? (
+                                <span
+                                  className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                  style={clampStyle}
+                                >
+                                  {note.translation}
+                                </span>
+                              ) : null}
                             </button>
-                            {!entry.note.isChapterTitle ? (
-                              <button
-                                type="button"
-                                onMouseDown={(event) => event.stopPropagation()}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  removeHighlightNote(entry.note);
-                                }}
-                                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                aria-label="删除笔记"
-                              >
-                                <X size={12} />
-                              </button>
-                            ) : null}
-                          </div>
-                        );
-                      })()}
-                    </div>
-                  ) : (
-                    <TOCNode key={entry.node.id} item={entry.node} level={level + 1} />
-                  )
-                )}
+                          )}
+                          {!note.isChapterTitle && !isEditingNote ? (
+                            <button
+                              type="button"
+                              onMouseDown={(event) => event.stopPropagation()}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                removeHighlightNote(note);
+                              }}
+                              className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                              aria-label="删除笔记"
+                            >
+                              <X size={12} />
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (child.kind === 'chapter') {
+                    return <TOCNode key={child.id} item={child} level={level + 1} />;
+                  }
+                  return null;
+                })}
               </div>
             ) : null}
           </div>
@@ -4530,18 +4901,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     );
   };
 
-  const toolbarMindmapNode =
-    viewMode === ReaderMode.MIND_MAP
-      ? activeMindmapNodeId
-        ? mindmapNodeMap.get(activeMindmapNodeId) || mindmapRoot
-        : mindmapRoot
-      : null;
+  const toolbarMindmapNode = activeMindmapNodeId
+    ? mindmapNodeMap.get(activeMindmapNodeId) || mindmapRoot
+    : mindmapRoot;
   const canToolbarAddChild =
-    viewMode === ReaderMode.MIND_MAP && !mindmapEditing && Boolean(toolbarMindmapNode);
+    Boolean(toolbarMindmapNode) && (viewMode !== ReaderMode.MIND_MAP || !mindmapEditing);
   const canToolbarAddSibling =
-    viewMode === ReaderMode.MIND_MAP &&
-    !mindmapEditing &&
-    Boolean(toolbarMindmapNode && toolbarMindmapNode.kind !== 'root');
+    Boolean(toolbarMindmapNode && toolbarMindmapNode.kind !== 'root') &&
+    (viewMode !== ReaderMode.MIND_MAP || !mindmapEditing);
 
   return (
     <div ref={containerRef} className="flex h-[calc(100vh-40px)] bg-white overflow-hidden">
@@ -4551,20 +4918,75 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         className="bg-[#f9f9f9] border-r border-gray-200 flex flex-col"
         style={{ width: leftWidth }}
       >
-        {/* Updated Header: Matches App Title Bar Height (h-10) */}
-        <div className="h-10 flex border-b border-gray-200 bg-white">
-           <Tooltip label="文章目录" wrapperClassName="flex-1 h-full">
-             <button
-               className="w-full h-full flex justify-center items-center border-b-2 border-blue-400 text-blue-600 bg-blue-50"
-             >
-               <List size={16} />
-             </button>
-           </Tooltip>
+        <div className="h-10 flex items-center gap-2 border-b border-gray-200 bg-white px-3">
+          <Tooltip label="章节目录">
+            <button
+              type="button"
+              className="flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all bg-gray-200 text-gray-900 hover:bg-gray-200"
+              aria-label="章节目录"
+            >
+              <List size={14} />
+            </button>
+          </Tooltip>
+          <div className="ml-auto flex items-center gap-1">
+            <Tooltip label="新增子节点">
+              <button
+                type="button"
+                disabled={!canToolbarAddChild}
+                onClick={() => {
+                  if (!toolbarMindmapNode || !canToolbarAddChild) return;
+                  handleMindmapAddChild(toolbarMindmapNode);
+                }}
+                className="p-1 text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="5" cy="12" r="2" fill="currentColor" stroke="none" />
+                  <line x1="8" y1="12" x2="12" y2="12" />
+                  <rect x="12.5" y="7" width="8.5" height="10" rx="2" ry="2" strokeDasharray="3 2" />
+                </svg>
+              </button>
+            </Tooltip>
+            <Tooltip label="新增同级节点">
+              <button
+                type="button"
+                disabled={!canToolbarAddSibling}
+                onClick={() => {
+                  if (!toolbarMindmapNode || !canToolbarAddSibling) return;
+                  handleMindmapAddSibling(toolbarMindmapNode);
+                }}
+                className="p-1 text-gray-600 hover:text-gray-900 hover:bg-gray-200 rounded disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <svg
+                  className="w-4 h-4"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <circle cx="5" cy="6" r="2" fill="currentColor" stroke="none" />
+                  <line x1="7" y1="6" x2="12" y2="6" />
+                  <line x1="7" y1="6" x2="12" y2="16" />
+                  <rect x="12" y="3" width="9" height="6" rx="2" ry="2" />
+                  <rect x="12" y="13" width="9" height="6" rx="2" ry="2" strokeDasharray="3 2" />
+                </svg>
+              </button>
+            </Tooltip>
+          </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-2">
-          {outlineDisplay.map(item => (
-            <TOCNode key={item.id} item={item} level={0} />
-          ))}
+        <div className="flex-1 min-h-0 relative">
+          <div className="h-full overflow-y-auto p-2">
+            {mindmapRoot ? <TOCNode item={mindmapRoot} level={0} /> : null}
+          </div>
         </div>
       </div>
 
@@ -4580,33 +5002,37 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
       {/* SECTION E: Main Content (PDF / MindMap) */}
       <div className="flex-1 min-w-0 flex flex-col bg-gray-50 relative">
-        {/* Toolbar: Matches App Title Bar Height (h-10) */}
-        <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center px-3 sticky top-0 z-10">
-          {/* Adjusted: Removed scale, increased padding for larger buttons, kept text/icon small */}
+        <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center gap-2 px-3 sticky top-0 z-10">
           <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
             <Tooltip label="PDF">
-              <button 
+              <button
                 onClick={() => switchViewMode(ReaderMode.PDF)}
-                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.PDF ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
+                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                  viewMode === ReaderMode.PDF
+                    ? 'bg-gray-200 text-gray-900'
+                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                }`}
                 aria-label="PDF"
               >
                 <FileText size={14} />
               </button>
             </Tooltip>
-            <Tooltip label="Mind Map">
-              <button 
+            <Tooltip label="思维导图">
+              <button
                 onClick={() => switchViewMode(ReaderMode.MIND_MAP)}
-                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${viewMode === ReaderMode.MIND_MAP ? 'bg-gray-200 text-gray-900' : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'}`}
-                aria-label="Mind Map"
+                className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                  viewMode === ReaderMode.MIND_MAP
+                    ? 'bg-gray-200 text-gray-900'
+                    : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                }`}
+                aria-label="思维导图"
               >
                 <Network size={14} />
               </button>
             </Tooltip>
           </div>
-
-          <div className="flex-1 flex justify-center">
-            {viewMode === ReaderMode.MIND_MAP ? (
-              <div className="flex items-center gap-2 px-1 py-1">
+          {viewMode === ReaderMode.MIND_MAP ? (
+            <div className="flex-1 flex justify-center items-center gap-2">
               <Tooltip label="新增子节点">
                 <button
                   type="button"
@@ -4660,354 +5086,360 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                 </button>
               </Tooltip>
             </div>
-            ) : (
-              <div className="flex-1" />
-            )}
-          </div>
-
-          <div className="flex items-center gap-1 text-gray-600">
-            <button
-              onClick={() => {
-                if (viewMode === ReaderMode.PDF) {
-                  setPdfZoom((z) => Math.max(50, z - 10));
-                } else {
-                  setMindmapZoom((z) => Math.max(50, z - 10));
-                }
-              }}
-              className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
-            >
-              <ZoomOut size={14} />
-            </button>
-            <span className="text-xs w-8 text-center">
-              {viewMode === ReaderMode.PDF ? pdfZoom : mindmapZoom}%
-            </span>
-            <button
-              onClick={() => {
-                if (viewMode === ReaderMode.PDF) {
-                  setPdfZoom((z) => Math.min(200, z + 10));
-                } else {
-                  setMindmapZoom((z) => Math.min(200, z + 10));
-                }
-              }}
-              className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
-            >
-              <ZoomIn size={14} />
-            </button>
-          </div>
+          ) : (
+            <div className="flex-1" />
+          )}
+          {viewMode === ReaderMode.MIND_MAP ? (
+            <div className="flex items-center gap-1 text-gray-600">
+              <button
+                onClick={() => setMindmapZoom((z) => Math.max(50, z - 10))}
+                className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
+                aria-label="缩小思维导图"
+              >
+                <ZoomOut size={14} />
+              </button>
+              <span className="text-xs w-8 text-center">{mindmapZoom}%</span>
+              <button
+                onClick={() => setMindmapZoom((z) => Math.min(200, z + 10))}
+                className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
+                aria-label="放大思维导图"
+              >
+                <ZoomIn size={14} />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1 text-gray-600">
+              <button
+                onClick={() => setPdfZoom((z) => Math.max(50, z - 10))}
+                className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
+                aria-label="缩小PDF"
+              >
+                <ZoomOut size={14} />
+              </button>
+              <span className="text-xs w-8 text-center">{pdfZoom}%</span>
+              <button
+                onClick={() => setPdfZoom((z) => Math.min(200, z + 10))}
+                className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
+                aria-label="放大PDF"
+              >
+                <ZoomIn size={14} />
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Content Area */}
         <div
-          ref={contentAreaRef}
-          className="flex-1 min-w-0 overflow-auto relative"
-          onMouseUp={viewMode === ReaderMode.PDF ? updateSelectionFromWindow : undefined}
-          onMouseDown={handleHighlightClick}
-          onScroll={handleContentScroll}
+          className={`flex-1 min-w-0 overflow-hidden relative ${
+            viewMode === ReaderMode.MIND_MAP ? '' : 'hidden'
+          }`}
         >
-          <div className={viewMode === ReaderMode.PDF ? 'block' : 'hidden'}>
-            {pdfFile ? (
-              <div className="min-h-full flex justify-center py-6 px-4">
-                <Document
-                  file={pdfFile}
-                  onLoadSuccess={handleDocumentLoad}
-                  onLoadError={(error) => {
-                    console.error('PDF load error:', error);
-                  }}
-                  onSourceError={(error) => {
-                    console.error('PDF source error:', error);
-                  }}
-                  loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
-                  error={<div className="text-sm text-red-500">PDF加载失败</div>}
-                >
-                  {Array.from(new Array(numPages || 0), (_, index) => (
-                    <div
-                      key={`page_${index + 1}`}
-                      ref={(el) => {
-                        pageRefs.current[index] = el;
-                      }}
-                      data-page-index={index}
-                      className="mb-4 last:mb-0 relative"
-                    >
-                      <Page
-                        pageNumber={index + 1}
-                        width={800}
-                        scale={pdfZoom / 100}
-                        renderAnnotationLayer={false}
-                        renderTextLayer
-                      />
-                      {highlightRectsByPage.get(index)?.length ? (
-                        <div className="absolute inset-0 pointer-events-none">
-                          {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
-                            const isActive = item.id === activeHighlightId;
-                            const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
-                            const borderColor = isActive ? (swatch || toSolidColor(item.color)) : '';
-                            return (
-                              <div
-                                key={`mark-${index}-${rectIndex}`}
-                                className="absolute mix-blend-multiply opacity-40"
-                                style={{
-                                  top: `${item.rect.y * 100}%`,
-                                  left: `${item.rect.x * 100}%`,
-                                  width: `${item.rect.w * 100}%`,
-                                  height: `${item.rect.h * 100}%`,
-                                  background: item.color,
-                                  boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
-                                }}
-                              />
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                      {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
-                        <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
-                          {pdfMarginChildrenByPage.get(index)!.map((group) => {
-                            const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
-                            const clampedTop = Math.max(0, Math.min(1, topRatio));
-                            return (
-                              <div
-                                key={`margin-${index}-${group.parentId}`}
-                                className="absolute left-0"
-                                style={{ top: `${clampedTop * 100}%` }}
-                              >
-                                <div className="flex flex-col gap-1">
-                                  {group.items.map((item) => {
-                                    const swatch =
-                                      item.kind === 'note' && item.color
-                                        ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
-                                          toSolidColor(item.color)
-                                        : '#9ca3af';
-                                    const label = item.label?.trim() || '（空白）';
-                                    if (item.kind === 'chapter') {
+            <React.Suspense
+              fallback={
+                <div className="w-full h-full flex items-center justify-center text-sm text-gray-400">
+                  正在加载思维导图...
+                </div>
+              }
+            >
+              <LazyMindMap
+                root={mindmapRoot}
+                zoomScale={mindmapZoomScale}
+                collapsedIds={collapsedMindmapIds}
+                expandedNoteIds={expandedHighlightIds}
+                offset={mindmapOffset}
+                dropTarget={
+                  dragOverMindmapTarget
+                    ? {
+                        id: dragOverMindmapTarget.id,
+                        position: dragOverMindmapTarget.position
+                      }
+                    : null
+                }
+                draggingNoteId={draggingNoteId}
+                selectedNodeId={activeMindmapNodeId}
+                onLayoutStart={handleMindmapLayoutStart}
+                onLayout={handleMindmapLayout}
+                onNodeClick={handleMindMapNodeClick}
+                onNodeDoubleClick={handleMindmapNodeDoubleClick}
+                onNodeMouseDown={handleMindmapNodeMouseDown}
+                onBackgroundMouseDown={handleMindmapMouseDown}
+                onNodeToggleCollapse={handleMindmapToggleCollapse}
+                toolbarColors={HIGHLIGHT_COLORS}
+                onToolbarColorSelect={handleMindmapToolbarColor}
+                onToolbarMakeChapter={handleMindmapToolbarMakeChapter}
+                onToolbarClear={handleMindmapToolbarClear}
+                editingNodeId={mindmapEditing?.nodeId || null}
+                editingValue={mindmapEditValue}
+                onEditChange={setMindmapEditValue}
+                onEditCommit={commitMindmapEdit}
+                onEditCancel={cancelMindmapEdit}
+                onNoteToggleExpand={(noteId) =>
+                  setExpandedHighlightIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(noteId)) {
+                      next.delete(noteId);
+                    } else {
+                      next.add(noteId);
+                    }
+                    return next;
+                  })
+                }
+              />
+            </React.Suspense>
+            {SHOW_MINDMAP_DROP_DEBUG ? (
+              <div className="pointer-events-none absolute top-2 right-2 z-40 rounded-md bg-black/75 text-white text-[10px] leading-4 px-2 py-1 font-mono">
+                <div>{`hit: ${formatMindmapDropTarget(dragOverMindmapTarget)}`}</div>
+                <div>{`last: ${mindmapDropLastHit}`}</div>
+                <div className="mt-1 max-w-[460px] whitespace-pre-wrap break-all text-[9px] leading-3">
+                  {mindmapDropOrderDebug || 'order: -'}
+                </div>
+              </div>
+            ) : null}
+            {dragGhost ? (
+              <div
+                className="fixed z-40 pointer-events-none"
+                style={{
+                  left: dragGhost.x,
+                  top: dragGhost.y,
+                  width: dragGhost.width,
+                  height: dragGhost.height,
+                  background: dragGhost.color
+                    ? 'rgba(255,255,255,0.9)'
+                    : 'rgba(255,255,255,0.9)',
+                  border: '1px solid rgba(148, 163, 184, 0.7)',
+                  borderRadius: 8,
+                  boxShadow: '0 8px 16px rgba(15, 23, 42, 0.15)',
+                  opacity: 0.7,
+                  padding: '6px 8px'
+                }}
+              >
+                {(dragGhost.lines && dragGhost.lines.length
+                  ? dragGhost.lines
+                  : [dragGhost.text]
+                ).map((line, index) => (
+                  <div
+                    key={`${dragGhost.id}-line-${index}`}
+                    style={{
+                      fontSize: dragGhost.fontSize ? `${dragGhost.fontSize}px` : '12px',
+                      lineHeight: dragGhost.lineHeight ? `${dragGhost.lineHeight}px` : '14px',
+                      color: '#111827'
+                    }}
+                  >
+                    {line}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        <div
+            ref={contentAreaRef}
+            className={`flex-1 min-w-0 overflow-auto relative ${
+              viewMode === ReaderMode.PDF ? '' : 'hidden'
+            }`}
+            onMouseUp={updateSelectionFromWindow}
+            onMouseDown={handleHighlightClick}
+            onScroll={handleContentScroll}
+          >
+            {pdfFileForRender ? (
+                <div className="min-h-full flex justify-center py-6 px-4">
+                  <Document
+                    file={pdfFileForRender}
+                    onLoadSuccess={handleDocumentLoad}
+                    onLoadError={(error) => {
+                      console.error('PDF load error:', error);
+                    }}
+                    onSourceError={(error) => {
+                      console.error('PDF source error:', error);
+                    }}
+                    loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
+                    error={<div className="text-sm text-red-500">PDF加载失败</div>}
+                  >
+                    {Array.from(new Array(numPages || 0), (_, index) => (
+                      <div
+                        key={`page_${index + 1}`}
+                        ref={(el) => {
+                          pageRefs.current[index] = el;
+                        }}
+                        data-page-index={index}
+                        className="mb-4 last:mb-0 relative"
+                      >
+                        <Page
+                          pageNumber={index + 1}
+                          width={800}
+                          scale={pdfZoom / 100}
+                          renderAnnotationLayer={false}
+                          renderTextLayer
+                        />
+                        {highlightRectsByPage.get(index)?.length ? (
+                          <div className="absolute inset-0 pointer-events-none">
+                            {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
+                              const isActive = item.id === activeHighlightId;
+                              const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
+                              const borderColor = isActive ? (swatch || toSolidColor(item.color)) : '';
+                              return (
+                                <div
+                                  key={`mark-${index}-${rectIndex}`}
+                                  className="absolute mix-blend-multiply opacity-40"
+                                  style={{
+                                    top: `${item.rect.y * 100}%`,
+                                    left: `${item.rect.x * 100}%`,
+                                    width: `${item.rect.w * 100}%`,
+                                    height: `${item.rect.h * 100}%`,
+                                    background: item.color,
+                                    boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
+                                  }}
+                                />
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                        {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
+                          <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
+                            {pdfMarginChildrenByPage.get(index)!.map((group) => {
+                              const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
+                              const clampedTop = Math.max(0, Math.min(1, topRatio));
+                              return (
+                                <div
+                                  key={`margin-${index}-${group.parentId}`}
+                                  className="absolute left-0"
+                                  style={{ top: `${clampedTop * 100}%` }}
+                                >
+                                  <div className="flex flex-col gap-1">
+                                    {group.items.map((item) => {
+                                      const swatch =
+                                        item.kind === 'note' && item.color
+                                          ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
+                                            toSolidColor(item.color)
+                                          : '#9ca3af';
+                                      const label = item.label?.trim() || '（空白）';
+                                      if (item.kind === 'chapter') {
+                                        return (
+                                          <div key={item.key} className="relative group">
+                                            <button
+                                              type="button"
+                                              className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
+                                              style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
+                                              onMouseDown={(event) => event.stopPropagation()}
+                                              onClick={(event) => openMarginToolbar(event, item)}
+                                            >
+                                              <span className="truncate flex-1">{label}</span>
+                                            </button>
+                                            {item.node?.isCustom ? (
+                                              <button
+                                                type="button"
+                                                onMouseDown={(event) => event.stopPropagation()}
+                                                onClick={(event) => {
+                                                  event.stopPropagation();
+                                                  removeCustomChapter(item.node!.id);
+                                                }}
+                                                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                                aria-label="删除章节"
+                                              >
+                                                <X size={12} />
+                                              </button>
+                                            ) : null}
+                                          </div>
+                                        );
+                                      }
+                                      const isExpanded = expandedHighlightIds.has(item.note?.id || '');
+                                      const clampStyle = isExpanded
+                                        ? { whiteSpace: 'pre-wrap' as const }
+                                        : {
+                                            display: '-webkit-box',
+                                            WebkitLineClamp: 2,
+                                            WebkitBoxOrient: 'vertical',
+                                            overflow: 'hidden'
+                                          };
                                       return (
                                         <div key={item.key} className="relative group">
                                           <button
                                             type="button"
-                                            className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
-                                            style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
+                                            className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
+                                            style={{
+                                              borderLeft: `3px solid ${swatch}`,
+                                              paddingLeft: `${8 + (item.indentPx || 0)}px`
+                                            }}
                                             onMouseDown={(event) => event.stopPropagation()}
                                             onClick={(event) => openMarginToolbar(event, item)}
+                                            onDoubleClick={(event) => {
+                                              event.stopPropagation();
+                                              if (!item.note) return;
+                                              setExpandedHighlightIds((prev) => {
+                                                const next = new Set(prev);
+                                                if (next.has(item.note!.id)) {
+                                                  next.delete(item.note!.id);
+                                                } else {
+                                                  next.add(item.note!.id);
+                                                }
+                                                return next;
+                                              });
+                                            }}
                                           >
-                                            <span className="truncate flex-1">{label}</span>
+                                            <span className="leading-4 w-full" style={clampStyle}>
+                                              {label}
+                                            </span>
+                                            {item.note &&
+                                            !item.note.isChapterTitle &&
+                                            !isManualHighlight(item.note) &&
+                                            item.note.translation ? (
+                                              <span
+                                                className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                                style={clampStyle}
+                                              >
+                                                {item.note.translation}
+                                              </span>
+                                            ) : null}
                                           </button>
-                                          {item.node?.isCustom ? (
+                                          {item.note && !item.note.isChapterTitle ? (
                                             <button
                                               type="button"
                                               onMouseDown={(event) => event.stopPropagation()}
                                               onClick={(event) => {
                                                 event.stopPropagation();
-                                                removeCustomChapter(item.node!.id);
+                                                removeHighlightNote(item.note!);
                                               }}
                                               className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                              aria-label="删除章节"
+                                              aria-label="删除笔记"
                                             >
                                               <X size={12} />
                                             </button>
                                           ) : null}
                                         </div>
                                       );
-                                    }
-                                    const isExpanded = expandedHighlightIds.has(item.note?.id || '');
-                                    const clampStyle = isExpanded
-                                      ? { whiteSpace: 'pre-wrap' as const }
-                                      : {
-                                          display: '-webkit-box',
-                                          WebkitLineClamp: 2,
-                                          WebkitBoxOrient: 'vertical',
-                                          overflow: 'hidden'
-                                        };
-                                    return (
-                                      <div key={item.key} className="relative group">
-                                        <button
-                                          type="button"
-                                          className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
-                                          style={{
-                                            borderLeft: `3px solid ${swatch}`,
-                                            paddingLeft: `${8 + (item.indentPx || 0)}px`
-                                          }}
-                                          onMouseDown={(event) => event.stopPropagation()}
-                                          onClick={(event) => openMarginToolbar(event, item)}
-                                          onDoubleClick={(event) => {
-                                            event.stopPropagation();
-                                            if (!item.note) return;
-                                            setExpandedHighlightIds((prev) => {
-                                              const next = new Set(prev);
-                                              if (next.has(item.note!.id)) {
-                                                next.delete(item.note!.id);
-                                              } else {
-                                                next.add(item.note!.id);
-                                              }
-                                              return next;
-                                            });
-                                          }}
-                                        >
-                                          <span className="leading-4 w-full" style={clampStyle}>
-                                            {label}
-                                          </span>
-                                          {item.note &&
-                                          !item.note.isChapterTitle &&
-                                          !isManualHighlight(item.note) &&
-                                          item.note.translation ? (
-                                            <span
-                                              className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
-                                              style={clampStyle}
-                                            >
-                                              {item.note.translation}
-                                            </span>
-                                          ) : null}
-                                        </button>
-                                        {item.note && !item.note.isChapterTitle ? (
-                                          <button
-                                            type="button"
-                                            onMouseDown={(event) => event.stopPropagation()}
-                                            onClick={(event) => {
-                                              event.stopPropagation();
-                                              removeHighlightNote(item.note!);
-                                            }}
-                                            className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                            aria-label="删除笔记"
-                                          >
-                                            <X size={12} />
-                                          </button>
-                                        ) : null}
-                                      </div>
-                                    );
-                                  })}
+                                    })}
+                                  </div>
                                 </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </Document>
-              </div>
-            ) : paper.filePath ? (
-              <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
-                正在加载PDF…
-              </div>
-            ) : (
-              <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
-                <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
-                  <div className="p-12">
-                    <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
-                    <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
-                    <div className="prose max-w-none font-serif leading-relaxed">
-                      <p className="mb-4 font-bold">Abstract</p>
-                      <p className="mb-8 italic text-gray-600">{paper.summary}</p>
-                      <p className="mb-4 font-bold">1. Introduction</p>
-                      <p>{paper.content}</p>
-                      <p className="mt-4">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
-                      <p className="mt-4">Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </Document>
+                </div>
+              ) : paper.filePath ? (
+                <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
+                  正在加载PDF…
+                </div>
+              ) : (
+                <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
+                  <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
+                    <div className="p-12">
+                      <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
+                      <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
+                      <div className="prose max-w-none font-serif leading-relaxed">
+                        <p className="mb-4 font-bold">Abstract</p>
+                        <p className="mb-8 italic text-gray-600">{paper.summary}</p>
+                        <p className="mb-4 font-bold">1. Introduction</p>
+                        <p>{paper.content}</p>
+                        <p className="mt-4">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+                        <p className="mt-4">Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
-            )}
+              )}
           </div>
-          <div className={viewMode === ReaderMode.MIND_MAP ? 'block h-full relative' : 'hidden'}>
-            {viewMode === ReaderMode.MIND_MAP ? (
-              <>
-                <React.Suspense
-                  fallback={
-                    <div className="w-full h-full flex items-center justify-center text-sm text-gray-400">
-                      正在加载思维导图...
-                    </div>
-                  }
-                >
-                  <LazyMindMap
-                    root={mindmapRoot}
-                    zoomScale={mindmapZoomScale}
-                    collapsedIds={collapsedMindmapIds}
-                    expandedNoteIds={expandedHighlightIds}
-                    offset={mindmapOffset}
-                    dropTarget={
-                      dragOverMindmapTarget
-                        ? {
-                            id: dragOverMindmapTarget.id,
-                            position: dragOverMindmapTarget.position
-                          }
-                        : null
-                    }
-                    draggingNoteId={draggingNoteId}
-                    selectedNodeId={activeMindmapNodeId}
-                    onLayoutStart={handleMindmapLayoutStart}
-                    onLayout={handleMindmapLayout}
-                    onNodeClick={handleMindMapNodeClick}
-                    onNodeDoubleClick={handleMindmapNodeDoubleClick}
-                    onNodeMouseDown={handleMindmapNodeMouseDown}
-                    onBackgroundMouseDown={handleMindmapMouseDown}
-                    onNodeToggleCollapse={handleMindmapToggleCollapse}
-                    toolbarColors={HIGHLIGHT_COLORS}
-                    onToolbarColorSelect={handleMindmapToolbarColor}
-                    onToolbarMakeChapter={handleMindmapToolbarMakeChapter}
-                    onToolbarClear={handleMindmapToolbarClear}
-                    editingNodeId={mindmapEditing?.nodeId || null}
-                    editingValue={mindmapEditValue}
-                    onEditChange={setMindmapEditValue}
-                    onEditCommit={commitMindmapEdit}
-                    onEditCancel={cancelMindmapEdit}
-                    onNoteToggleExpand={(noteId) =>
-                      setExpandedHighlightIds((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(noteId)) {
-                          next.delete(noteId);
-                        } else {
-                          next.add(noteId);
-                        }
-                        return next;
-                      })
-                    }
-                  />
-                </React.Suspense>
-                {SHOW_MINDMAP_DROP_DEBUG ? (
-                  <div className="pointer-events-none absolute top-2 right-2 z-40 rounded-md bg-black/75 text-white text-[10px] leading-4 px-2 py-1 font-mono">
-                    <div>{`hit: ${formatMindmapDropTarget(dragOverMindmapTarget)}`}</div>
-                    <div>{`last: ${mindmapDropLastHit}`}</div>
-                    <div className="mt-1 max-w-[460px] whitespace-pre-wrap break-all text-[9px] leading-3">
-                      {mindmapDropOrderDebug || 'order: -'}
-                    </div>
-                  </div>
-                ) : null}
-                {dragGhost ? (
-                  <div
-                    className="fixed z-40 pointer-events-none"
-                    style={{
-                      left: dragGhost.x,
-                      top: dragGhost.y,
-                      width: dragGhost.width,
-                      height: dragGhost.height,
-                      background: dragGhost.color
-                        ? 'rgba(255,255,255,0.9)'
-                        : 'rgba(255,255,255,0.9)',
-                      border: '1px solid rgba(148, 163, 184, 0.7)',
-                      borderRadius: 8,
-                      boxShadow: '0 8px 16px rgba(15, 23, 42, 0.15)',
-                      opacity: 0.7,
-                      padding: '6px 8px'
-                    }}
-                  >
-                    {(dragGhost.lines && dragGhost.lines.length
-                      ? dragGhost.lines
-                      : [dragGhost.text]
-                    ).map((line, index) => (
-                      <div
-                        key={`${dragGhost.id}-line-${index}`}
-                        style={{
-                          fontSize: dragGhost.fontSize ? `${dragGhost.fontSize}px` : '12px',
-                          lineHeight: dragGhost.lineHeight ? `${dragGhost.lineHeight}px` : '14px',
-                          color: '#111827'
-                        }}
-                      >
-                        {line}
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-              </>
-            ) : null}
-          </div>
-        </div>
       </div>
 
       {/* Resize Handle (Right) */}

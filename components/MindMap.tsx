@@ -23,14 +23,6 @@ const MINDMAP_EDIT_TOOLBAR_MIN_WIDTH = 320;
 const MINDMAP_EDIT_TOOLBAR_HEIGHT = 30;
 const MINDMAP_EDIT_TOOLBAR_GAP = 8;
 
-const toSolidColor = (fill: string) => {
-  const match = fill.match(/rgba?\(([^)]+)\)/);
-  if (!match) return fill;
-  const parts = match[1].split(',').map((part) => part.trim());
-  if (parts.length < 3) return fill;
-  return `rgb(${parts[0]}, ${parts[1]}, ${parts[2]})`;
-};
-
 const isManualMindmapNote = (note: any) => {
   if (!note) return false;
   if (note.source === 'manual') return true;
@@ -197,7 +189,8 @@ export const MindMap: React.FC<MindMapProps> = ({
     const handle = window.requestAnimationFrame(() => {
       if (editInputRef.current) {
         editInputRef.current.focus();
-        editInputRef.current.select();
+        const cursor = editInputRef.current.value.length;
+        editInputRef.current.setSelectionRange(cursor, cursor);
       }
     });
     return () => window.cancelAnimationFrame(handle);
@@ -439,17 +432,22 @@ export const MindMap: React.FC<MindMapProps> = ({
               const isManualNote = node.kind === 'note' && isManualMindmapNote(node.note);
               const isNormalChapter = node.kind === 'chapter' && Boolean(node.isNormalChapter);
               const useItalicNodeText = isManualNote || isNormalChapter;
-              const selectedStroke =
-                node.kind === 'note' && node.color
-                  ? toSolidColor(node.color)
-                  : '#94a3b8';
-              const resolvedFill = isEditing ? 'transparent' : isHovered ? '#e5e7eb' : fill;
+              const selectedFill = '#eff6ff';
+              const selectedStroke = '#bfdbfe';
+              const resolvedFill = isEditing
+                ? 'transparent'
+                : isSelected
+                  ? selectedFill
+                  : isHovered
+                    ? '#e5e7eb'
+                    : fill;
               const effectiveStroke = isEditing
                 ? 'transparent'
                 : isSelected
                   ? selectedStroke
                   : stroke;
-              const strokeWidth = isEditing ? 0 : isSelected ? 2 : 1;
+              const strokeWidth = isEditing ? 0 : isSelected ? 1.5 : 1;
+              const nodeTextFill = '#111827';
               const showActions = activeActionNodeId === node.id && !isEditing;
               const isDropInside =
                 Boolean(dropTarget && dropTarget.id === node.id && dropTarget.position === 'inside');
@@ -647,7 +645,7 @@ export const MindMap: React.FC<MindMapProps> = ({
                             onBlur={(event) => {
                               onEditCommit?.(node, event.currentTarget.value);
                             }}
-                            className="mt-2 w-full min-h-[44px] text-[11px] text-gray-600 bg-gray-50 rounded-md p-2 resize-none outline-none"
+                            className="mt-2 w-full min-h-[72px] text-[11px] text-gray-600 bg-gray-50 rounded-md p-2 resize-none outline-none border border-blue-300 ring-1 ring-blue-200 focus:border-blue-400 focus:ring-2 focus:ring-blue-300"
                             style={{
                               fontSize: `${node.fontSize}px`,
                               lineHeight: `${node.lineHeight}px`,
@@ -665,7 +663,7 @@ export const MindMap: React.FC<MindMapProps> = ({
                       dominantBaseline="hanging"
                       style={{
                         fontSize: node.fontSize,
-                        fill: '#111827',
+                        fill: nodeTextFill,
                         userSelect: 'none',
                         fontStyle: useItalicNodeText ? 'italic' : 'normal'
                       }}
@@ -689,7 +687,7 @@ export const MindMap: React.FC<MindMapProps> = ({
                         dominantBaseline="hanging"
                         style={{
                           fontSize: node.fontSize,
-                          fill: '#111827',
+                          fill: nodeTextFill,
                           userSelect: 'none',
                           fontStyle: useItalicNodeText ? 'italic' : 'normal'
                         }}

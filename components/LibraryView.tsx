@@ -572,8 +572,8 @@ const FolderItem: React.FC<FolderItemProps> = ({
           onSelectFolder(folder.id);
           if (!isExpanded) onToggleFolder(folder.id);
         }}
-        className={`group flex items-center px-2 py-1.5 text-sm cursor-pointer rounded-md select-none mx-2 mb-0.5
-          ${isSelected ? 'bg-blue-500 text-white' : 'text-gray-700 hover:bg-gray-200'}
+        className={`group flex items-center px-2 py-1.5 text-sm text-gray-700 cursor-pointer rounded-md select-none mx-2 mb-0.5
+          ${isSelected ? 'bg-blue-50 ring-1 ring-blue-200' : 'hover:bg-gray-200'}
           ${isDragOver ? 'bg-blue-100 ring-1 ring-blue-300 text-gray-800' : ''}`}
         style={{ paddingLeft: `${level * 16 + 8}px` }}
       >
@@ -591,12 +591,12 @@ const FolderItem: React.FC<FolderItemProps> = ({
         {folder.id === SYSTEM_FOLDER_TRASH_ID ? (
           <Trash2
             size={16}
-            className={`mr-2 ${isSelected ? 'text-white' : 'text-gray-400'}`}
+            className="mr-2 text-gray-400"
           />
         ) : (
           <FolderIcon
             size={16}
-            className={`mr-2 ${isSelected ? 'text-white' : 'text-blue-400'}`}
+            className="mr-2 text-blue-400"
             fill="currentColor"
             fillOpacity={0.2}
           />
