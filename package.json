@@ -9,7 +9,8 @@
     "electron": "electron .",
     "build": "vite build",
     "preview": "vite preview",
-    "pack:mac": "npm run build && electron-builder --mac"
+    "pack:mac": "npm run build && electron-builder --mac",
+    "pack:win": "npm run build && electron-builder --win"
   },
   "build": {
     "appId": "com.mindpaper.app",
@@ -29,6 +30,13 @@
         "zip"
       ],
       "identity": null
+    },
+    "win": {
+      "icon": "assets/mind-paper-v2.ico",
+      "target": [
+        "nsis",
+        "zip"
+      ]
     }
   },
   "dependencies": {
