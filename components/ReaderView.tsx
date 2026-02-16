@@ -24,7 +24,10 @@ import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
 import {
+  extractMethodWithAI,
   extractMetadataWithAI,
+  extractPdfFullText,
+  extractPdfMethodSection,
   extractPdfFirstPageMetadata,
   extractPdfFirstPageText,
   extractPdfMetadataFromTextItems
@@ -295,6 +298,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
   const [infoRefreshError, setInfoRefreshError] = useState('');
+  const [parsePdfWithAIEnabled, setParsePdfWithAIEnabled] = useState(false);
+  const [methodExpanded, setMethodExpanded] = useState(false);
+  const methodText = String(paper.method || '').trim();
+  const methodCanToggle = methodText.length > 180 || methodText.includes('\n');
+  const methodCollapsedStyle = {
+    display: '-webkit-box',
+    WebkitLineClamp: 3,
+    WebkitBoxOrient: 'vertical' as const,
+    overflow: 'hidden'
+  };
 
   const formatDateYmd = (value: string) => {
     const raw = String(value || '').trim();
@@ -542,6 +555,48 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     }
   };
 
+  const clearMindmapTransientInteractionState = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      if (dragNoteTimerRef.current) {
+        window.clearTimeout(dragNoteTimerRef.current);
+      }
+      if (dragChapterTimerRef.current) {
+        window.clearTimeout(dragChapterTimerRef.current);
+      }
+      if (tocDragNoteTimerRef.current) {
+        window.clearTimeout(tocDragNoteTimerRef.current);
+      }
+      if (tocDragChapterTimerRef.current) {
+        window.clearTimeout(tocDragChapterTimerRef.current);
+      }
+    }
+    dragNoteTimerRef.current = null;
+    dragChapterTimerRef.current = null;
+    tocDragNoteTimerRef.current = null;
+    tocDragChapterTimerRef.current = null;
+
+    dragNoteRef.current = null;
+    dragChapterRef.current = null;
+    tocDragNoteRef.current = null;
+    tocDragChapterRef.current = null;
+
+    dragNoteTriggeredRef.current = false;
+    dragChapterTriggeredRef.current = false;
+    tocDragNoteTriggeredRef.current = false;
+    tocDragChapterTriggeredRef.current = false;
+
+    dragOverMindmapTargetRef.current = null;
+    setDraggingNoteId(null);
+    setDraggingChapterId(null);
+    setDraggingTocNoteId(null);
+    setDraggingTocChapterId(null);
+    setDragOverMindmapTarget(null);
+    setDragOverTocId(null);
+    setDragGhost(null);
+    setIsMindmapPanning(false);
+    mindmapPanRef.current = null;
+  }, []);
+
   const switchViewMode = (nextMode: ReaderMode) => {
     if (nextMode === viewMode) return;
     if (viewMode === ReaderMode.PDF) {
@@ -549,9 +604,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       if (container) {
         pdfScrollTopRef.current = container.scrollTop;
       }
+    } else {
+      clearMindmapTransientInteractionState();
     }
     setViewMode(nextMode);
   };
+
+  useEffect(() => {
+    if (viewMode !== ReaderMode.MIND_MAP) {
+      clearMindmapTransientInteractionState();
+    }
+  }, [viewMode, clearMindmapTransientInteractionState]);
 
   useEffect(() => {
     const handleMove = (e: MouseEvent) => {
@@ -865,11 +928,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
         const settings = await window.electronAPI.settingsGet();
         parseWithAI = Boolean(settings?.parsePdfWithAI);
+        setParsePdfWithAIEnabled(parseWithAI);
         canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
+      } else {
+        setParsePdfWithAIEnabled(false);
       }
 
       const fallbackTitle = paper.title || 'Document';
       let updates: Partial<Paper> = {};
+      let methodBuffer: ArrayBuffer | null = null;
 
       if (parseWithAI && canUseAI) {
         let firstPageText = '';
@@ -897,10 +964,49 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           ...(aiMetadata.title ? { title: aiMetadata.title } : {}),
           ...(aiMetadata.author ? { author: aiMetadata.author } : {}),
           ...(aiMetadata.summary ? { summary: aiMetadata.summary } : {}),
-          ...(aiMetadata.keywords ? { keywords: aiMetadata.keywords } : {}),
+          keywords: Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [],
           ...(aiMetadata.publishedDate ? { date: aiMetadata.publishedDate } : {}),
           ...(aiMetadata.publisher ? { publisher: aiMetadata.publisher } : {})
         };
+        methodBuffer = getPdfBufferForParsing();
+        if (!methodBuffer && typeof pdfFile === 'string') {
+          const response = await fetch(pdfFile);
+          methodBuffer = await response.arrayBuffer();
+        }
+
+        if (Object.keys(updates).length) {
+          onUpdatePaper(paper.id, updates);
+        }
+
+        if (methodBuffer) {
+          void (async () => {
+            try {
+              const methodRegion = await extractPdfMethodSection(
+                methodBuffer as ArrayBuffer,
+                String(
+                  updates.title ||
+                    paper.title ||
+                    fallbackTitle
+                )
+              );
+              const fullText = methodRegion
+                ? ''
+                : await extractPdfFullText(methodBuffer as ArrayBuffer, {
+                    maxChars: 240000
+                  });
+              const method = await extractMethodWithAI(
+                methodRegion || fullText,
+                window.electronAPI!.askAI!
+              );
+              if (method) {
+                onUpdatePaper(paper.id, { method });
+              }
+            } catch (error) {
+              console.warn('AI方法提取失败:', error);
+            }
+          })();
+        }
+        return;
       } else {
         let parsed: { metadata: any } | null = null;
         if (pdfDocRef.current) {
@@ -942,7 +1048,33 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   useEffect(() => {
+    let cancelled = false;
+    const loadParseSetting = async () => {
+      if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
+        if (!cancelled) setParsePdfWithAIEnabled(false);
+        return;
+      }
+      try {
+        const settings = await window.electronAPI.settingsGet();
+        if (!cancelled) {
+          setParsePdfWithAIEnabled(Boolean(settings?.parsePdfWithAI));
+        }
+      } catch {
+        if (!cancelled) setParsePdfWithAIEnabled(false);
+      }
+    };
+    void loadParseSetting();
+    return () => {
+      cancelled = true;
+    };
+  }, [paper.id]);
+
+  useEffect(() => {
     pdfDocRef.current = null;
+  }, [paper.id]);
+
+  useEffect(() => {
+    setMethodExpanded(false);
   }, [paper.id]);
 
   const clearSelection = () => {
@@ -1790,6 +1922,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     event: React.MouseEvent<SVGGElement>
   ) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
+    clearMindmapTransientInteractionState();
     if (node.kind === 'note' && node.note) {
       const note = node.note as HighlightItem;
       if (note.isChapterTitle) return;
@@ -1825,6 +1958,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     item: MindMapNode,
     event: React.MouseEvent<HTMLDivElement>
   ) => {
+    clearMindmapTransientInteractionState();
     if (Date.now() < tocSuppressClickUntilRef.current) return;
     if (tocDragChapterTriggeredRef.current) return;
     if (item.kind !== 'chapter') return;
@@ -1844,6 +1978,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     note: HighlightItem,
     event: React.MouseEvent<HTMLButtonElement>
   ) => {
+    clearMindmapTransientInteractionState();
     if (Date.now() < tocSuppressClickUntilRef.current) return;
     if (tocDragNoteTriggeredRef.current) return;
     if (note.isChapterTitle) return;
@@ -2627,6 +2762,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   ) => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
     if (event.button !== 0) return;
+    if (event.detail >= 2) {
+      clearMindmapTransientInteractionState();
+      return;
+    }
     setActiveMindmapNodeId(node.id);
     const target = event.currentTarget;
     const rect = target.getBoundingClientRect();
@@ -2712,6 +2851,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     event: React.MouseEvent<HTMLButtonElement>
   ) => {
     if (event.button !== 0) return;
+    if (event.detail >= 2) {
+      clearMindmapTransientInteractionState();
+      return;
+    }
     event.preventDefault();
     const target = event.currentTarget;
     const rect = target.getBoundingClientRect();
@@ -2752,6 +2895,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     event: React.MouseEvent<HTMLDivElement>
   ) => {
     if (event.button !== 0) return;
+    if (event.detail >= 2) {
+      clearMindmapTransientInteractionState();
+      return;
+    }
     if (item.kind !== 'chapter') return;
     if (!customChapterIdSet.has(item.id)) return;
     event.preventDefault();
@@ -4650,7 +4797,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                </div>
                <textarea
                  ref={tocEditInputRef}
-                 autoFocus
                  data-toc-editing-node="true"
                  value={mindmapEditValue}
                  onChange={(event) => setMindmapEditValue(event.target.value)}
@@ -4801,7 +4947,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                               </div>
                               <textarea
                                 ref={tocEditInputRef}
-                                autoFocus
                                 data-toc-editing-node="true"
                                 value={mindmapEditValue}
                                 onChange={(event) => setMindmapEditValue(event.target.value)}
@@ -5691,6 +5836,38 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布机构</div>
                     <div>{paper.publisher || '-'}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-400 text-xs uppercase mb-1">方法</div>
+                    {methodText ? (
+                      <>
+                        <div
+                          className="text-gray-700 break-words"
+                          style={
+                            methodExpanded
+                              ? { whiteSpace: 'pre-wrap' as const }
+                              : methodCollapsedStyle
+                          }
+                        >
+                          {methodText}
+                        </div>
+                        {methodCanToggle ? (
+                          <button
+                            type="button"
+                            onClick={() => setMethodExpanded((prev) => !prev)}
+                            className="mt-1 text-xs text-blue-600 hover:text-blue-700"
+                          >
+                            {methodExpanded ? '收起' : '展开'}
+                          </button>
+                        ) : null}
+                      </>
+                    ) : !parsePdfWithAIEnabled ? (
+                      <div className="text-xs text-blue-600">
+                        请在设置中开启“AI解析”，然后点击右上角“重新解析”。
+                      </div>
+                    ) : (
+                      <div>-</div>
+                    )}
                   </div>
                   {infoRefreshError ? (
                     <div className="text-xs text-red-500">{infoRefreshError}</div>

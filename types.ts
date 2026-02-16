@@ -14,6 +14,7 @@ export interface Paper {
   previousFolderId?: string;
   summary: string;
   content: string; // Mock content
+  method?: string;
   keywords: string[];
   publisher?: string;
   fileUrl?: string;

@@ -6,7 +6,10 @@ import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH
 import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
+  extractMethodWithAI,
   extractMetadataWithAI,
+  extractPdfFullText,
+  extractPdfMethodSection,
   extractPdfFirstPageMetadata,
   extractPdfFirstPageText
 } from './services/pdfMetadataService';
@@ -180,7 +183,7 @@ const App: React.FC = () => {
           parsedTitle = aiMetadata.title || fallbackTitle;
           parsedAuthor = aiMetadata.author || 'Unknown';
           parsedSummary = aiMetadata.summary || 'No abstract extracted.';
-          parsedKeywords = aiMetadata.keywords || [];
+          parsedKeywords = Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [];
           parsedDate = aiMetadata.publishedDate || parsedDate;
           parsedPublisher = aiMetadata.publisher || parsedPublisher;
           updateParsedPaper({
@@ -191,31 +194,55 @@ const App: React.FC = () => {
             date: parsedDate,
             publisher: parsedPublisher
           });
+
+          void (async () => {
+            try {
+              const methodRegion = await extractPdfMethodSection(
+                fileData,
+                parsedTitle || fallbackTitle
+              );
+              const methodSource =
+                methodRegion ||
+                (await extractPdfFullText(fileData, { maxChars: 240000 }));
+              const method = await extractMethodWithAI(methodSource, window.electronAPI!.askAI!);
+              if (method) {
+                updateParsedPaper({ method });
+              }
+            } catch (error) {
+              console.warn('AI方法提取失败:', error);
+            }
+          })();
           return;
         } catch (error) {
           console.warn('AI解析失败，回退传统解析:', error);
+          parseWithAI = false;
         }
       }
 
-      try {
-        const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
-        parsedTitle = parsed.metadata.title || fallbackTitle;
-        parsedAuthor = parsed.metadata.author || 'Unknown';
-        parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
-        parsedKeywords = parsed.metadata.keywords || [];
-        parsedDate = parsed.metadata.publishedDate || parsedDate;
-        parsedPublisher = parsed.metadata.publisher || parsedPublisher;
-      } catch (error) {
-        console.warn('PDF首页解析失败，使用默认信息:', error);
+      if (!parseWithAI || !canUseAI) {
+        try {
+          const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
+          parsedTitle = parsed.metadata.title || fallbackTitle;
+          parsedAuthor = parsed.metadata.author || 'Unknown';
+          parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
+          parsedKeywords = parsed.metadata.keywords || [];
+          parsedDate = parsed.metadata.publishedDate || parsedDate;
+          parsedPublisher = parsed.metadata.publisher || parsedPublisher;
+        } catch (error) {
+          console.warn('PDF首页解析失败，使用默认信息:', error);
+        }
       }
-      updateParsedPaper({
+
+      const updates: Partial<Paper> = {
         title: parsedTitle,
         author: parsedAuthor,
         summary: parsedSummary,
         keywords: parsedKeywords,
         date: parsedDate,
         publisher: parsedPublisher
-      });
+      };
+
+      updateParsedPaper(updates);
     })();
 
     return pendingPaper;
