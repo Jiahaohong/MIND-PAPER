@@ -380,7 +380,10 @@ const getQdrantBinaryName = () => {
 
 const resolveQdrantCandidates = (localTarget, storagePath) => {
   const candidates = [];
-  const devLocalPath = path.join(PROJECT_ROOT, 'resources', 'qdrant', 'qdrant-macos');
+  const qdrantBinName = getQdrantBinaryName();
+  const envBin = String(process.env.MINDPAPER_QDRANT_BIN || '').trim();
+  const packagedPath = path.join(process.resourcesPath || '', 'qdrant', qdrantBinName);
+  const devLocalPath = path.join(PROJECT_ROOT, 'resources', 'qdrant', qdrantBinName);
   const envOverrides = {
     QDRANT__SERVICE__HOST: '127.0.0.1',
     QDRANT__SERVICE__HTTP_PORT: String(localTarget.port),
@@ -393,12 +396,13 @@ const resolveQdrantCandidates = (localTarget, storagePath) => {
     candidates.push({ command, args: [], envOverrides, isPath });
   };
 
+  appendCandidates(envBin, true);
+  appendCandidates(packagedPath, true);
   appendCandidates(devLocalPath, true);
   return candidates;
 };
 
 const ensureQdrantReady = async () => {
-  if (process.platform !== 'darwin') return true;
   const qdrantUrl = getQdrantUrl();
   if (await isQdrantReachable(qdrantUrl, 1200)) return true;
   if (qdrantBootPromise) return qdrantBootPromise;
@@ -444,6 +448,7 @@ const ensureQdrantReady = async () => {
     for (const candidate of candidates) {
       let proc = null;
       try {
+        console.log(`[vector-index] trying qdrant binary: ${candidate.command}`);
         if (candidate.isPath) {
           try {
             await fs.access(candidate.command);
