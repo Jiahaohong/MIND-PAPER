@@ -43,6 +43,35 @@ declare global {
         parsePdfWithAI?: boolean;
         libraryPath?: string;
       }>;
+      vector?: {
+        status?: () => Promise<{
+          ok: boolean;
+          qdrantUrl?: string;
+          qdrantStoragePath?: string;
+          collection?: string;
+          vectorFields?: string[];
+          vectorDim?: number;
+          pointCount?: number;
+          error?: string;
+        }>;
+        debugQdrantStartup?: () => Promise<{
+          ok: boolean;
+          qdrantUrl?: string;
+          collections?: string[];
+          error?: string;
+        }>;
+        debugDumpQdrant?: () => Promise<{
+          ok: boolean;
+          qdrantUrl?: string;
+          collections?: Array<{
+            name: string;
+            pointsCount: number;
+            vectorNames: string[];
+            samplePoints: Array<{ id: string; payloadKeys: string[] }>;
+          }>;
+          error?: string;
+        }>;
+      };
       library?: {
         getFolders?: () => Promise<any>;
         saveFolders?: (payload: any) => Promise<{ ok: boolean }>;

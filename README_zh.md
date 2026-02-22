@@ -51,4 +51,29 @@ https://github.com/user-attachments/assets/e98cd7e1-49dd-458c-854f-d9679c903ae4
 
 默认使用CNKI翻译。如果配置了AI API可切换为AI翻译。
 
+# 本地多字段向量索引（title/author/summary/method）
 
+已接入本地向量索引构建，索引字段为：
+
+- `title`
+- `author`
+- `summary`
+- `method`
+
+运行前请确保：
+
+1. 本地已启动 Qdrant（默认 `http://127.0.0.1:6333`）
+2. 本机可执行 `python3`
+3. Python 环境已安装 `sentence-transformers`
+
+主进程会在启动时初始化集合并基于 `papers.json` 做首轮同步；后续 `saveSnapshot/savePapers` 会自动增量同步。
+
+## 打包内置 Qdrant（mac 自动拉起）
+
+可将 Qdrant 二进制放入：
+
+- `resources/qdrant/qdrant-macos`
+- `resources/qdrant/qdrant-win.exe`
+- `resources/qdrant/qdrant-linux`
+
+打包后会被复制到 `Resources/qdrant/...`，应用首次打开时会自动尝试拉起本地 Qdrant。

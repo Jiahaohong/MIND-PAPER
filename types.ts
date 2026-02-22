@@ -10,6 +10,8 @@ export interface Paper {
   title: string;
   author: string;
   date: string;
+  addedDate?: string;
+  uploadedAt?: number;
   folderId: string;
   previousFolderId?: string;
   summary: string;

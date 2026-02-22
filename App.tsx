@@ -37,6 +37,8 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [vectorDebugLoading, setVectorDebugLoading] = useState(false);
+  const [vectorDebugMessage, setVectorDebugMessage] = useState('');
 
   const activePaper = openPapers.find(p => p.id === activePaperId);
   const MAX_FULL_PDF_CACHE = 20;
@@ -51,6 +53,17 @@ const App: React.FC = () => {
       (folder) => folder.id !== SYSTEM_FOLDER_ALL_ID && folder.id !== SYSTEM_FOLDER_TRASH_ID
     );
     return [...systemFolders, ...filtered];
+  };
+
+  const createPaperId = () => {
+    if (typeof globalThis !== 'undefined' && globalThis.crypto?.randomUUID) {
+      return globalThis.crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
+      const random = Math.floor(Math.random() * 16);
+      const value = char === 'x' ? random : (random & 0x3) | 0x8;
+      return value.toString(16);
+    });
   };
 
   // Handlers
@@ -110,7 +123,8 @@ const App: React.FC = () => {
     }
 
     const fileData = await file.arrayBuffer();
-    const id = `p-${Date.now()}`;
+    const localPaperId = createPaperId();
+    let id = localPaperId;
     const fallbackTitle = file.name.replace(/\.pdf$/i, '');
     const formatNowDate = () => {
       const now = new Date();
@@ -119,11 +133,13 @@ const App: React.FC = () => {
       const day = now.getDate();
       return `${year}年${month}月${day}日`;
     };
+    const nowIso = new Date().toISOString();
+    const nowTs = Date.now();
     const assignedFolderId =
       folderId === SYSTEM_FOLDER_ALL_ID ? SYSTEM_FOLDER_ALL_ID : folderId;
     let filePath: string | undefined;
     if (typeof window !== 'undefined' && window.electronAPI?.library?.savePdf) {
-      const response = await window.electronAPI.library.savePdf({ paperId: id, data: fileData });
+      const response = await window.electronAPI.library.savePdf({ paperId: localPaperId, data: fileData });
       if (response?.ok && response.filePath) {
         filePath = response.filePath;
       }
@@ -134,6 +150,8 @@ const App: React.FC = () => {
       title: fallbackTitle,
       author: 'Unknown',
       date: formatNowDate(),
+      addedDate: nowIso,
+      uploadedAt: nowTs,
       folderId: assignedFolderId,
       summary: 'Uploaded PDF',
       content: '',
@@ -163,6 +181,7 @@ const App: React.FC = () => {
       let parsedKeywords: string[] = [];
       let parsedDate = formatNowDate();
       let parsedPublisher = '';
+      let parsedMethod = '';
       let parseWithAI = false;
       let canUseAI = false;
       if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
@@ -178,41 +197,30 @@ const App: React.FC = () => {
 
       if (parseWithAI && canUseAI) {
         try {
-          const firstPageText = await extractPdfFirstPageText(fileData);
-          const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+          const metadataTask = (async () => {
+            const firstPageText = await extractPdfFirstPageText(fileData);
+            return extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+          })();
+          const methodTask = (async () => {
+            try {
+              const methodRegion = await extractPdfMethodSection(fileData, fallbackTitle);
+              const methodSource =
+                methodRegion ||
+                (await extractPdfFullText(fileData, { maxChars: 240000 }));
+              return (await extractMethodWithAI(methodSource, window.electronAPI!.askAI!)) || '';
+            } catch (error) {
+              console.warn('AI方法提取失败:', error);
+              return '';
+            }
+          })();
+          const aiMetadata = await metadataTask;
           parsedTitle = aiMetadata.title || fallbackTitle;
           parsedAuthor = aiMetadata.author || 'Unknown';
           parsedSummary = aiMetadata.summary || 'No abstract extracted.';
           parsedKeywords = Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [];
           parsedDate = aiMetadata.publishedDate || parsedDate;
           parsedPublisher = aiMetadata.publisher || parsedPublisher;
-          updateParsedPaper({
-            title: parsedTitle,
-            author: parsedAuthor,
-            summary: parsedSummary,
-            keywords: parsedKeywords,
-            date: parsedDate,
-            publisher: parsedPublisher
-          });
-
-          void (async () => {
-            try {
-              const methodRegion = await extractPdfMethodSection(
-                fileData,
-                parsedTitle || fallbackTitle
-              );
-              const methodSource =
-                methodRegion ||
-                (await extractPdfFullText(fileData, { maxChars: 240000 }));
-              const method = await extractMethodWithAI(methodSource, window.electronAPI!.askAI!);
-              if (method) {
-                updateParsedPaper({ method });
-              }
-            } catch (error) {
-              console.warn('AI方法提取失败:', error);
-            }
-          })();
-          return;
+          parsedMethod = await methodTask;
         } catch (error) {
           console.warn('AI解析失败，回退传统解析:', error);
           parseWithAI = false;
@@ -239,7 +247,8 @@ const App: React.FC = () => {
         summary: parsedSummary,
         keywords: parsedKeywords,
         date: parsedDate,
-        publisher: parsedPublisher
+        publisher: parsedPublisher,
+        method: parsedMethod
       };
 
       updateParsedPaper(updates);
@@ -485,7 +494,6 @@ const App: React.FC = () => {
       }
       return null;
     };
-    const fallbackFolder = folders.find((folder) => !isSystemFolderId(folder.id));
     setPapers((prev) =>
       prev.map((paper) => {
         if (paper.id !== paperId) return paper;
@@ -493,9 +501,7 @@ const App: React.FC = () => {
           ? paper.previousFolderId
           : null;
         const targetId =
-          (preferredId && findFolderById(folders, preferredId)?.id) ||
-          fallbackFolder?.id ||
-          SYSTEM_FOLDER_ALL_ID;
+          (preferredId && findFolderById(folders, preferredId)?.id) || SYSTEM_FOLDER_ALL_ID;
         return { ...paper, folderId: targetId, previousFolderId: undefined };
       })
     );
@@ -549,6 +555,7 @@ const App: React.FC = () => {
 
   const loadSettings = async () => {
     setSettingsError('');
+    setVectorDebugMessage('');
     if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
       setSettingsError('设置仅桌面端可用');
       return;
@@ -582,6 +589,50 @@ const App: React.FC = () => {
       setSettingsError(error?.message || '设置保存失败');
     } finally {
       setSettingsLoading(false);
+    }
+  };
+
+  const handleDebugQdrantStartup = async () => {
+    setVectorDebugMessage('');
+    if (typeof window === 'undefined' || !window.electronAPI?.vector?.debugQdrantStartup) {
+      setVectorDebugMessage('当前环境不支持Qdrant调试');
+      return;
+    }
+    setVectorDebugLoading(true);
+    try {
+      const result = await window.electronAPI.vector.debugQdrantStartup();
+      if (!result?.ok) {
+        setVectorDebugMessage(`Qdrant启动检查失败: ${result?.error || 'unknown error'}`);
+        return;
+      }
+      const count = result.collections?.length || 0;
+      setVectorDebugMessage(`Qdrant启动成功，collections=${count}`);
+    } catch (error: any) {
+      setVectorDebugMessage(error?.message || 'Qdrant启动检查失败');
+    } finally {
+      setVectorDebugLoading(false);
+    }
+  };
+
+  const handleDebugDumpQdrant = async () => {
+    setVectorDebugMessage('');
+    if (typeof window === 'undefined' || !window.electronAPI?.vector?.debugDumpQdrant) {
+      setVectorDebugMessage('当前环境不支持Qdrant信息调试');
+      return;
+    }
+    setVectorDebugLoading(true);
+    try {
+      const result = await window.electronAPI.vector.debugDumpQdrant();
+      if (!result?.ok) {
+        setVectorDebugMessage(`打印Qdrant信息失败: ${result?.error || 'unknown error'}`);
+        return;
+      }
+      const collectionCount = Array.isArray(result.collections) ? result.collections.length : 0;
+      setVectorDebugMessage(`已在命令行打印Qdrant信息，collections=${collectionCount}`);
+    } catch (error: any) {
+      setVectorDebugMessage(error?.message || '打印Qdrant信息失败');
+    } finally {
+      setVectorDebugLoading(false);
     }
   };
 
@@ -731,7 +782,7 @@ const App: React.FC = () => {
               </div>
 
               <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">模型</label>
+                <label className="text-xs text-gray-500">OpenAI模型</label>
                 <input
                   type="text"
                   value={settingsForm.model}
@@ -741,6 +792,31 @@ const App: React.FC = () => {
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="gpt-3.5-turbo"
                 />
+              </div>
+
+              <div className="grid grid-cols-1 gap-2">
+                <label className="text-xs text-gray-500">Qdrant调试</label>
+                <div className="mt-1 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDebugQdrantStartup}
+                    disabled={vectorDebugLoading}
+                    className="px-2 py-1 rounded-md text-[11px] border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+                  >
+                    检查Qdrant启动
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDebugDumpQdrant}
+                    disabled={vectorDebugLoading}
+                    className="px-2 py-1 rounded-md text-[11px] border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
+                  >
+                    打印Qdrant信息
+                  </button>
+                </div>
+                {vectorDebugMessage ? (
+                  <div className="text-[11px] text-gray-500">{vectorDebugMessage}</div>
+                ) : null}
               </div>
 
               <div className="grid grid-cols-1 gap-2">

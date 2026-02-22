@@ -298,16 +298,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
   const [infoRefreshError, setInfoRefreshError] = useState('');
-  const [parsePdfWithAIEnabled, setParsePdfWithAIEnabled] = useState(false);
-  const [methodExpanded, setMethodExpanded] = useState(false);
-  const methodText = String(paper.method || '').trim();
-  const methodCanToggle = methodText.length > 180 || methodText.includes('\n');
-  const methodCollapsedStyle = {
-    display: '-webkit-box',
-    WebkitLineClamp: 3,
-    WebkitBoxOrient: 'vertical' as const,
-    overflow: 'hidden'
-  };
 
   const formatDateYmd = (value: string) => {
     const raw = String(value || '').trim();
@@ -928,10 +918,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
         const settings = await window.electronAPI.settingsGet();
         parseWithAI = Boolean(settings?.parsePdfWithAI);
-        setParsePdfWithAIEnabled(parseWithAI);
         canUseAI = Boolean(settings?.apiKey?.trim()) && Boolean(window.electronAPI?.askAI);
-      } else {
-        setParsePdfWithAIEnabled(false);
       }
 
       const fallbackTitle = paper.title || 'Document';
@@ -1048,33 +1035,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   };
 
   useEffect(() => {
-    let cancelled = false;
-    const loadParseSetting = async () => {
-      if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
-        if (!cancelled) setParsePdfWithAIEnabled(false);
-        return;
-      }
-      try {
-        const settings = await window.electronAPI.settingsGet();
-        if (!cancelled) {
-          setParsePdfWithAIEnabled(Boolean(settings?.parsePdfWithAI));
-        }
-      } catch {
-        if (!cancelled) setParsePdfWithAIEnabled(false);
-      }
-    };
-    void loadParseSetting();
-    return () => {
-      cancelled = true;
-    };
-  }, [paper.id]);
-
-  useEffect(() => {
     pdfDocRef.current = null;
-  }, [paper.id]);
-
-  useEffect(() => {
-    setMethodExpanded(false);
   }, [paper.id]);
 
   const clearSelection = () => {
@@ -5836,38 +5797,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布机构</div>
                     <div>{paper.publisher || '-'}</div>
-                  </div>
-                  <div>
-                    <div className="text-gray-400 text-xs uppercase mb-1">方法</div>
-                    {methodText ? (
-                      <>
-                        <div
-                          className="text-gray-700 break-words"
-                          style={
-                            methodExpanded
-                              ? { whiteSpace: 'pre-wrap' as const }
-                              : methodCollapsedStyle
-                          }
-                        >
-                          {methodText}
-                        </div>
-                        {methodCanToggle ? (
-                          <button
-                            type="button"
-                            onClick={() => setMethodExpanded((prev) => !prev)}
-                            className="mt-1 text-xs text-blue-600 hover:text-blue-700"
-                          >
-                            {methodExpanded ? '收起' : '展开'}
-                          </button>
-                        ) : null}
-                      </>
-                    ) : !parsePdfWithAIEnabled ? (
-                      <div className="text-xs text-blue-600">
-                        请在设置中开启“AI解析”，然后点击右上角“重新解析”。
-                      </div>
-                    ) : (
-                      <div>-</div>
-                    )}
                   </div>
                   {infoRefreshError ? (
                     <div className="text-xs text-red-500">{infoRefreshError}</div>

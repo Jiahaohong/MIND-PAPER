@@ -28,4 +28,8 @@ dist
 release
 tmp
 
+.qdrant-initialized
 Library/
+MindPaperLibrary/
+snapshots/
+build/

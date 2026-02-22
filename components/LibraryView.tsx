@@ -918,6 +918,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const visiblePapers = selectedFolderId ? getFolderPapers(selectedFolderId) : [];
   const parseUploadTime = (paper: Paper) => {
+    const uploadedAt = Number(paper.uploadedAt || 0);
+    if (Number.isFinite(uploadedAt) && uploadedAt > 0) return uploadedAt;
+    const addedDateRaw = String(paper.addedDate || '').trim();
+    if (addedDateRaw) {
+      const parsed = Date.parse(addedDateRaw);
+      if (Number.isFinite(parsed)) return parsed;
+      const zhMatch = addedDateRaw.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
+      if (zhMatch) {
+        return new Date(
+          Number(zhMatch[1]),
+          Number(zhMatch[2]) - 1,
+          Number(zhMatch[3])
+        ).getTime();
+      }
+    }
     const match = /^p-(\d+)/.exec(paper.id || '');
     if (match?.[1]) {
       const ts = Number(match[1]);
