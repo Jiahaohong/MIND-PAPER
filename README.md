@@ -3,13 +3,9 @@
 **Read this in other languages:  [中文](README_zh.md).**
 
 # News！
-The brand new v1.0.0 version is here! 
+The brand new v2.0.0 version is here! 
 
-More refined interface!
-
-Smoother operation!
-
-More immersive reading experience!
+The backend uses the QDrant vector database, supporting natural language literature retrieval with LLM!
 
 
 # Main Functions
