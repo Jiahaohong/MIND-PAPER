@@ -24,13 +24,12 @@ import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
 import {
-  extractMethodWithAI,
   extractMetadataWithAI,
   extractPdfFullText,
-  extractPdfMethodSection,
   extractPdfFirstPageMetadata,
   extractPdfFirstPageText,
-  extractPdfMetadataFromTextItems
+  extractPdfMetadataFromTextItems,
+  rewriteSummaryWithAI
 } from '../services/pdfMetadataService';
 import {
   buildMindmapStateV2FromOutline,
@@ -298,6 +297,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
   const [infoRefreshError, setInfoRefreshError] = useState('');
+  const logProgress = async (stage: string, paperId?: string) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.logProgress) return;
+    try {
+      await window.electronAPI.logProgress({ stage, paperId });
+    } catch {
+      // ignore progress logging errors
+    }
+  };
 
   const formatDateYmd = (value: string) => {
     const raw = String(value || '').trim();
@@ -913,6 +920,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     setInfoRefreshing(true);
     setInfoRefreshError('');
     try {
+      await logProgress('开始解析基本信息', paper.id);
       let parseWithAI = false;
       let canUseAI = false;
       if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
@@ -923,7 +931,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
 
       const fallbackTitle = paper.title || 'Document';
       let updates: Partial<Paper> = {};
-      let methodBuffer: ArrayBuffer | null = null;
+      let parseBuffer: ArrayBuffer | null = null;
 
       if (parseWithAI && canUseAI) {
         let firstPageText = '';
@@ -947,53 +955,46 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           throw new Error('无法读取PDF首页内容');
         }
         const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
+        const originalAbstract = String(aiMetadata.summary || paper.abstract || paper.summary || '').trim();
         updates = {
           ...(aiMetadata.title ? { title: aiMetadata.title } : {}),
           ...(aiMetadata.author ? { author: aiMetadata.author } : {}),
-          ...(aiMetadata.summary ? { summary: aiMetadata.summary } : {}),
+          ...(originalAbstract ? { summary: originalAbstract } : {}),
+          ...(originalAbstract ? { abstract: originalAbstract } : {}),
           keywords: Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [],
           ...(aiMetadata.publishedDate ? { date: aiMetadata.publishedDate } : {}),
           ...(aiMetadata.publisher ? { publisher: aiMetadata.publisher } : {})
         };
-        methodBuffer = getPdfBufferForParsing();
-        if (!methodBuffer && typeof pdfFile === 'string') {
+        await logProgress('完成解析基本信息', paper.id);
+        parseBuffer = getPdfBufferForParsing();
+        if (!parseBuffer && typeof pdfFile === 'string') {
           const response = await fetch(pdfFile);
-          methodBuffer = await response.arrayBuffer();
+          parseBuffer = await response.arrayBuffer();
         }
 
-        if (Object.keys(updates).length) {
-          onUpdatePaper(paper.id, updates);
-        }
-
-        if (methodBuffer) {
-          void (async () => {
-            try {
-              const methodRegion = await extractPdfMethodSection(
-                methodBuffer as ArrayBuffer,
-                String(
-                  updates.title ||
-                    paper.title ||
-                    fallbackTitle
-                )
-              );
-              const fullText = methodRegion
-                ? ''
-                : await extractPdfFullText(methodBuffer as ArrayBuffer, {
-                    maxChars: 240000
-                  });
-              const method = await extractMethodWithAI(
-                methodRegion || fullText,
+        if (parseBuffer && originalAbstract) {
+          try {
+            await logProgress('开始重写摘要', paper.id);
+            const fullText = await extractPdfFullText(parseBuffer as ArrayBuffer, {
+              maxChars: 260000
+            });
+            if (fullText) {
+              const rewrittenSummary = await rewriteSummaryWithAI(
+                {
+                  originalAbstract,
+                  fullText
+                },
                 window.electronAPI!.askAI!
               );
-              if (method) {
-                onUpdatePaper(paper.id, { method });
+              if (rewrittenSummary) {
+                updates.summary = rewrittenSummary;
               }
-            } catch (error) {
-              console.warn('AI方法提取失败:', error);
             }
-          })();
+            await logProgress('完成重写摘要', paper.id);
+          } catch (error) {
+            console.warn('重写摘要失败，保留原摘要:', error);
+          }
         }
-        return;
       } else {
         let parsed: { metadata: any } | null = null;
         if (pdfDocRef.current) {
@@ -1018,10 +1019,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           ...(meta.title ? { title: meta.title } : {}),
           ...(meta.author ? { author: meta.author } : {}),
           ...(meta.summary ? { summary: meta.summary } : {}),
+          ...(meta.summary ? { abstract: meta.summary } : {}),
           ...(meta.keywords ? { keywords: meta.keywords } : {}),
           ...(meta.publishedDate ? { date: meta.publishedDate } : {}),
           ...(meta.publisher ? { publisher: meta.publisher } : {})
         };
+        await logProgress('完成解析基本信息', paper.id);
       }
 
       if (Object.keys(updates).length) {
@@ -1194,6 +1197,27 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     return outlineRootId || `outline-root-${paper.id}`;
   };
 
+  const getOrderForPreFirstNativeHighlight = (
+    chapterId: string,
+    pageIndex: number,
+    topRatio: number
+  ) => {
+    if (!chapterId || chapterId !== outlineRootId) return undefined;
+    const rootNode = outlineDisplay[0];
+    const firstNativeRootChild = (rootNode?.items || []).find((node) => !node?.isCustom);
+    if (!firstNativeRootChild || typeof firstNativeRootChild.pageIndex !== 'number') {
+      return undefined;
+    }
+    const firstTopRatio =
+      typeof firstNativeRootChild.topRatio === 'number' ? firstNativeRootChild.topRatio : 0;
+    const isBeforeFirstNative =
+      pageIndex < firstNativeRootChild.pageIndex ||
+      (pageIndex === firstNativeRootChild.pageIndex &&
+        topRatio + CHAPTER_START_TOLERANCE < firstTopRatio);
+    if (!isBeforeFirstNative) return undefined;
+    return getCombinedOrderValueBefore(outlineRootId, 'node', firstNativeRootChild.id);
+  };
+
   const buildHighlightFromSelection = (
     color: string,
     options: Partial<HighlightItem> = {}
@@ -1220,7 +1244,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     } as HighlightItem;
     let nextOrder = base.order;
     if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
-      nextOrder = getCombinedOrderValue(base.chapterId);
+      const preFirstNativeOrder = getOrderForPreFirstNativeHighlight(
+        base.chapterId,
+        selectionInfo.pageIndex,
+        topRatio
+      );
+      nextOrder =
+        typeof preFirstNativeOrder === 'number'
+          ? preFirstNativeOrder
+          : getCombinedOrderValue(base.chapterId);
     }
     return { ...base, order: nextOrder };
   };
@@ -1253,7 +1285,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     } as HighlightItem;
     let nextOrder = base.order;
     if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
-      nextOrder = getCombinedOrderValue(base.chapterId);
+      const preFirstNativeOrder = getOrderForPreFirstNativeHighlight(
+        base.chapterId,
+        info.pageIndex,
+        topRatio
+      );
+      nextOrder =
+        typeof preFirstNativeOrder === 'number'
+          ? preFirstNativeOrder
+          : getCombinedOrderValue(base.chapterId);
     }
     return { ...base, order: nextOrder };
   };

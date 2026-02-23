@@ -6,12 +6,11 @@ import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH
 import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
-  extractMethodWithAI,
   extractMetadataWithAI,
   extractPdfFullText,
-  extractPdfMethodSection,
   extractPdfFirstPageMetadata,
-  extractPdfFirstPageText
+  extractPdfFirstPageText,
+  rewriteSummaryWithAI
 } from './services/pdfMetadataService';
 
 const App: React.FC = () => {
@@ -37,8 +36,6 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [vectorDebugLoading, setVectorDebugLoading] = useState(false);
-  const [vectorDebugMessage, setVectorDebugMessage] = useState('');
 
   const activePaper = openPapers.find(p => p.id === activePaperId);
   const MAX_FULL_PDF_CACHE = 20;
@@ -64,6 +61,35 @@ const App: React.FC = () => {
       const value = char === 'x' ? random : (random & 0x3) | 0x8;
       return value.toString(16);
     });
+  };
+
+  const hydratePaperRuntimeStatus = (paper: Paper): Paper => {
+    const summary = String(paper.summary || '').trim();
+    const abstract = String(paper.abstract || '').trim();
+    const inferredRewriteDone =
+      Boolean(summary) && Boolean(abstract) && summary !== abstract;
+    return {
+      ...paper,
+      isParsing: Boolean(paper.isParsing),
+      isBackgroundProcessing: Boolean(paper.isBackgroundProcessing),
+      backgroundTask: String(paper.backgroundTask || ''),
+      isRewritingSummary: Boolean(paper.isRewritingSummary),
+      isVectorizing: Boolean(paper.isVectorizing),
+      summaryRewriteDone:
+        typeof paper.summaryRewriteDone === 'boolean'
+          ? paper.summaryRewriteDone
+          : inferredRewriteDone,
+      vectorizationDone: Boolean(paper.vectorizationDone)
+    };
+  };
+
+  const logProgress = async (stage: string, paperId?: string) => {
+    if (typeof window === 'undefined' || !window.electronAPI?.logProgress) return;
+    try {
+      await window.electronAPI.logProgress({ stage, paperId });
+    } catch {
+      // ignore progress logging errors
+    }
   };
 
   // Handlers
@@ -160,30 +186,40 @@ const App: React.FC = () => {
       fileUrl: filePath ? undefined : URL.createObjectURL(file),
       fileData: filePath ? undefined : fileData,
       filePath,
-      isParsing: true
+      isParsing: true,
+      isBackgroundProcessing: false,
+      backgroundTask: '',
+      isRewritingSummary: false,
+      isVectorizing: false,
+      summaryRewriteDone: false,
+      vectorizationDone: false
     };
 
     setPapers((prev) => [pendingPaper, ...prev]);
 
-    const updateParsedPaper = (updates: Partial<Paper>) => {
+    const patchPaper = (updates: Partial<Paper>) => {
       setPapers((prev) =>
-        prev.map((paper) => (paper.id === id ? { ...paper, ...updates, isParsing: false } : paper))
+        prev.map((paper) => (paper.id === id ? { ...paper, ...updates } : paper))
       );
       setOpenPapers((prev) =>
-        prev.map((paper) => (paper.id === id ? { ...paper, ...updates, isParsing: false } : paper))
+        prev.map((paper) => (paper.id === id ? { ...paper, ...updates } : paper))
       );
+    };
+    const finishParsingPaper = (updates: Partial<Paper>) => {
+      patchPaper({ ...updates, isParsing: false });
     };
 
     (async () => {
       let parsedTitle = fallbackTitle;
       let parsedAuthor = 'Unknown';
       let parsedSummary = 'Uploaded PDF';
+      let parsedAbstract = '';
       let parsedKeywords: string[] = [];
       let parsedDate = formatNowDate();
       let parsedPublisher = '';
-      let parsedMethod = '';
       let parseWithAI = false;
       let canUseAI = false;
+      await logProgress('开始解析基本信息', id);
       if (typeof window !== 'undefined' && window.electronAPI?.settingsGet) {
         try {
           const settings = await window.electronAPI.settingsGet();
@@ -197,30 +233,67 @@ const App: React.FC = () => {
 
       if (parseWithAI && canUseAI) {
         try {
+          const fullTextTask = extractPdfFullText(fileData, { maxChars: 260000 });
           const metadataTask = (async () => {
             const firstPageText = await extractPdfFirstPageText(fileData);
             return extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
           })();
-          const methodTask = (async () => {
-            try {
-              const methodRegion = await extractPdfMethodSection(fileData, fallbackTitle);
-              const methodSource =
-                methodRegion ||
-                (await extractPdfFullText(fileData, { maxChars: 240000 }));
-              return (await extractMethodWithAI(methodSource, window.electronAPI!.askAI!)) || '';
-            } catch (error) {
-              console.warn('AI方法提取失败:', error);
-              return '';
-            }
-          })();
           const aiMetadata = await metadataTask;
           parsedTitle = aiMetadata.title || fallbackTitle;
           parsedAuthor = aiMetadata.author || 'Unknown';
-          parsedSummary = aiMetadata.summary || 'No abstract extracted.';
+          parsedAbstract = aiMetadata.summary || 'No abstract extracted.';
+          parsedSummary = parsedAbstract;
           parsedKeywords = Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [];
           parsedDate = aiMetadata.publishedDate || parsedDate;
           parsedPublisher = aiMetadata.publisher || parsedPublisher;
-          parsedMethod = await methodTask;
+          await logProgress('完成解析基本信息', id);
+          await logProgress('开始入库', id);
+          finishParsingPaper({
+            title: parsedTitle,
+            author: parsedAuthor,
+            summary: parsedSummary,
+            abstract: parsedAbstract || parsedSummary,
+            keywords: parsedKeywords,
+            date: parsedDate,
+            publisher: parsedPublisher,
+            isBackgroundProcessing: true,
+            backgroundTask: '重写摘要中'
+          });
+          await logProgress('完成入库', id);
+          let rewriteSummary = parsedSummary;
+          try {
+            const fullText = await fullTextTask;
+            patchPaper({
+              isRewritingSummary: true,
+              summaryRewriteDone: false
+            });
+            await logProgress('开始重写摘要', id);
+            const rewritten = await rewriteSummaryWithAI(
+              {
+                originalAbstract: parsedAbstract,
+                fullText
+              },
+              window.electronAPI!.askAI!
+            );
+            if (rewritten) {
+              rewriteSummary = rewritten;
+            }
+          } catch (error) {
+            console.warn('重写摘要失败，使用原始摘要:', error);
+          } finally {
+            await logProgress('完成重写摘要', id);
+            await logProgress('开始入库', id);
+            patchPaper({
+              summary: rewriteSummary,
+              abstract: parsedAbstract || rewriteSummary,
+              isRewritingSummary: false,
+              summaryRewriteDone: true,
+              isBackgroundProcessing: false,
+              backgroundTask: ''
+            });
+            await logProgress('完成入库', id);
+          }
+          return;
         } catch (error) {
           console.warn('AI解析失败，回退传统解析:', error);
           parseWithAI = false;
@@ -233,11 +306,14 @@ const App: React.FC = () => {
           parsedTitle = parsed.metadata.title || fallbackTitle;
           parsedAuthor = parsed.metadata.author || 'Unknown';
           parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
+          parsedAbstract = parsedSummary;
           parsedKeywords = parsed.metadata.keywords || [];
           parsedDate = parsed.metadata.publishedDate || parsedDate;
           parsedPublisher = parsed.metadata.publisher || parsedPublisher;
+          await logProgress('完成解析基本信息', id);
         } catch (error) {
           console.warn('PDF首页解析失败，使用默认信息:', error);
+          await logProgress('完成解析基本信息', id);
         }
       }
 
@@ -245,13 +321,17 @@ const App: React.FC = () => {
         title: parsedTitle,
         author: parsedAuthor,
         summary: parsedSummary,
+        abstract: parsedAbstract || parsedSummary,
         keywords: parsedKeywords,
         date: parsedDate,
         publisher: parsedPublisher,
-        method: parsedMethod
+        isBackgroundProcessing: false,
+        backgroundTask: ''
       };
 
-      updateParsedPaper(updates);
+      await logProgress('开始入库', id);
+      finishParsingPaper(updates);
+      await logProgress('完成入库', id);
     })();
 
     return pendingPaper;
@@ -521,8 +601,27 @@ const App: React.FC = () => {
         ? ensureSystemFolders(savedFolders)
         : ensureSystemFolders(INITIAL_FOLDERS);
     const savedPapers = await window.electronAPI.library.getPapers();
-    const nextPapers =
-      Array.isArray(savedPapers) && savedPapers.length ? savedPapers : [];
+    let nextPapers =
+      Array.isArray(savedPapers) && savedPapers.length
+        ? savedPapers.map((paper) => hydratePaperRuntimeStatus(paper))
+        : [];
+    if (nextPapers.length && window.electronAPI?.vector?.getPaperStatuses) {
+      try {
+        const statusResp = await window.electronAPI.vector.getPaperStatuses({
+          paperIds: nextPapers.map((paper) => paper.id)
+        });
+        if (statusResp?.ok) {
+          const vectorized = new Set(
+            Array.isArray(statusResp.vectorizedPaperIds) ? statusResp.vectorizedPaperIds : []
+          );
+          nextPapers = nextPapers.map((paper) =>
+            vectorized.has(paper.id) ? { ...paper, vectorizationDone: true } : paper
+          );
+        }
+      } catch {
+        // ignore vector status bootstrap errors
+      }
+    }
     setFolders(nextFolders);
     setPapers(nextPapers);
     setOpenPapers((prev) => {
@@ -543,6 +642,63 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleProgress = (event: Event) => {
+      const payload = (event as CustomEvent<{ stage?: string; paperId?: string }>).detail || {};
+      const paperId = String(payload.paperId || '').trim();
+      const stage = String(payload.stage || '').trim();
+      if (!paperId || !stage) return;
+      const applyStatus = (paper: Paper): Paper => {
+        if (paper.id !== paperId) return paper;
+        if (stage === '开始解析基本信息') {
+          return {
+            ...paper,
+            isRewritingSummary: false,
+            isVectorizing: false,
+            summaryRewriteDone: false,
+            vectorizationDone: false
+          };
+        }
+        if (stage === '开始重写摘要') {
+          return {
+            ...paper,
+            isRewritingSummary: true,
+            summaryRewriteDone: false
+          };
+        }
+        if (stage === '完成重写摘要') {
+          return {
+            ...paper,
+            isRewritingSummary: false,
+            summaryRewriteDone: true
+          };
+        }
+        if (stage === '开始向量化') {
+          return {
+            ...paper,
+            isVectorizing: true,
+            vectorizationDone: false
+          };
+        }
+        if (stage === '完成向量化') {
+          return {
+            ...paper,
+            isVectorizing: false,
+            vectorizationDone: true
+          };
+        }
+        return paper;
+      };
+      setPapers((prev) => prev.map(applyStatus));
+      setOpenPapers((prev) => prev.map(applyStatus));
+    };
+    window.addEventListener('mindpaper-progress', handleProgress as EventListener);
+    return () => {
+      window.removeEventListener('mindpaper-progress', handleProgress as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!libraryLoaded) return;
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
     if (window.electronAPI.library.saveSnapshot) {
@@ -555,7 +711,6 @@ const App: React.FC = () => {
 
   const loadSettings = async () => {
     setSettingsError('');
-    setVectorDebugMessage('');
     if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
       setSettingsError('设置仅桌面端可用');
       return;
@@ -589,50 +744,6 @@ const App: React.FC = () => {
       setSettingsError(error?.message || '设置保存失败');
     } finally {
       setSettingsLoading(false);
-    }
-  };
-
-  const handleDebugQdrantStartup = async () => {
-    setVectorDebugMessage('');
-    if (typeof window === 'undefined' || !window.electronAPI?.vector?.debugQdrantStartup) {
-      setVectorDebugMessage('当前环境不支持Qdrant调试');
-      return;
-    }
-    setVectorDebugLoading(true);
-    try {
-      const result = await window.electronAPI.vector.debugQdrantStartup();
-      if (!result?.ok) {
-        setVectorDebugMessage(`Qdrant启动检查失败: ${result?.error || 'unknown error'}`);
-        return;
-      }
-      const count = result.collections?.length || 0;
-      setVectorDebugMessage(`Qdrant启动成功，collections=${count}`);
-    } catch (error: any) {
-      setVectorDebugMessage(error?.message || 'Qdrant启动检查失败');
-    } finally {
-      setVectorDebugLoading(false);
-    }
-  };
-
-  const handleDebugDumpQdrant = async () => {
-    setVectorDebugMessage('');
-    if (typeof window === 'undefined' || !window.electronAPI?.vector?.debugDumpQdrant) {
-      setVectorDebugMessage('当前环境不支持Qdrant信息调试');
-      return;
-    }
-    setVectorDebugLoading(true);
-    try {
-      const result = await window.electronAPI.vector.debugDumpQdrant();
-      if (!result?.ok) {
-        setVectorDebugMessage(`打印Qdrant信息失败: ${result?.error || 'unknown error'}`);
-        return;
-      }
-      const collectionCount = Array.isArray(result.collections) ? result.collections.length : 0;
-      setVectorDebugMessage(`已在命令行打印Qdrant信息，collections=${collectionCount}`);
-    } catch (error: any) {
-      setVectorDebugMessage(error?.message || '打印Qdrant信息失败');
-    } finally {
-      setVectorDebugLoading(false);
     }
   };
 
@@ -792,31 +903,6 @@ const App: React.FC = () => {
                   className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
                   placeholder="gpt-3.5-turbo"
                 />
-              </div>
-
-              <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">Qdrant调试</label>
-                <div className="mt-1 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={handleDebugQdrantStartup}
-                    disabled={vectorDebugLoading}
-                    className="px-2 py-1 rounded-md text-[11px] border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
-                  >
-                    检查Qdrant启动
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleDebugDumpQdrant}
-                    disabled={vectorDebugLoading}
-                    className="px-2 py-1 rounded-md text-[11px] border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-60"
-                  >
-                    打印Qdrant信息
-                  </button>
-                </div>
-                {vectorDebugMessage ? (
-                  <div className="text-[11px] text-gray-500">{vectorDebugMessage}</div>
-                ) : null}
               </div>
 
               <div className="grid grid-cols-1 gap-2">

@@ -20,6 +20,31 @@ declare global {
         content?: string;
         error?: string;
       }>;
+      getEmbedding?: (payload:
+        | string
+        | {
+            input?: string | string[];
+            text?: string | string[];
+            model?: string;
+            dimensions?: number;
+          }) => Promise<{
+        success: boolean;
+        model?: string;
+        dimensions?: number;
+        embedding?: number[];
+        embeddings?: number[][];
+        error?: string;
+      }>;
+      logSummaryRewrite?: (payload: {
+        paperId?: string;
+        source?: string;
+        abstract?: string;
+        summary?: string;
+      }) => Promise<{ ok: boolean }>;
+      logProgress?: (payload: {
+        stage: string;
+        paperId?: string;
+      }) => Promise<{ ok: boolean }>;
       settingsGet?: () => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
@@ -52,6 +77,15 @@ declare global {
           vectorFields?: string[];
           vectorDim?: number;
           pointCount?: number;
+          summaryVectorCollection?: string;
+          summaryVectorCount?: number;
+          error?: string;
+        }>;
+        getPaperStatuses?: (payload: {
+          paperIds: string[];
+        }) => Promise<{
+          ok: boolean;
+          vectorizedPaperIds?: string[];
           error?: string;
         }>;
         debugQdrantStartup?: () => Promise<{
@@ -68,6 +102,20 @@ declare global {
             pointsCount: number;
             vectorNames: string[];
             samplePoints: Array<{ id: string; payloadKeys: string[] }>;
+          }>;
+          error?: string;
+        }>;
+        searchPapers?: (payload: {
+          query: string;
+          limit?: number;
+          model?: string;
+        }) => Promise<{
+          ok: boolean;
+          results?: Array<{
+            id: string;
+            paperId: string;
+            score: number;
+            payload?: Record<string, unknown>;
           }>;
           error?: string;
         }>;

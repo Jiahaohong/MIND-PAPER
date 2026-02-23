@@ -1,5 +1,13 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+ipcRenderer.on('progress-event', (_event, payload) => {
+  try {
+    window.dispatchEvent(new CustomEvent('mindpaper-progress', { detail: payload || {} }));
+  } catch {
+    // ignore bridge event dispatch errors
+  }
+});
+
 contextBridge.exposeInMainWorld('electron', {
   platform: process.platform,
 });
@@ -7,12 +15,17 @@ contextBridge.exposeInMainWorld('electron', {
 contextBridge.exposeInMainWorld('electronAPI', {
   translateText: (payload) => ipcRenderer.invoke('translate-text', payload),
   askAI: (payload) => ipcRenderer.invoke('ask-ai', payload),
+  getEmbedding: (payload) => ipcRenderer.invoke('get-embedding', payload),
+  logSummaryRewrite: (payload) => ipcRenderer.invoke('log-summary-rewrite', payload),
+  logProgress: (payload) => ipcRenderer.invoke('log-progress', payload),
   settingsGet: () => ipcRenderer.invoke('settings-get'),
   settingsSet: (payload) => ipcRenderer.invoke('settings-set', payload),
   vector: {
     status: () => ipcRenderer.invoke('vector-get-status'),
+    getPaperStatuses: (payload) => ipcRenderer.invoke('vector-get-paper-statuses', payload),
     debugQdrantStartup: () => ipcRenderer.invoke('vector-debug-qdrant-startup'),
-    debugDumpQdrant: () => ipcRenderer.invoke('vector-debug-dump-qdrant')
+    debugDumpQdrant: () => ipcRenderer.invoke('vector-debug-dump-qdrant'),
+    searchPapers: (payload) => ipcRenderer.invoke('vector-search-papers', payload)
   },
   library: {
     getFolders: () => ipcRenderer.invoke('library-get-folders'),

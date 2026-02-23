@@ -15,6 +15,7 @@ export interface Paper {
   folderId: string;
   previousFolderId?: string;
   summary: string;
+  abstract?: string;
   content: string; // Mock content
   method?: string;
   keywords: string[];
@@ -23,6 +24,12 @@ export interface Paper {
   fileData?: ArrayBuffer;
   filePath?: string;
   isParsing?: boolean;
+  isBackgroundProcessing?: boolean;
+  backgroundTask?: string;
+  isRewritingSummary?: boolean;
+  isVectorizing?: boolean;
+  summaryRewriteDone?: boolean;
+  vectorizationDone?: boolean;
 }
 
 export interface TOCItem {

@@ -4,8 +4,11 @@ import {
   FileText,
   Network,
   Plus,
+  Search,
   Pencil,
   X,
+  Check,
+  Loader2,
   ChevronRight,
   ChevronDown,
   Trash2,
@@ -72,6 +75,17 @@ const isManualHighlight = (item: HighlightItem) => {
   const rects = Array.isArray(item.rects) ? item.rects : [];
   if (!rects.length) return true;
   return rects.every((rect) => Number(rect.w || 0) === 0 && Number(rect.h || 0) === 0);
+};
+
+type TraditionalSearchResult = {
+  paper: Paper;
+  matchedKeywordCount: number;
+  totalFrequency: number;
+};
+
+type SearchResultItem = TraditionalSearchResult & {
+  vectorScore: number;
+  fusedScore: number;
 };
 
 const resolveOutlineDestination = async (
@@ -772,6 +786,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [sortField, setSortField] = useState<'title' | 'author' | 'publishedDate' | 'uploadedAt'>('uploadedAt');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchMode, setSearchMode] = useState<'traditional' | 'hybrid'>('traditional');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchCommittedQuery, setSearchCommittedQuery] = useState('');
+  const [similaritySearchEnabled, setSimilaritySearchEnabled] = useState(false);
+  const [vectorSearchLoading, setVectorSearchLoading] = useState(false);
+  const [vectorSearchError, setVectorSearchError] = useState('');
+  const [vectorSearchResults, setVectorSearchResults] = useState<Array<{ paperId: string; score: number }>>([]);
   const folderEditRef = useRef<{ id: string | null; originalName: string; isNew: boolean }>({
     id: null,
     originalName: '',
@@ -781,6 +803,51 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const folderInputRef = useRef<HTMLInputElement>(null);
   const thumbnailViewportRef = useRef<HTMLDivElement>(null);
   const sortMenuRef = useRef<HTMLDivElement>(null);
+  const searchPanelRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const renderStageStatusIcon = (
+    state: 'pending' | 'running' | 'done',
+    tone: 'rewrite' | 'vector',
+    label: string
+  ) => {
+    const toneClass =
+      tone === 'rewrite'
+        ? 'border-amber-200 text-amber-600'
+        : 'border-indigo-200 text-indigo-600';
+    if (state === 'done') {
+      return (
+        <span
+          title={label}
+          aria-label={label}
+          className={`inline-flex h-4 w-4 items-center justify-center rounded border bg-white ${toneClass}`}
+        >
+          <Check size={10} />
+        </span>
+      );
+    }
+    if (state === 'running') {
+      return (
+        <span
+          title={label}
+          aria-label={label}
+          className={`inline-flex h-4 w-4 items-center justify-center rounded border bg-white ${toneClass}`}
+        >
+          <Loader2 size={10} className="animate-spin" />
+        </span>
+      );
+    }
+    return (
+      <span
+        title={label}
+        aria-label={label}
+        className={`inline-flex h-4 w-4 items-center justify-center rounded border bg-white ${toneClass}`}
+      >
+        <X size={10} />
+      </span>
+    );
+  };
+  const vectorSearchReqIdRef = useRef(0);
 
   // --- Helpers ---
   const toggleFolder = (id: string) => {
@@ -1000,6 +1067,222 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     });
     return list;
   }, [visiblePapers, sortField, sortOrder]);
+  const searchKeywords = useMemo(() => {
+    const raw = String(searchCommittedQuery || '').trim().toLowerCase();
+    if (!raw) return [];
+    const parts = raw
+      .split(/[\s,，;；、\n\r\t]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    return Array.from(new Set(parts));
+  }, [searchCommittedQuery]);
+  const hasUnsubmittedSearchInput = useMemo(
+    () => String(searchQuery || '').trim() !== String(searchCommittedQuery || '').trim(),
+    [searchQuery, searchCommittedQuery]
+  );
+
+  const traditionalSearchResults = useMemo(() => {
+    if (!searchKeywords.length) return [];
+    const countOccurrences = (source: string, keyword: string) => {
+      if (!source || !keyword) return 0;
+      let count = 0;
+      let index = 0;
+      while (index < source.length) {
+        const found = source.indexOf(keyword, index);
+        if (found === -1) break;
+        count += 1;
+        index = found + keyword.length;
+      }
+      return count;
+    };
+    const sourcePapers = papers.filter((paper) => paper.folderId !== SYSTEM_FOLDER_TRASH_ID);
+    const ranked = sourcePapers
+      .map((paper) => {
+        const summary = String(paper.summary || '').toLowerCase();
+        if (!summary) return null;
+        let matchedKeywordCount = 0;
+        let totalFrequency = 0;
+        searchKeywords.forEach((keyword) => {
+          const freq = countOccurrences(summary, keyword);
+          if (freq > 0) {
+            matchedKeywordCount += 1;
+            totalFrequency += freq;
+          }
+        });
+        if (!matchedKeywordCount || !totalFrequency) return null;
+        return { paper, matchedKeywordCount, totalFrequency };
+      })
+      .filter(Boolean) as TraditionalSearchResult[];
+    ranked.sort((a, b) => {
+      if (b.matchedKeywordCount !== a.matchedKeywordCount) {
+        return b.matchedKeywordCount - a.matchedKeywordCount;
+      }
+      if (b.totalFrequency !== a.totalFrequency) {
+        return b.totalFrequency - a.totalFrequency;
+      }
+      return parseUploadTime(b.paper) - parseUploadTime(a.paper);
+    });
+    return ranked.slice(0, 100);
+  }, [papers, searchKeywords]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) return;
+    let cancelled = false;
+    const loadSearchCapability = async () => {
+      try {
+        const settings = await window.electronAPI!.settingsGet!();
+        if (cancelled) return;
+        const enabled = Boolean(settings?.parsePdfWithAI);
+        setSimilaritySearchEnabled(enabled);
+        if (!enabled) {
+          setSearchMode('traditional');
+        }
+      } catch {
+        if (cancelled) return;
+        setSimilaritySearchEnabled(false);
+        setSearchMode('traditional');
+      }
+    };
+    void loadSearchCapability();
+    return () => {
+      cancelled = true;
+    };
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (!similaritySearchEnabled && searchMode === 'hybrid') {
+      setSearchMode('traditional');
+    }
+  }, [similaritySearchEnabled, searchMode]);
+
+  useEffect(() => {
+    const query = String(searchCommittedQuery || '').trim();
+    if (!searchOpen || searchMode !== 'hybrid' || !query || !similaritySearchEnabled) {
+      setVectorSearchLoading(false);
+      setVectorSearchError('');
+      setVectorSearchResults([]);
+      return;
+    }
+    if (typeof window === 'undefined' || !window.electronAPI?.vector?.searchPapers) {
+      setVectorSearchLoading(false);
+      setVectorSearchResults([]);
+      setVectorSearchError('当前环境不支持向量召回');
+      return;
+    }
+    const reqId = vectorSearchReqIdRef.current + 1;
+    vectorSearchReqIdRef.current = reqId;
+    setVectorSearchLoading(true);
+    setVectorSearchError('');
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await window.electronAPI!.vector!.searchPapers!({
+          query,
+          limit: 80
+        });
+        if (vectorSearchReqIdRef.current !== reqId) return;
+        if (!response?.ok) {
+          setVectorSearchResults([]);
+          setVectorSearchError(response?.error || '向量召回失败');
+          return;
+        }
+        const rows = Array.isArray(response.results) ? response.results : [];
+        setVectorSearchResults(
+          rows
+            .map((item) => ({
+              paperId: String(item?.paperId || '').trim(),
+              score: Number(item?.score || 0)
+            }))
+            .filter((item) => item.paperId && Number.isFinite(item.score))
+        );
+      } catch (error: any) {
+        if (vectorSearchReqIdRef.current !== reqId) return;
+        setVectorSearchResults([]);
+        setVectorSearchError(error?.message || '向量召回失败');
+      } finally {
+        if (vectorSearchReqIdRef.current === reqId) {
+          setVectorSearchLoading(false);
+        }
+      }
+    }, 260);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [searchOpen, searchMode, searchCommittedQuery, similaritySearchEnabled]);
+
+  const searchResults = useMemo<SearchResultItem[]>(() => {
+    const nonTrashPaperMap = new Map(
+      papers
+        .filter((paper) => paper.folderId !== SYSTEM_FOLDER_TRASH_ID)
+        .map((paper) => [paper.id, paper] as const)
+    );
+    const traditionalMap = new Map(
+      traditionalSearchResults.map((item) => [item.paper.id, item] as const)
+    );
+    if (searchMode !== 'hybrid') {
+      return traditionalSearchResults.map((item) => ({
+        ...item,
+        vectorScore: 0,
+        fusedScore: item.matchedKeywordCount * 10 + item.totalFrequency
+      }));
+    }
+
+    const vectorRows = vectorSearchResults.filter((item) => nonTrashPaperMap.has(item.paperId));
+    const vectorScoreMap = new Map(vectorRows.map((item) => [item.paperId, item.score] as const));
+    const vectorScores = vectorRows.map((item) => item.score);
+    const vectorMax = vectorScores.length ? Math.max(...vectorScores) : 0;
+    const vectorMin = vectorScores.length ? Math.min(...vectorScores) : 0;
+
+    const traditionalRows = Array.from(traditionalMap.values());
+    const traditionalRaw = traditionalRows.map(
+      (item) => item.matchedKeywordCount * 10 + item.totalFrequency
+    );
+    const traditionalMax = traditionalRaw.length ? Math.max(...traditionalRaw) : 0;
+    const traditionalMin = traditionalRaw.length ? Math.min(...traditionalRaw) : 0;
+
+    const normalize = (score: number, min: number, max: number) => {
+      if (!Number.isFinite(score)) return 0;
+      if (max <= min) return score > 0 ? 1 : 0;
+      return Math.max(0, Math.min(1, (score - min) / (max - min)));
+    };
+
+    const resultMap = new Map<string, SearchResultItem>();
+    traditionalRows.forEach((item) => {
+      const rawTraditional = item.matchedKeywordCount * 10 + item.totalFrequency;
+      const tradNorm = normalize(rawTraditional, traditionalMin, traditionalMax);
+      const vectorRaw = Number(vectorScoreMap.get(item.paper.id) || 0);
+      const vectorNorm = normalize(vectorRaw, vectorMin, vectorMax);
+      resultMap.set(item.paper.id, {
+        ...item,
+        vectorScore: vectorRaw,
+        fusedScore: tradNorm * 0.65 + vectorNorm * 0.35
+      });
+    });
+    vectorRows.forEach((item) => {
+      if (resultMap.has(item.paperId)) return;
+      const paper = nonTrashPaperMap.get(item.paperId);
+      if (!paper) return;
+      const vectorNorm = normalize(item.score, vectorMin, vectorMax);
+      resultMap.set(item.paperId, {
+        paper,
+        matchedKeywordCount: 0,
+        totalFrequency: 0,
+        vectorScore: item.score,
+        fusedScore: vectorNorm * 0.35
+      });
+    });
+
+    const merged = Array.from(resultMap.values());
+    merged.sort((a, b) => {
+      if (b.fusedScore !== a.fusedScore) return b.fusedScore - a.fusedScore;
+      if (b.matchedKeywordCount !== a.matchedKeywordCount) {
+        return b.matchedKeywordCount - a.matchedKeywordCount;
+      }
+      if (b.totalFrequency !== a.totalFrequency) return b.totalFrequency - a.totalFrequency;
+      if (b.vectorScore !== a.vectorScore) return b.vectorScore - a.vectorScore;
+      return parseUploadTime(b.paper) - parseUploadTime(a.paper);
+    });
+    return merged.slice(0, 100);
+  }, [papers, searchMode, traditionalSearchResults, vectorSearchResults]);
   const selectedPaper = visiblePapers.find((paper) => paper.id === selectedPaperId) || null;
   const mindmapNodeMap = useMemo(() => {
     if (!mindmapRoot) return new Map<string, MindMapNode>();
@@ -1102,6 +1385,23 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     window.addEventListener('mousedown', handleMouseDown);
     return () => window.removeEventListener('mousedown', handleMouseDown);
   }, [sortMenuOpen]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    searchInputRef.current?.focus();
+    searchInputRef.current?.select();
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('[data-search-anchor]')) return;
+      setSearchOpen(false);
+    };
+    window.addEventListener('mousedown', handleMouseDown);
+    return () => window.removeEventListener('mousedown', handleMouseDown);
+  }, [searchOpen]);
 
   useEffect(() => {
     if (!selectedPaperId) return;
@@ -1650,16 +1950,139 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           className="hidden"
           onChange={handleFileChange}
         />
-        <div className="h-10 px-3 flex items-center justify-between border-b border-gray-100">
-          <div className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+        <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center justify-between px-3 relative">
+          <div className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
             {selectedFolderId ? findFolderName(folders, selectedFolderId) || 'Documents' : 'Documents'}
           </div>
-          <div className="relative flex items-center gap-1" data-sort-menu-anchor>
+          <div className="relative flex items-center gap-1">
+            <div className="relative" data-search-anchor>
+              <Tooltip label={searchOpen ? '关闭搜索' : '搜索'}>
+                <button
+                  type="button"
+                  onClick={() => setSearchOpen((prev) => !prev)}
+                  className={`p-1 rounded-md text-gray-500 ${
+                    searchOpen ? 'bg-gray-200' : 'hover:bg-gray-200'
+                  }`}
+                >
+                  <Search size={14} />
+                </button>
+              </Tooltip>
+              {searchOpen ? (
+                <div
+                  ref={searchPanelRef}
+                  className="absolute right-0 top-8 z-40 w-[360px] rounded-md border border-gray-200 bg-white shadow-md p-2"
+                >
+                  <div className="mb-2 grid grid-cols-2 gap-1 rounded-md bg-gray-100 p-1">
+                    <button
+                      type="button"
+                      onClick={() => setSearchMode('traditional')}
+                      className={`rounded px-2 py-1 text-[11px] ${
+                        searchMode === 'traditional'
+                          ? 'bg-white text-gray-900 shadow-sm'
+                          : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                    >
+                      关键词搜索
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!similaritySearchEnabled) return;
+                        setSearchMode('hybrid');
+                      }}
+                      disabled={!similaritySearchEnabled}
+                      className={`rounded px-2 py-1 text-[11px] ${
+                        searchMode === 'hybrid'
+                          ? 'bg-white text-gray-900 shadow-sm'
+                          : similaritySearchEnabled
+                            ? 'text-gray-500 hover:text-gray-700'
+                            : 'text-gray-300 cursor-not-allowed'
+                      }`}
+                    >
+                      相似度搜索
+                    </button>
+                  </div>
+                  <input
+                    ref={searchInputRef}
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        setSearchOpen(false);
+                        return;
+                      }
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        setSearchCommittedQuery(String(searchQuery || '').trim());
+                      }
+                    }}
+                    placeholder="输入多个关键词（空格/逗号分隔）"
+                    className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                  />
+                  <div className="mt-2 max-h-72 overflow-y-auto">
+                    {!similaritySearchEnabled && searchMode === 'traditional' && hasUnsubmittedSearchInput ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">按回车开始搜索</div>
+                    ) : !similaritySearchEnabled && searchMode === 'traditional' && searchCommittedQuery.trim() && !searchResults.length ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">未搜索到相关论文</div>
+                    ) : hasUnsubmittedSearchInput ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">按回车开始搜索</div>
+                    ) : !searchKeywords.length ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">
+                        请输入关键词进行搜索。
+                      </div>
+                    ) : !similaritySearchEnabled && searchMode === 'hybrid' ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">
+                        相似度搜索已关闭，请在设置中开启 AI解析。
+                      </div>
+                    ) : searchMode === 'hybrid' && vectorSearchLoading ? (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">正在搜索</div>
+                    ) : searchMode === 'hybrid' && vectorSearchError ? (
+                      <div className="px-1 py-2 text-[11px] text-amber-600">{vectorSearchError}</div>
+                    ) : searchResults.length ? (
+                      searchResults.map((item) => (
+                        <button
+                          key={item.paper.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedFolderId(item.paper.folderId);
+                            setSelectedPaperId(item.paper.id);
+                            setSearchOpen(false);
+                          }}
+                          onDoubleClick={() => onOpenPaper(item.paper)}
+                          className="w-full text-left rounded-md px-2 py-2 hover:bg-gray-50"
+                        >
+                          <div className="text-xs text-gray-900 line-clamp-2">{item.paper.title}</div>
+                          <div className="mt-1 text-[11px] text-gray-500 truncate">
+                            {item.paper.author || 'Unknown'}
+                          </div>
+                          {searchMode === 'hybrid' ? (
+                            <div className="mt-1 text-[11px] text-gray-400">
+                              融合: {item.fusedScore.toFixed(3)} · 关键词: {item.matchedKeywordCount} · 频次:{' '}
+                              {item.totalFrequency} · 向量: {item.vectorScore.toFixed(3)}
+                            </div>
+                          ) : (
+                            <div className="mt-1 text-[11px] text-gray-400">
+                              匹配关键词: {item.matchedKeywordCount} · 频次: {item.totalFrequency}
+                            </div>
+                          )}
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-1 py-2 text-[11px] text-gray-400">
+                        未搜索到相关论文
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+            <div className="relative flex items-center gap-1" data-sort-menu-anchor>
             <Tooltip label="排序">
               <button
                 type="button"
                 onClick={() => setSortMenuOpen((prev) => !prev)}
-                className={`p-1 rounded-md text-gray-500 ${sortMenuOpen ? 'bg-gray-100' : 'hover:bg-gray-100'}`}
+                className={`p-1 rounded-md text-gray-500 ${sortMenuOpen ? 'bg-gray-200' : 'hover:bg-gray-200'}`}
               >
                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
                   <path d="M2 3.5H12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -1722,7 +2145,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               <Tooltip label="清空回收站">
                 <button
                   onClick={onEmptyTrash}
-                  className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+                  className="p-1 rounded-md hover:bg-gray-200 text-gray-500"
                 >
                   <Trash2 size={14} />
                 </button>
@@ -1731,12 +2154,13 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               <Tooltip label="添加文档">
                 <button
                   onClick={handleAddClick}
-                  className="p-1 rounded-md hover:bg-gray-100 text-gray-500"
+                  className="p-1 rounded-md hover:bg-gray-200 text-gray-500"
                 >
                   <Plus size={14} />
                 </button>
               </Tooltip>
             )}
+            </div>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto">
@@ -1760,13 +2184,45 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                    setDraggingPaperId(null);
                    setDragOverFolderId(null);
                  }}
-                 className={`group px-3 py-3 border-b border-gray-100 cursor-pointer 
+                 className={`group mx-1 my-1 rounded-md border border-gray-100 p-2 cursor-pointer 
                     ${selectedPaperId === paper.id ? 'bg-blue-50' : 'hover:bg-gray-50'}`}
                >
-                 <div className="flex items-start justify-between gap-3">
-                   <div className="flex items-start min-w-0">
-                     <FileText size={20} className="text-gray-400 mt-1 mr-3 shrink-0" />
-                     <div className="min-w-0">
+                 <div className="flex w-full items-start justify-between gap-3">
+                   <div className="flex min-w-0 flex-1 items-start">
+                     <div className="mr-3 mt-0.5 shrink-0 flex flex-col items-center gap-1">
+                       <FileText size={20} className="text-gray-400" />
+                       {!paper.isParsing ? (
+                         <div className="flex flex-col items-center gap-1">
+                           {renderStageStatusIcon(
+                             paper.isRewritingSummary
+                               ? 'running'
+                               : paper.summaryRewriteDone
+                                 ? 'done'
+                                 : 'pending',
+                             'rewrite',
+                             paper.isRewritingSummary
+                               ? '正在重写摘要'
+                               : paper.summaryRewriteDone
+                                 ? '已经重写摘要'
+                                 : '未重写摘要'
+                           )}
+                           {renderStageStatusIcon(
+                             paper.isVectorizing
+                               ? 'running'
+                               : paper.vectorizationDone
+                                 ? 'done'
+                                 : 'pending',
+                             'vector',
+                             paper.isVectorizing
+                               ? '正在向量化'
+                               : paper.vectorizationDone
+                                 ? '已经向量化'
+                                 : '未向量化'
+                           )}
+                         </div>
+                       ) : null}
+                     </div>
+                     <div className="min-w-0 flex-1">
                        {paper.isParsing ? (
                          <div className="space-y-2 py-0.5">
                            <div className="skeleton-shimmer h-3 w-5/6 rounded" />
@@ -1784,7 +2240,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                            <div className="text-xs text-gray-500 w-full truncate" title={paper.author}>
                              {paper.author}
                            </div>
-                           <div className="text-xs text-gray-400 mt-0.5 flex items-center justify-between">
+                           {paper.isBackgroundProcessing && paper.backgroundTask && paper.backgroundTask !== '重写摘要中' ? (
+                             <div className="mt-1 inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[10px] text-blue-600">
+                               {paper.backgroundTask || '后台处理中'}
+                             </div>
+                           ) : null}
+                           <div className="mt-0.5 w-full text-xs text-gray-400 flex items-center justify-between">
                              <span>{formatDateYmd(paper.date)}</span>
                              <span>{formatUploadDateYmd(paper)}</span>
                            </div>
@@ -1865,7 +2326,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       >
         {selectedPaper ? (
           <div className="flex-1 flex flex-col overflow-hidden">
-            <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-200">
+            <div className="h-10 bg-white/80 backdrop-blur border-b border-gray-200 flex items-center gap-2 px-3">
               <div className="flex gap-1 bg-gray-100 p-1 rounded-lg">
                 <Tooltip label="PDF">
                   <button
@@ -1881,7 +2342,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     <FileText size={14} />
                   </button>
                 </Tooltip>
-                <Tooltip label="Mind Map">
+                <Tooltip label="思维导图">
                   <button
                     type="button"
                     onClick={() => setPreviewMode('mindmap')}

@@ -16,8 +16,13 @@ const DEFAULT_LIBRARY_ROOT = path.join(app.getPath('userData'), 'Library');
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-3.5-turbo';
 const DEFAULT_LIBRARY_META_COLLECTION = 'library_meta';
+const DEFAULT_PAPERS_VECTOR_COLLECTION = 'papers';
 const LIBRARY_META_VECTOR_NAME = 'meta';
 const LIBRARY_META_VECTOR_DIM = 1;
+const PAPERS_VECTOR_NAME = 'summary';
+const DEFAULT_SUMMARY_EMBEDDING_MODEL = 'text-embedding-3-small';
+const DEFAULT_SUMMARY_VECTOR_DIM = 1024;
+const SUMMARY_EMBED_MAX_TEXT_LEN = 6000;
 const LIBRARY_META_VERSION = 1;
 const LIBRARY_FOLDERS_POINT_KEY = '__folders__';
 const LIBRARY_MIGRATION_POINT_KEY = '__migration__';
@@ -47,11 +52,49 @@ let qdrantBootPromise = null;
 let qdrantProcess = null;
 let qdrantStartedByApp = false;
 let libraryMetaReadyPromise = null;
+let summaryVectorSyncChain = Promise.resolve();
+const PROGRESS_STAGES = new Set([
+  '开始解析基本信息',
+  '完成解析基本信息',
+  '开始重写摘要',
+  '完成重写摘要',
+  '开始向量化',
+  '完成向量化',
+  '开始入库',
+  '完成入库',
+  '开始翻译',
+  '完成翻译'
+]);
+
+const logProgress = (stage, paperId = '') => {
+  const normalized = String(stage || '').trim();
+  if (!PROGRESS_STAGES.has(normalized)) return;
+  const id = String(paperId || '').trim();
+  const suffix = id ? ` paper=${id}` : '';
+  console.log(`[progress] ${normalized}${suffix}`);
+  const payload = { stage: normalized, paperId: id, at: Date.now() };
+  BrowserWindow.getAllWindows().forEach((win) => {
+    try {
+      if (win?.isDestroyed?.()) return;
+      if (win?.webContents?.isDestroyed?.()) return;
+      win.webContents.send('progress-event', payload);
+    } catch {
+      // ignore window dispatch errors
+    }
+  });
+};
 
 const getQdrantUrl = () => process.env.MINDPAPER_QDRANT_URL || DEFAULT_QDRANT_URL;
 const getLibraryMetaCollection = () =>
   String(process.env.MINDPAPER_LIBRARY_META_COLLECTION || DEFAULT_LIBRARY_META_COLLECTION).trim() ||
   DEFAULT_LIBRARY_META_COLLECTION;
+const getPapersVectorCollection = () =>
+  String(process.env.MINDPAPER_PAPERS_COLLECTION || DEFAULT_PAPERS_VECTOR_COLLECTION).trim() ||
+  DEFAULT_PAPERS_VECTOR_COLLECTION;
+const getConfiguredSummaryVectorDim = () => {
+  const dim = Number(process.env.MINDPAPER_SUMMARY_VECTOR_DIM || DEFAULT_SUMMARY_VECTOR_DIM);
+  return Number.isFinite(dim) && dim > 0 ? Math.floor(dim) : DEFAULT_SUMMARY_VECTOR_DIM;
+};
 
 const isUuid = (value) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
@@ -160,6 +203,15 @@ const buildOpenAIUrl = (baseUrl) => {
     : `${resolved.replace(/\/$/, '')}/chat/completions`;
 };
 
+const buildOpenAIEmbeddingsUrl = (baseUrl) => {
+  const resolved = String(baseUrl || '').trim() || DEFAULT_BASE_URL;
+  if (resolved.endsWith('/embeddings')) return resolved;
+  if (resolved.endsWith('/chat/completions')) {
+    return `${resolved.slice(0, -'/chat/completions'.length)}/embeddings`;
+  }
+  return `${resolved.replace(/\/$/, '')}/embeddings`;
+};
+
 const openaiChatCompletion = async (
   messages,
   settings,
@@ -198,6 +250,51 @@ const openaiChatCompletion = async (
       throw new Error('AI返回内容为空');
     }
     return String(content).trim();
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const openaiEmbeddings = async (
+  input,
+  settings,
+  options = { model: 'text-embedding-3-small', dimensions: undefined }
+) => {
+  const apiKey = settings.apiKey;
+  const baseUrl = settings.baseUrl || DEFAULT_BASE_URL;
+  if (!apiKey || !baseUrl) {
+    throw new Error('请在设置中填写 API Key 和 Base URL');
+  }
+  const model = String(options.model || 'text-embedding-3-small').trim() || 'text-embedding-3-small';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const requestBody = { model, input };
+    const dims = Number(options.dimensions);
+    if (Number.isFinite(dims) && dims > 0) {
+      requestBody.dimensions = Math.floor(dims);
+    }
+    const response = await fetch(buildOpenAIEmbeddingsUrl(baseUrl), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error?.message || 'Embedding请求失败');
+    }
+    const rows = Array.isArray(data?.data) ? data.data : [];
+    const vectors = rows
+      .map((item) => (Array.isArray(item?.embedding) ? item.embedding : null))
+      .filter((item) => Array.isArray(item));
+    if (!vectors.length) {
+      throw new Error('Embedding返回为空');
+    }
+    return vectors;
   } finally {
     clearTimeout(timeout);
   }
@@ -605,6 +702,254 @@ const ensureLibraryMetaCollection = async () => {
   });
 };
 
+const extractNamedVectorDim = (collectionResult) => {
+  const vectors = collectionResult?.config?.params?.vectors;
+  if (!vectors) return 0;
+  if (typeof vectors?.size === 'number') {
+    return Number.isFinite(vectors.size) && vectors.size > 0 ? Math.floor(vectors.size) : 0;
+  }
+  const namedVector = vectors?.[PAPERS_VECTOR_NAME];
+  if (namedVector && typeof namedVector.size === 'number') {
+    return Number.isFinite(namedVector.size) && namedVector.size > 0
+      ? Math.floor(namedVector.size)
+      : 0;
+  }
+  return 0;
+};
+
+const extractPapersVectorNames = (collectionResult) => {
+  const vectors = collectionResult?.config?.params?.vectors;
+  if (!vectors) return [];
+  if (typeof vectors?.size === 'number') {
+    return ['__unnamed__'];
+  }
+  return Object.keys(vectors || {})
+    .map((name) => String(name || '').trim())
+    .filter(Boolean)
+    .sort();
+};
+
+const createPapersVectorCollection = async (collection, dim) => {
+  await qdrantRequest(`/collections/${collection}`, {
+    method: 'PUT',
+    body: {
+      vectors: {
+        [PAPERS_VECTOR_NAME]: {
+          size: dim,
+          distance: 'Cosine'
+        }
+      }
+    }
+  });
+};
+
+const ensurePapersVectorCollection = async () => {
+  const collection = getPapersVectorCollection();
+  const configuredDim = getConfiguredSummaryVectorDim();
+  try {
+    const existing = await qdrantRequest(`/collections/${collection}`);
+    const vectorNames = extractPapersVectorNames(existing?.result || {});
+    const summaryOnly =
+      vectorNames.length === 1 && vectorNames[0] === PAPERS_VECTOR_NAME;
+    if (!summaryOnly) {
+      console.warn(
+        `[vector-index] papers collection has legacy vectors (${vectorNames.join(', ') || 'none'}), recreating to summary-only.`
+      );
+      await qdrantRequest(`/collections/${collection}`, { method: 'DELETE' });
+      await createPapersVectorCollection(collection, configuredDim);
+      return;
+    }
+    const existingDim = extractNamedVectorDim(existing?.result || {});
+    if (existingDim > 0 && existingDim !== configuredDim) {
+      console.warn(
+        `[vector-index] papers vector dim mismatch: collection=${existingDim}, configured=${configuredDim}. Using collection dim.`
+      );
+    }
+    return;
+  } catch {
+    // create if missing
+  }
+  await createPapersVectorCollection(collection, configuredDim);
+};
+
+const getPapersVectorCollectionDim = async () => {
+  const collection = getPapersVectorCollection();
+  try {
+    const info = await qdrantRequest(`/collections/${collection}`);
+    const dim = extractNamedVectorDim(info?.result || {});
+    if (dim > 0) return dim;
+  } catch {
+    // fallback to configured value
+  }
+  return getConfiguredSummaryVectorDim();
+};
+
+const fetchPaperVectorPointsByIds = async (pointIds = []) => {
+  const ids = (Array.isArray(pointIds) ? pointIds : []).map((id) => String(id || '').trim()).filter(Boolean);
+  if (!ids.length) return [];
+  const collection = getPapersVectorCollection();
+  const data = await qdrantRequest(`/collections/${collection}/points`, {
+    method: 'POST',
+    body: {
+      ids,
+      with_payload: true,
+      with_vector: false
+    }
+  });
+  return Array.isArray(data?.result) ? data.result : [];
+};
+
+const deletePaperVectorPoints = async (paperIds = []) => {
+  const ids = (Array.isArray(paperIds) ? paperIds : [])
+    .map((paperId) => getPaperArticleId(paperId))
+    .map((id) => String(id || '').trim())
+    .filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const collection = getPapersVectorCollection();
+    await qdrantRequest(`/collections/${collection}/points/delete`, {
+      method: 'POST',
+      body: { points: ids, wait: false }
+    });
+  } catch (error) {
+    console.warn('[vector-index] delete vector points failed:', error?.message || error);
+  }
+};
+
+const normalizeSummaryForEmbedding = (value) =>
+  String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, SUMMARY_EMBED_MAX_TEXT_LEN);
+
+const hashSummaryText = (value) =>
+  crypto.createHash('sha1').update(String(value || ''), 'utf8').digest('hex');
+
+const syncSummaryVectorsForPapers = async (papers = []) => {
+  const source = Array.isArray(papers) ? papers : [];
+  if (!source.length) return { ok: true, indexed: 0, skipped: 0 };
+  const settings = await loadSettings();
+  if (!settings?.parsePdfWithAI) {
+    return { ok: false, skipped: source.length, error: 'ai_parse_disabled' };
+  }
+  if (!settings?.apiKey || !settings?.baseUrl) {
+    return { ok: false, skipped: source.length, error: 'missing_openai_config' };
+  }
+  const ready = await ensureQdrantReady();
+  if (!ready) return { ok: false, skipped: source.length, error: 'qdrant_not_ready' };
+  await ensurePapersVectorCollection();
+
+  const candidates = source
+    .map((paper) => {
+      const paperId = String(paper?.id || '').trim();
+      const summary = normalizeSummaryForEmbedding(paper?.summary);
+      if (!paperId) return null;
+      return {
+        paperId,
+        pointId: getPaperArticleId(paperId),
+        summary,
+        summaryHash: hashSummaryText(summary),
+        payload: {
+          type: 'paper_vector',
+          paperId,
+          summaryHash: hashSummaryText(summary),
+          updatedAt: Date.now()
+        }
+      };
+    })
+    .filter(Boolean);
+  if (!candidates.length) return { ok: true, indexed: 0, skipped: source.length };
+
+  const nonEmpty = candidates.filter((item) => item.summary);
+  const emptySummaryIds = candidates.filter((item) => !item.summary).map((item) => item.paperId);
+  if (!nonEmpty.length) {
+    if (emptySummaryIds.length) {
+      await deletePaperVectorPoints(emptySummaryIds);
+    }
+    return { ok: true, indexed: 0, skipped: candidates.length };
+  }
+
+  const existing = await fetchPaperVectorPointsByIds(nonEmpty.map((item) => item.pointId));
+  const existingMetaMap = new Map(
+    existing.map((point) => [
+      String(point?.id || '').trim(),
+      {
+        summaryHash: String(point?.payload?.summaryHash || '').trim(),
+        legacyPayload: isLegacyVectorPayloadShape(point?.payload || {})
+      }
+    ])
+  );
+  const changed = nonEmpty.filter((item) => {
+    const existingMeta = existingMetaMap.get(item.pointId);
+    if (!existingMeta) return true;
+    if (existingMeta.summaryHash !== item.summaryHash) return true;
+    return Boolean(existingMeta.legacyPayload);
+  });
+  if (!changed.length) {
+    if (emptySummaryIds.length) {
+      await deletePaperVectorPoints(emptySummaryIds);
+    }
+    return { ok: true, indexed: 0, skipped: nonEmpty.length };
+  }
+
+  const model = String(process.env.MINDPAPER_SUMMARY_EMBED_MODEL || DEFAULT_SUMMARY_EMBEDDING_MODEL).trim();
+  const vectorDim = await getPapersVectorCollectionDim();
+  const batchSize = 16;
+  let indexed = 0;
+  for (let i = 0; i < changed.length; i += batchSize) {
+    const chunk = changed.slice(i, i + batchSize);
+    chunk.forEach((item) => {
+      logProgress('开始向量化', item.paperId);
+    });
+    // eslint-disable-next-line no-await-in-loop
+    const vectors = await openaiEmbeddings(
+      chunk.map((item) => item.summary),
+      settings,
+      { model, dimensions: vectorDim }
+    );
+    chunk.forEach((item) => {
+      logProgress('完成向量化', item.paperId);
+      logProgress('开始入库', item.paperId);
+    });
+    const points = chunk
+      .map((item, idx) => {
+        const vector = Array.isArray(vectors[idx]) ? vectors[idx] : null;
+        if (!vector) return null;
+        return {
+          id: item.pointId,
+          vector: { [PAPERS_VECTOR_NAME]: vector },
+          payload: item.payload
+        };
+      })
+      .filter(Boolean);
+    if (!points.length) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await qdrantRequest(`/collections/${getPapersVectorCollection()}/points`, {
+      method: 'PUT',
+      body: { points, wait: false }
+    });
+    indexed += points.length;
+    points.forEach((point) => {
+      const paperId = String(point?.payload?.paperId || '').trim();
+      logProgress('完成入库', paperId);
+    });
+  }
+  if (emptySummaryIds.length) {
+    await deletePaperVectorPoints(emptySummaryIds);
+  }
+  return { ok: true, indexed, skipped: nonEmpty.length - changed.length };
+};
+
+const enqueueSummaryVectorSync = (papers = []) => {
+  const snapshot = Array.isArray(papers) ? papers.map((item) => ({ ...item })) : [];
+  summaryVectorSyncChain = summaryVectorSyncChain
+    .then(async () => syncSummaryVectorsForPapers(snapshot))
+    .catch((error) => {
+      console.warn('[vector-index] summary vector sync failed:', error?.message || error);
+    });
+  return summaryVectorSyncChain;
+};
+
 const upsertLibraryMetaPoints = async (points = []) => {
   if (!points.length) return;
   const collection = getLibraryMetaCollection();
@@ -690,26 +1035,44 @@ const moveFileSafe = async (fromPath, toPath) => {
   }
 };
 
+const sanitizePaperForMeta = (paper, targetPdfPath) => {
+  const source = paper && typeof paper === 'object' ? paper : {};
+  const next = {
+    id: String(source.id || '').trim(),
+    title: String(source.title || '').trim(),
+    author: String(source.author || '').trim(),
+    date: String(source.date || '').trim(),
+    addedDate: String(
+      source.addedDate || source.uploadedAt || source.addedAt || source.createdAt || new Date().toISOString()
+    ),
+    uploadedAt: 0,
+    folderId: String(source.folderId || '').trim(),
+    previousFolderId: String(source.previousFolderId || '').trim(),
+    summary: String(source.summary || '').trim(),
+    abstract: String(source.abstract || '').trim(),
+    content: String(source.content || ''),
+    keywords: Array.isArray(source.keywords)
+      ? source.keywords.map((item) => String(item || '').trim()).filter(Boolean)
+      : [],
+    publisher: String(source.publisher || '').trim(),
+    filePath: targetPdfPath
+  };
+  const uploadedAtMs = Number(source.uploadedAt || Date.parse(next.addedDate));
+  next.uploadedAt = Number.isFinite(uploadedAtMs) && uploadedAtMs > 0 ? uploadedAtMs : Date.now();
+  return next;
+};
+
 const normalizePaperForMeta = async (paper, order, paths) => {
-  const next = paper && typeof paper === 'object' ? { ...paper } : {};
-  const paperId = String(next.id || '').trim();
+  const raw = paper && typeof paper === 'object' ? { ...paper } : {};
+  const paperId = String(raw.id || '').trim();
   if (!paperId) return null;
   const paperPointId = getPaperArticleId(paperId);
   const targetPdfPath = path.join(paths.papersDir, `${paperPointId}.pdf`);
-  const sourcePdfPath = String(next.filePath || '').trim();
+  const sourcePdfPath = String(raw.filePath || '').trim();
   if (sourcePdfPath && sourcePdfPath !== targetPdfPath) {
     await moveFileSafe(sourcePdfPath, targetPdfPath);
   }
-  next.id = paperId;
-  if (Object.prototype.hasOwnProperty.call(next, 'articleId')) {
-    delete next.articleId;
-  }
-  next.addedDate = String(
-    next.addedDate || next.uploadedAt || next.addedAt || next.createdAt || new Date().toISOString()
-  );
-  const uploadedAtMs = Number(next.uploadedAt || Date.parse(next.addedDate));
-  next.uploadedAt = Number.isFinite(uploadedAtMs) && uploadedAtMs > 0 ? uploadedAtMs : Date.now();
-  next.filePath = targetPdfPath;
+  const next = sanitizePaperForMeta(raw, targetPdfPath);
   return {
     point: {
       id: paperPointId,
@@ -723,6 +1086,12 @@ const normalizePaperForMeta = async (paper, order, paths) => {
     },
     paper: next
   };
+};
+
+const isLegacyVectorPayloadShape = (payload = {}) => {
+  const allowedKeys = new Set(['type', 'paperId', 'summaryHash', 'updatedAt']);
+  const keys = Object.keys(payload || {});
+  return keys.some((key) => !allowedKeys.has(key));
 };
 
 const saveFoldersToMeta = async (folders) => {
@@ -759,24 +1128,27 @@ const loadPapersFromMeta = async () => {
     .filter((item) => item.paper && typeof item.paper === 'object')
     .sort((a, b) => a.order - b.order)
     .map((item) => {
-      const next = { ...item.paper };
-      if (Object.prototype.hasOwnProperty.call(next, 'articleId')) {
-        delete next.articleId;
-      }
-      const paperId = String(next.id || '').trim();
+      const source = { ...item.paper };
+      const paperId = String(source.id || '').trim();
       const paperPointId = getPaperArticleId(paperId);
-      next.addedDate = String(
-        next.addedDate || next.uploadedAt || next.addedAt || next.createdAt || new Date().toISOString()
-      );
-      const uploadedAtMs = Number(next.uploadedAt || Date.parse(next.addedDate));
-      next.uploadedAt = Number.isFinite(uploadedAtMs) && uploadedAtMs > 0 ? uploadedAtMs : Date.now();
-      next.filePath = path.join(paths.papersDir, `${paperPointId}.pdf`);
+      const next = sanitizePaperForMeta(source, path.join(paths.papersDir, `${paperPointId}.pdf`));
       return next;
     });
 };
 
 const savePapersToMeta = async (papers, paths) => {
   const source = Array.isArray(papers) ? papers : [];
+  const runtimeStateById = new Map(
+    source
+      .map((paper) => [
+        String(paper?.id || '').trim(),
+        {
+          isParsing: Boolean(paper?.isParsing),
+          isBackgroundProcessing: Boolean(paper?.isBackgroundProcessing)
+        }
+      ])
+      .filter((entry) => entry[0])
+  );
   const normalizedPapers = [];
   const paperPoints = [];
   for (let index = 0; index < source.length; index += 1) {
@@ -806,6 +1178,21 @@ const savePapersToMeta = async (papers, paths) => {
   if (removedPaperIds.length) {
     await deleteLibraryMetaPoints(removedPaperIds);
     await deleteLibraryMetaPoints(removedStateIds);
+    await deletePaperVectorPoints(
+      existingPaperPoints
+        .filter((point) => removedPaperIds.includes(String(point?.id || '').trim()))
+        .map((point) => String(point?.payload?.paper?.id || '').trim())
+        .filter(Boolean)
+    );
+  }
+  const vectorReadyPapers = normalizedPapers.filter(
+    (paper) => {
+      const state = runtimeStateById.get(String(paper?.id || '').trim());
+      return !state?.isParsing && !state?.isBackgroundProcessing;
+    }
+  );
+  if (vectorReadyPapers.length) {
+    void enqueueSummaryVectorSync(vectorReadyPapers);
   }
   return normalizedPapers;
 };
@@ -1145,13 +1532,16 @@ ipcMain.handle('translate-text', async (_event, payload = {}) => {
   if (!text) return { ok: false, error: '缺少文本' };
 
   try {
+    logProgress('开始翻译');
     const settings = await loadSettings();
     const engine = settings.translationEngine || 'cnki';
     if (engine === 'openai') {
       const content = await openaiTranslate(text, settings);
+      logProgress('完成翻译');
       return { ok: true, content, engine: 'openai' };
     }
     const content = await cnkiTranslateWithRetry(text);
+    logProgress('完成翻译');
     return { ok: true, content, engine: 'cnki' };
   } catch (error) {
     return { ok: false, error: error?.message || '翻译失败' };
@@ -1186,6 +1576,74 @@ ipcMain.handle('ask-ai', async (_event, payload = {}) => {
     return { ok: true, content };
   } catch (error) {
     return { ok: false, error: error?.message || 'AI请求失败' };
+  }
+});
+
+ipcMain.handle('log-summary-rewrite', async (_event, payload = {}) => {
+  const paperId = String(payload?.paperId || '').trim();
+  if (paperId) {
+    logProgress('完成重写摘要', paperId);
+  } else {
+    logProgress('完成重写摘要');
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('log-progress', async (_event, payload = {}) => {
+  const stage = String(payload?.stage || '').trim();
+  const paperId = String(payload?.paperId || '').trim();
+  logProgress(stage, paperId);
+  return { ok: true };
+});
+
+ipcMain.handle('get-embedding', async (_event, payload = {}) => {
+  try {
+    const settings = await loadSettings();
+    const rawInput =
+      typeof payload === 'string'
+        ? payload
+        : payload?.input ?? payload?.text ?? '';
+    const inputList = Array.isArray(rawInput)
+      ? rawInput
+          .map((item) => String(item || '').trim())
+          .filter(Boolean)
+      : [String(rawInput || '').trim()].filter(Boolean);
+    if (!inputList.length) {
+      return { success: false, error: '缺少文本输入' };
+    }
+    const model =
+      typeof payload === 'object' && payload?.model
+        ? String(payload.model).trim()
+        : 'text-embedding-3-small';
+    const dimensions = (() => {
+      if (typeof payload === 'object' && payload?.dimensions !== undefined) {
+        return Number(payload.dimensions);
+      }
+      return getConfiguredSummaryVectorDim();
+    })();
+    const vectors = await openaiEmbeddings(inputList.length === 1 ? inputList[0] : inputList, settings, {
+      model,
+      dimensions
+    });
+    if (inputList.length === 1) {
+      return {
+        success: true,
+        model,
+        dimensions: Array.isArray(vectors[0]) ? vectors[0].length : 0,
+        embedding: vectors[0]
+      };
+    }
+    return {
+      success: true,
+      model,
+      dimensions: Array.isArray(vectors[0]) ? vectors[0].length : 0,
+      embeddings: vectors
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error?.message || 'Embedding请求失败'
+    };
   }
 });
 
@@ -1313,6 +1771,7 @@ ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
     await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
     await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
     await deleteLibraryMetaPoints([getPaperArticleId(paperId), getLibraryStatePointId(paperId)]);
+    await deletePaperVectorPoints([paperId]);
     const papers = await loadPapersFromMeta();
     const remainIds = Array.isArray(papers)
       ? papers
@@ -1346,6 +1805,7 @@ ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
       stateIdsToDelete.push(getLibraryStatePointId(paperId));
     }
     await deleteLibraryMetaPoints([...pointIdsToDelete, ...stateIdsToDelete]);
+    await deletePaperVectorPoints(ids);
     const papers = await loadPapersFromMeta();
     const idSet = new Set(ids);
     const remainIds = Array.isArray(papers)
@@ -1358,11 +1818,84 @@ ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
   });
 });
 
+ipcMain.handle('vector-search-papers', async (_event, payload = {}) => {
+  try {
+    const query = String(payload?.query || '').trim();
+    if (!query) return { ok: false, error: '缺少query' };
+    const limit = Math.max(1, Math.min(100, Number(payload?.limit || 30)));
+    const settings = await loadSettings();
+    if (!settings?.parsePdfWithAI) {
+      return { ok: false, error: 'AI解析已关闭，相似度搜索不可用' };
+    }
+    if (!settings?.apiKey || !settings?.baseUrl) {
+      return { ok: false, error: '请先在设置中配置 API Key 和 Base URL' };
+    }
+    const ready = await ensureQdrantReady();
+    if (!ready) return { ok: false, error: 'qdrant not ready' };
+    await ensurePapersVectorCollection();
+    const model = String(payload?.model || process.env.MINDPAPER_SUMMARY_EMBED_MODEL || DEFAULT_SUMMARY_EMBEDDING_MODEL).trim();
+    const vectorDim = await getPapersVectorCollectionDim();
+    const vectors = await openaiEmbeddings(query, settings, { model, dimensions: vectorDim });
+    const vector = Array.isArray(vectors[0]) ? vectors[0] : null;
+    if (!vector) return { ok: false, error: 'query embedding failed' };
+    const data = await qdrantRequest(`/collections/${getPapersVectorCollection()}/points/search`, {
+      method: 'POST',
+      body: {
+        vector: {
+          name: PAPERS_VECTOR_NAME,
+          vector
+        },
+        limit,
+        with_payload: true,
+        with_vector: false
+      }
+    });
+    const points = Array.isArray(data?.result) ? data.result : [];
+    const results = points
+      .map((item) => ({
+        id: String(item?.id || ''),
+        paperId: String(item?.payload?.paperId || ''),
+        score: Number(item?.score || 0),
+        payload: item?.payload || {}
+      }))
+      .filter((item) => item.paperId);
+    return { ok: true, results };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'vector search failed' };
+  }
+});
+
+ipcMain.handle('vector-get-paper-statuses', async (_event, payload = {}) => {
+  try {
+    const paperIds = Array.isArray(payload?.paperIds)
+      ? payload.paperIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [];
+    if (!paperIds.length) return { ok: true, vectorizedPaperIds: [] };
+    const ready = await ensureQdrantReady();
+    if (!ready) return { ok: false, error: 'qdrant not ready', vectorizedPaperIds: [] };
+    await ensurePapersVectorCollection();
+    const pointIdToPaperId = new Map(paperIds.map((paperId) => [getPaperArticleId(paperId), paperId]));
+    const points = await fetchPaperVectorPointsByIds(Array.from(pointIdToPaperId.keys()));
+    const vectorizedPaperIds = points
+      .map((point) => {
+        const payloadPaperId = String(point?.payload?.paperId || '').trim();
+        if (payloadPaperId) return payloadPaperId;
+        return pointIdToPaperId.get(String(point?.id || '').trim()) || '';
+      })
+      .filter(Boolean);
+    return { ok: true, vectorizedPaperIds: Array.from(new Set(vectorizedPaperIds)) };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'vector status failed', vectorizedPaperIds: [] };
+  }
+});
+
 ipcMain.handle('vector-get-status', async () => {
   const startup = await debugQdrantStartup();
   const ready = Boolean(startup?.ok);
   const collectionName = getLibraryMetaCollection();
+  const papersCollectionName = getPapersVectorCollection();
   let pointCount = -1;
+  let summaryVectorCount = -1;
   if (ready) {
     try {
       const qdrantUrl = getQdrantUrl().replace(/\/$/, '');
@@ -1375,6 +1908,15 @@ ipcMain.handle('vector-get-status', async () => {
         const data = await response.json();
         pointCount = Number(data?.result?.count || 0);
       }
+      const summaryResp = await fetch(`${qdrantUrl}/collections/${papersCollectionName}/points/count`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exact: true })
+      }).catch(() => null);
+      if (summaryResp?.ok) {
+        const data = await summaryResp.json();
+        summaryVectorCount = Number(data?.result?.count || 0);
+      }
     } catch {
       pointCount = -1;
     }
@@ -1385,6 +1927,8 @@ ipcMain.handle('vector-get-status', async () => {
     vectorFields: ['meta'],
     vectorDim: LIBRARY_META_VECTOR_DIM,
     pointCount,
+    summaryVectorCollection: papersCollectionName,
+    summaryVectorCount,
     qdrantUrl: getQdrantUrl(),
     qdrantStoragePath: getQdrantStoragePath(),
     qdrantManagedByApp: qdrantStartedByApp,
@@ -1412,6 +1956,10 @@ app.whenReady().then(() => {
     try {
       await ensureLibraryMetaReady();
       await debugQdrantStartup();
+      const papers = await loadPapersFromMeta();
+      if (Array.isArray(papers) && papers.length) {
+        void enqueueSummaryVectorSync(papers);
+      }
     } catch (error) {
       console.warn('[vector-index] init failed:', error?.message || error);
     }
@@ -1433,7 +1981,7 @@ app.on('before-quit', (event) => {
   if (isForceQuitting) return;
   event.preventDefault();
   isForceQuitting = true;
-  Promise.allSettled([flushWrites()])
+  Promise.allSettled([flushWrites().then(() => summaryVectorSyncChain)])
     .then(async () => {
       try {
         await stopManagedQdrant();

@@ -57,6 +57,7 @@ const METHOD_MAX_EXTRACT_PAGES = 10;
 const METHOD_MAX_CHARS = 12000;
 const METHOD_EARLY_SEARCH_RATIO = 0.72;
 const METHOD_PREFERRED_HALF_RATIO = 0.6;
+const EXPERIMENT_MAX_EXTRACT_PAGES = 12;
 
 const buildLines = (items: any[]): LineItem[] => {
   const textItems = items
@@ -925,6 +926,110 @@ export const extractPdfMethodSection = async (
   }
 };
 
+export const extractPdfExperimentSection = async (
+  fileData: ArrayBuffer
+): Promise<string> => {
+  ensureWorker();
+  const loadingTask = pdfjs.getDocument({ data: fileData.slice(0) });
+  const doc = await loadingTask.promise;
+  const pageLineCache = new Map<number, LineItem[]>();
+  const getPageLines = async (pageIndex: number) => {
+    const cached = pageLineCache.get(pageIndex);
+    if (cached) return cached;
+    const page = await doc.getPage(pageIndex + 1);
+    const textContent = await page.getTextContent();
+    const lines = buildLines(textContent.items || []);
+    pageLineCache.set(pageIndex, lines);
+    return lines;
+  };
+
+  try {
+    const outline = await doc.getOutline();
+    if (Array.isArray(outline) && outline.length) {
+      const entries = await buildOutlineEntries(doc, outline, 0, 'outline');
+      const startCandidate = entries.find(
+        (entry) =>
+          typeof entry.pageIndex === 'number' &&
+          entry.pageIndex >= 0 &&
+          isExperimentHeading(entry.title)
+      );
+      if (startCandidate && typeof startCandidate.pageIndex === 'number') {
+        const startPage = Math.max(0, startCandidate.pageIndex);
+        const boundaryCandidate = entries.find(
+          (entry) =>
+            typeof entry.pageIndex === 'number' &&
+            entry.pageIndex > startPage &&
+            entry.depth <= startCandidate.depth &&
+            isEndSectionHeading(entry.title)
+        );
+        const endExclusive = Math.min(
+          doc.numPages,
+          Math.max(
+            startPage + 1,
+            Math.min(
+              boundaryCandidate?.pageIndex ?? doc.numPages,
+              startPage + EXPERIMENT_MAX_EXTRACT_PAGES
+            )
+          )
+        );
+        const outlineExperiment = await collectMethodText(doc, getPageLines, startPage, endExclusive, {
+          startHeading: startCandidate.title
+        });
+        if (outlineExperiment.length >= 120) return outlineExperiment;
+      }
+    }
+
+    let start: { pageIndex: number; lineIndex: number; heading: string } | null = null;
+    let boundary: { pageIndex: number; lineIndex: number; heading: string } | null = null;
+    for (let pageIndex = 0; pageIndex < doc.numPages; pageIndex += 1) {
+      const lines = await getPageLines(pageIndex);
+      for (let i = 0; i < lines.length; i += 1) {
+        const value = lines[i].text.trim();
+        if (!value) continue;
+        const looksLikeHeading =
+          SECTION_HEADING_REGEX.test(value) ||
+          NUMBERED_SECTION_REGEX.test(value) ||
+          isLikelyAllCapsHeading(value);
+        if (!start) {
+          if (looksLikeHeading && isExperimentHeading(value)) {
+            start = { pageIndex, lineIndex: i, heading: value };
+          }
+          continue;
+        }
+        if (
+          looksLikeHeading &&
+          isEndSectionHeading(value) &&
+          (pageIndex > start.pageIndex || i > start.lineIndex)
+        ) {
+          boundary = { pageIndex, lineIndex: i, heading: value };
+          break;
+        }
+      }
+      if (boundary) break;
+    }
+
+    if (!start) return '';
+    const endExclusive = boundary
+      ? Math.min(
+          doc.numPages,
+          Math.max(start.pageIndex + 1, boundary.pageIndex + 1)
+        )
+      : Math.min(doc.numPages, Math.max(start.pageIndex + 1, start.pageIndex + EXPERIMENT_MAX_EXTRACT_PAGES));
+    return collectMethodText(doc, getPageLines, start.pageIndex, endExclusive, {
+      startHeading: start.heading,
+      boundaryPage: boundary?.pageIndex,
+      boundaryHeading: boundary?.heading,
+      boundaryLineIndex: boundary?.lineIndex
+    });
+  } finally {
+    try {
+      await doc.destroy();
+    } catch {
+      // ignore
+    }
+  }
+};
+
 export const extractPdfFirstPageMetadata = async (
   fileData: ArrayBuffer,
   fallbackTitle: string
@@ -1066,6 +1171,66 @@ export const extractMethodWithAI = async (
     return String(merged.content || '').trim().slice(0, 12000);
   }
   return notes.join('\n\n').slice(0, 12000).trim();
+};
+
+export const rewriteSummaryWithAI = async (
+  payload: {
+    originalAbstract: string;
+    fullText: string;
+  },
+  askAI: AskAIFn
+): Promise<string> => {
+  const originalAbstract = String(payload.originalAbstract || '').trim();
+  const fullText = String(payload.fullText || '').trim();
+
+  if (!fullText) return originalAbstract;
+  const chunks = splitTextForAI(fullText, 14000);
+  const evidenceNotes: string[] = [];
+  for (let i = 0; i < chunks.length; i += 1) {
+    const prompt = [
+      'You are extracting evidence for rewriting a richer academic abstract.',
+      'From this chunk, extract only factual points useful for an abstract:',
+      '- research problem/background',
+      '- core method idea and technical mechanism',
+      '- datasets, settings, and evaluation protocol',
+      '- key quantitative findings (metrics/numbers if present)',
+      '- limitations or boundary conditions',
+      'Return concise plain text notes in source language (max 160 words).',
+      'If this chunk contains no useful evidence, return exactly: N/A',
+      `Chunk: ${i + 1}/${chunks.length}`,
+      '',
+      '[Chunk Text]',
+      chunks[i]
+    ].join('\n');
+    const response = await askAI({ prompt, messages: [] });
+    if (!response?.ok || !response.content) continue;
+    const note = String(response.content || '').trim();
+    if (!note || /^n\/a$/i.test(note)) continue;
+    evidenceNotes.push(note);
+  }
+
+  const rewritePrompt = [
+    'You are a senior research editor rewriting an abstract.',
+    'Task: rewrite a richer, detail-oriented abstract using only provided evidence.',
+    'Hard constraints:',
+    '1) Do not fabricate any fact, metric, dataset, or claim.',
+    '2) Keep language consistent with source text.',
+    '3) Keep academic and concise style, plain text only (no markdown, no bullet list).',
+    '4) Target length: 220-320 words.',
+    '5) Cover these elements naturally in one coherent paragraph:',
+    '   research context/problem, core method, experimental setup, key results, and practical contribution.',
+    '6) If specific numbers are missing, describe results qualitatively instead of guessing.',
+    '7) Preserve the original abstract intent but enrich technical detail.',
+    '',
+    '[Original Abstract]',
+    originalAbstract || 'N/A',
+    '',
+    '[Evidence Notes From Full Paper]',
+    evidenceNotes.length ? evidenceNotes.join('\n\n') : 'N/A'
+  ].join('\n');
+  const rewritten = await askAI({ prompt: rewritePrompt, messages: [] });
+  if (!rewritten?.ok || !rewritten.content) return originalAbstract;
+  return String(rewritten.content || '').trim().slice(0, 2400);
 };
 
 export const extractMetadataWithAI = async (
