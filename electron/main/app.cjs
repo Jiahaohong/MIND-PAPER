@@ -1055,6 +1055,18 @@ const sanitizePaperForMeta = (paper, targetPdfPath) => {
       ? source.keywords.map((item) => String(item || '').trim()).filter(Boolean)
       : [],
     publisher: String(source.publisher || '').trim(),
+    doi: String(source.doi || '').trim(),
+    references: Array.isArray(source.references)
+      ? source.references.map((item) => normalizeDoi(item)).filter(Boolean)
+      : [],
+    referenceStats:
+      source.referenceStats && typeof source.referenceStats === 'object'
+        ? {
+            totalOpenAlex: Number(source.referenceStats.totalOpenAlex || 0),
+            totalSemanticScholar: Number(source.referenceStats.totalSemanticScholar || 0),
+            intersectionCount: Number(source.referenceStats.intersectionCount || 0)
+          }
+        : undefined,
     filePath: targetPdfPath
   };
   const uploadedAtMs = Number(source.uploadedAt || Date.parse(next.addedDate));
@@ -1519,6 +1531,331 @@ const openaiTranslate = async (text, settings) => {
   );
 };
 
+const normalizePaperTitle = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+    .trim();
+
+const titleSimilarityScore = (query, target) => {
+  const q = normalizePaperTitle(query);
+  const t = normalizePaperTitle(target);
+  if (!q || !t) return 0;
+  if (q === t) return 1;
+  if (t.includes(q) || q.includes(t)) return 0.95;
+  const qTokens = new Set(q.split(/\s+/).filter(Boolean));
+  const tTokens = new Set(t.split(/\s+/).filter(Boolean));
+  if (!qTokens.size || !tTokens.size) return 0;
+  let common = 0;
+  qTokens.forEach((token) => {
+    if (tTokens.has(token)) common += 1;
+  });
+  const denom = Math.max(qTokens.size, tTokens.size);
+  return denom ? common / denom : 0;
+};
+
+const normalizeDoi = (doi) => {
+  const raw = String(doi || '').trim().toLowerCase();
+  if (!raw) return '';
+  return raw
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//, '')
+    .replace(/^doi:\s*/i, '')
+    .trim();
+};
+
+const extractArxivIdFromDoi = (doi) => {
+  const normalized = normalizeDoi(doi);
+  const match = normalized.match(/^10\.48550\/arxiv\.(.+)$/i);
+  return match ? String(match[1] || '').trim() : '';
+};
+
+const fetchJsonWithTimeout = async (url, timeoutMs = 12000) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${text || response.statusText}`);
+    }
+    return text ? JSON.parse(text) : {};
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const searchOpenAlexByTitle = async (title) => {
+  const url = `https://api.openalex.org/works?search=${encodeURIComponent(title)}&per-page=5`;
+  const data = await fetchJsonWithTimeout(url);
+  const results = Array.isArray(data?.results) ? data.results : [];
+  if (!results.length) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const item of results) {
+    const candidateTitle = String(item?.title || '').trim();
+    const score = titleSimilarityScore(title, candidateTitle);
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (!best) return null;
+  const output = {
+    source: 'OpenAlex',
+    title: String(best?.title || '').trim(),
+    authors: Array.isArray(best?.authorships)
+      ? best.authorships
+          .map((auth) => String(auth?.author?.display_name || '').trim())
+          .filter(Boolean)
+      : [],
+    publication_date: String(best?.publication_date || '').trim(),
+    venue:
+      String(best?.primary_location?.source?.display_name || '').trim() ||
+      String(best?.host_venue?.display_name || '').trim(),
+    doi: String(best?.doi || '').trim() || null
+  };
+  console.log(
+    `[open-source][openalex] query="${String(title || '').slice(0, 120)}" result=${JSON.stringify(
+      output
+    )}`
+  );
+  return output;
+};
+
+const getOpenAlexReferencesByDoi = async (doi) => {
+  const normalized = normalizeDoi(doi);
+  if (!normalized) return [];
+  const work = await fetchJsonWithTimeout(
+    `https://api.openalex.org/works/https://doi.org/${encodeURIComponent(normalized)}`
+  ).catch(() => null);
+  const referencedWorks = Array.isArray(work?.referenced_works) ? work.referenced_works : [];
+  const ids = referencedWorks
+    .map((item) => String(item || '').split('/').pop())
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  if (!ids.length) return [];
+  const allDois = [];
+  const fetchRefDetailsBatch = async (batchIds) => {
+    const keys = ['openalex', 'openalex_id', 'ids.openalex'];
+    for (const key of keys) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const detail = await fetchJsonWithTimeout(
+          `https://api.openalex.org/works?filter=${key}:${encodeURIComponent(
+            batchIds.join('|')
+          )}&per-page=${batchIds.length}`
+        );
+        const results = Array.isArray(detail?.results) ? detail.results : [];
+        if (results.length) return results;
+      } catch {
+        // try next key
+      }
+    }
+    return [];
+  };
+  const chunkSize = 40;
+  for (let index = 0; index < ids.length; index += chunkSize) {
+    const chunk = ids.slice(index, index + chunkSize);
+    // eslint-disable-next-line no-await-in-loop
+    const results = await fetchRefDetailsBatch(chunk);
+    allDois.push(
+      ...results
+        .map((item) => normalizeDoi(item?.doi))
+        .filter(Boolean)
+    );
+  }
+  return Array.from(new Set(allDois));
+};
+
+const getOpenAlexReferencesByTitle = async (title) => {
+  const query = String(title || '').trim();
+  if (!query) return [];
+  const data = await fetchJsonWithTimeout(
+    `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=1`
+  ).catch(() => null);
+  const top = Array.isArray(data?.results) ? data.results[0] : null;
+  const referencedWorks = Array.isArray(top?.referenced_works) ? top.referenced_works : [];
+  const ids = referencedWorks
+    .map((item) => String(item || '').split('/').pop())
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+  if (!ids.length) return [];
+  const batch = ids.slice(0, 80);
+  const detail = await fetchJsonWithTimeout(
+    `https://api.openalex.org/works?filter=ids.openalex:${encodeURIComponent(batch.join('|'))}&per-page=${batch.length}`
+  ).catch(() => null);
+  const results = Array.isArray(detail?.results) ? detail.results : [];
+  return Array.from(new Set(results.map((item) => normalizeDoi(item?.doi)).filter(Boolean)));
+};
+
+const searchSemanticScholarByTitle = async (title) => {
+  const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(
+    title
+  )}&limit=5&fields=title,authors,venue,year,publicationDate,externalIds,abstract`;
+  const data = await fetchJsonWithTimeout(url);
+  const results = Array.isArray(data?.data) ? data.data : [];
+  if (!results.length) return null;
+  let best = null;
+  let bestScore = -1;
+  for (const item of results) {
+    const candidateTitle = String(item?.title || '').trim();
+    const score = titleSimilarityScore(title, candidateTitle);
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (!best) return null;
+  const output = {
+    source: 'Semantic Scholar',
+    title: String(best?.title || '').trim(),
+    authors: Array.isArray(best?.authors)
+      ? best.authors.map((auth) => String(auth?.name || '').trim()).filter(Boolean)
+      : [],
+    publication_date: String(best?.publicationDate || best?.year || '').trim(),
+    venue: String(best?.venue || '').trim(),
+    doi: String(best?.externalIds?.DOI || '').trim() || null
+  };
+  console.log(
+    `[open-source][semanticscholar] query="${String(title || '').slice(
+      0,
+      120
+    )}" result=${JSON.stringify(output)}`
+  );
+  return output;
+};
+
+const getSemanticScholarReferencesByDoi = async (doi) => {
+  const normalized = normalizeDoi(doi);
+  if (!normalized) return [];
+  const data = await fetchJsonWithTimeout(
+    `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(
+      normalized
+    )}?fields=references.externalIds`
+  ).catch(() => null);
+  const references = Array.isArray(data?.references) ? data.references : [];
+  let dois = Array.from(
+    new Set(
+      references
+        .map((item) => normalizeDoi(item?.externalIds?.DOI))
+        .filter(Boolean)
+    )
+  );
+  if (!dois.length) {
+    const arxivId = extractArxivIdFromDoi(normalized);
+    if (arxivId) {
+      const arxivData = await fetchJsonWithTimeout(
+        `https://api.semanticscholar.org/graph/v1/paper/ARXIV:${encodeURIComponent(
+          arxivId
+        )}?fields=references.externalIds`
+      ).catch(() => null);
+      const arxivRefs = Array.isArray(arxivData?.references) ? arxivData.references : [];
+      dois = Array.from(
+        new Set(
+          arxivRefs
+            .map((item) => normalizeDoi(item?.externalIds?.DOI))
+            .filter(Boolean)
+        )
+      );
+    }
+  }
+  return dois;
+};
+
+const getSemanticScholarReferencesByTitle = async (title) => {
+  const query = String(title || '').trim();
+  if (!query) return [];
+  const search = await fetchJsonWithTimeout(
+    `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(
+      query
+    )}&limit=1&fields=paperId,title`
+  ).catch(() => null);
+  const paperId = String(search?.data?.[0]?.paperId || '').trim();
+  if (!paperId) return [];
+  const detail = await fetchJsonWithTimeout(
+    `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(
+      paperId
+    )}?fields=references.externalIds`
+  ).catch(() => null);
+  const references = Array.isArray(detail?.references) ? detail.references : [];
+  return Array.from(
+    new Set(
+      references
+        .map((item) => normalizeDoi(item?.externalIds?.DOI))
+        .filter(Boolean)
+    )
+  );
+};
+
+const getReferenceIntersectionByDoi = async (doi, title = '') => {
+  const normalized = normalizeDoi(doi);
+  if (!normalized) {
+    return {
+      doi: '',
+      total_openalex: 0,
+      total_semanticscholar: 0,
+      intersection_count: 0,
+      references: []
+    };
+  }
+  let [openAlexRefs, semanticScholarRefs] = await Promise.all([
+    getOpenAlexReferencesByDoi(normalized),
+    getSemanticScholarReferencesByDoi(normalized)
+  ]);
+  if (!openAlexRefs.length && !semanticScholarRefs.length && String(title || '').trim()) {
+    [openAlexRefs, semanticScholarRefs] = await Promise.all([
+      getOpenAlexReferencesByTitle(title),
+      getSemanticScholarReferencesByTitle(title)
+    ]);
+  }
+  const union = Array.from(new Set([...openAlexRefs, ...semanticScholarRefs]));
+  console.log(
+    `[references] doi=${normalized} openalex=${openAlexRefs.length} semanticscholar=${semanticScholarRefs.length} union=${union.length}`
+  );
+  return {
+    doi: normalized,
+    total_openalex: openAlexRefs.length,
+    total_semanticscholar: semanticScholarRefs.length,
+    intersection_count: union.length,
+    union_count: union.length,
+    references: union
+  };
+};
+
+const searchPaperOpenSource = async (title) => {
+  const query = String(title || '').trim();
+  if (!query) return null;
+  let primary = null;
+  const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
+  if (openAlex) {
+    primary = {
+      source: 'OpenAlex',
+      title: String(openAlex?.title || '').trim(),
+      authors: Array.isArray(openAlex?.authors) ? openAlex.authors.filter(Boolean) : [],
+      publication_date: String(openAlex?.publication_date || '').trim(),
+      venue: String(openAlex?.venue || '').trim(),
+      doi: String(openAlex?.doi || '').trim() || null
+    };
+  } else {
+    const semantic = await searchSemanticScholarByTitle(query).catch(() => null);
+    if (!semantic) return null;
+    primary = {
+      source: 'Semantic Scholar',
+      title: String(semantic?.title || '').trim(),
+      authors: Array.isArray(semantic?.authors) ? semantic.authors.filter(Boolean) : [],
+      publication_date: String(semantic?.publication_date || '').trim(),
+      venue: String(semantic?.venue || '').trim(),
+      doi: String(semantic?.doi || '').trim() || null
+    };
+  }
+  console.log(
+    `[open-source][merged] query="${String(query || '').slice(0, 120)}" result=${JSON.stringify(
+      primary
+    )}`
+  );
+  return primary;
+};
+
 ipcMain.handle('settings-get', async () => {
   const settings = await loadSettings();
   return { ...settings, libraryPath: getLibraryRoot() };
@@ -1576,6 +1913,47 @@ ipcMain.handle('ask-ai', async (_event, payload = {}) => {
     return { ok: true, content };
   } catch (error) {
     return { ok: false, error: error?.message || 'AI请求失败' };
+  }
+});
+
+ipcMain.handle('search-paper-open-source', async (_event, payload = {}) => {
+  try {
+    const title = String(payload?.title || '').trim();
+    if (!title) return null;
+    return await searchPaperOpenSource(title);
+  } catch (error) {
+    console.warn('[metadata] open-source search failed:', error?.message || error);
+    return null;
+  }
+});
+
+ipcMain.handle('search-paper-references', async (_event, payload = {}) => {
+  try {
+    const doi = String(payload?.doi || '').trim();
+    const title = String(payload?.title || '').trim();
+    if (!doi) {
+      return {
+        ok: false,
+        error: '缺少 DOI',
+        doi: '',
+        total_openalex: 0,
+        total_semanticscholar: 0,
+        intersection_count: 0,
+        references: []
+      };
+    }
+    const result = await getReferenceIntersectionByDoi(doi, title);
+    return { ok: true, ...result };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error?.message || '参考文献解析失败',
+      doi: normalizeDoi(payload?.doi),
+      total_openalex: 0,
+      total_semanticscholar: 0,
+      intersection_count: 0,
+      references: []
+    };
   }
 });
 

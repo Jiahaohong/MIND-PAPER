@@ -5,6 +5,15 @@ type AskAIFn = (payload: {
   messages?: Array<{ role: 'user' | 'model'; text: string }>;
 }) => Promise<{ ok: boolean; content?: string; error?: string }>;
 
+export type OpenSourcePaperMetadata = {
+  source: 'OpenAlex' | 'Semantic Scholar';
+  title?: string;
+  authors?: string[];
+  publication_date?: string;
+  venue?: string;
+  doi?: string | null;
+};
+
 type ParsedMetadata = {
   title: string;
   author: string;
@@ -19,6 +28,113 @@ type LineItem = {
   x: number;
   text: string;
   size: number;
+};
+
+const normalizePaperTitle = (value: string) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+    .trim();
+
+const titleSimilarityScore = (query: string, target: string) => {
+  const q = normalizePaperTitle(query);
+  const t = normalizePaperTitle(target);
+  if (!q || !t) return 0;
+  if (q === t) return 1;
+  if (t.includes(q) || q.includes(t)) return 0.95;
+  const qTokens = new Set(q.split(/\s+/).filter(Boolean));
+  const tTokens = new Set(t.split(/\s+/).filter(Boolean));
+  if (!qTokens.size || !tTokens.size) return 0;
+  let common = 0;
+  qTokens.forEach((token) => {
+    if (tTokens.has(token)) common += 1;
+  });
+  return common / Math.max(qTokens.size, tTokens.size);
+};
+
+const fetchJsonWithTimeout = async (url: string, timeoutMs = 12000) => {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${text || response.statusText}`);
+    return text ? JSON.parse(text) : {};
+  } finally {
+    window.clearTimeout(timeout);
+  }
+};
+
+const searchOpenAlexByTitle = async (title: string): Promise<OpenSourcePaperMetadata | null> => {
+  const url = `https://api.openalex.org/works?search=${encodeURIComponent(title)}&per-page=5`;
+  const data = await fetchJsonWithTimeout(url);
+  const results = Array.isArray(data?.results) ? data.results : [];
+  if (!results.length) return null;
+  let best: any = null;
+  let bestScore = -1;
+  for (const item of results) {
+    const score = titleSimilarityScore(title, String(item?.title || ''));
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (!best) return null;
+  return {
+    source: 'OpenAlex',
+    title: String(best?.title || '').trim(),
+    authors: Array.isArray(best?.authorships)
+      ? best.authorships
+          .map((auth: any) => String(auth?.author?.display_name || '').trim())
+          .filter(Boolean)
+      : [],
+    publication_date: String(best?.publication_date || '').trim(),
+    venue:
+      String(best?.primary_location?.source?.display_name || '').trim() ||
+      String(best?.host_venue?.display_name || '').trim(),
+    doi: String(best?.doi || '').trim() || null
+  };
+};
+
+const searchSemanticScholarByTitle = async (
+  title: string
+): Promise<OpenSourcePaperMetadata | null> => {
+  const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(
+    title
+  )}&limit=5&fields=title,authors,venue,year,publicationDate,externalIds`;
+  const data = await fetchJsonWithTimeout(url);
+  const results = Array.isArray(data?.data) ? data.data : [];
+  if (!results.length) return null;
+  let best: any = null;
+  let bestScore = -1;
+  for (const item of results) {
+    const score = titleSimilarityScore(title, String(item?.title || ''));
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  if (!best) return null;
+  return {
+    source: 'Semantic Scholar',
+    title: String(best?.title || '').trim(),
+    authors: Array.isArray(best?.authors)
+      ? best.authors.map((auth: any) => String(auth?.name || '').trim()).filter(Boolean)
+      : [],
+    publication_date: String(best?.publicationDate || best?.year || '').trim(),
+    venue: String(best?.venue || '').trim(),
+    doi: String(best?.externalIds?.DOI || '').trim() || null
+  };
+};
+
+export const searchPaperOpenSourceByTitle = async (
+  title: string
+): Promise<OpenSourcePaperMetadata | null> => {
+  const query = String(title || '').trim();
+  if (!query) return null;
+  const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
+  if (openAlex) return openAlex;
+  return searchSemanticScholarByTitle(query).catch(() => null);
 };
 
 const ensureWorker = () => {
@@ -1092,6 +1208,69 @@ export const extractPdfFullText = async (
       // ignore
     }
   }
+};
+
+export const extractPdfReferencesFromLocal = async (
+  fileData: ArrayBuffer,
+  options?: { maxPages?: number; maxRefs?: number }
+): Promise<string[]> => {
+  const maxPages = Math.max(1, options?.maxPages || 80);
+  const maxRefs = Math.max(10, options?.maxRefs || 200);
+  const fullText = await extractPdfFullText(fileData, {
+    maxPages,
+    maxChars: 420000
+  });
+  if (!fullText) return [];
+
+  const lines = fullText
+    .split('\n')
+    .map((line) => line.replace(/\[Page\s+\d+\]/gi, '').trim())
+    .filter(Boolean);
+  if (!lines.length) return [];
+
+  const headingRegex =
+    /^(references?|bibliography|reference list|works cited|参考文献|参考资料|文献)\s*$/i;
+  const stopRegex =
+    /^(appendix|appendices|supplementary|acknowledg(?:e)?ments?|致谢|附录)\b/i;
+  const entryStartRegex = /^\s*(\[\d{1,4}\]|\(\d{1,4}\)|\d{1,4}[.)])\s+/;
+  const spaceNorm = (value: string) => value.replace(/\s+/g, ' ').trim();
+
+  const headingIndex = lines.findIndex((line) => headingRegex.test(line));
+  if (headingIndex < 0) return [];
+
+  const refs: string[] = [];
+  let current = '';
+
+  for (let i = headingIndex + 1; i < lines.length; i += 1) {
+    const raw = spaceNorm(lines[i]);
+    if (!raw) continue;
+    if (refs.length > 0 && stopRegex.test(raw)) break;
+
+    const isNewEntry = entryStartRegex.test(raw);
+    if (isNewEntry) {
+      if (current) refs.push(current);
+      current = raw;
+    } else if (current) {
+      current = `${current} ${raw}`.trim();
+    } else {
+      // Fallback for reference formats without numeric prefixes.
+      if (/\b(19|20)\d{2}\b/.test(raw) && /[.。]$/.test(raw) && raw.length > 35) {
+        refs.push(raw);
+      }
+    }
+
+    if (refs.length >= maxRefs) break;
+  }
+
+  if (current && refs.length < maxRefs) refs.push(current);
+
+  return Array.from(
+    new Set(
+      refs
+        .map((item) => item.replace(entryStartRegex, '').trim())
+        .filter((item) => item.length >= 18)
+    )
+  ).slice(0, maxRefs);
 };
 
 const splitTextForAI = (text: string, maxChars = 16000) => {

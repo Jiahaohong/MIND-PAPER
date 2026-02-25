@@ -6,12 +6,11 @@ import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH
 import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
-  extractMetadataWithAI,
   extractPdfFullText,
-  extractPdfFirstPageMetadata,
-  extractPdfFirstPageText,
+  extractPdfReferencesFromLocal,
   rewriteSummaryWithAI
 } from './services/pdfMetadataService';
+import { resolvePaperMetadata } from './services/paperMetadataResolver';
 
 const App: React.FC = () => {
   const DEFAULT_SETTINGS = {
@@ -212,11 +211,13 @@ const App: React.FC = () => {
     (async () => {
       let parsedTitle = fallbackTitle;
       let parsedAuthor = 'Unknown';
-      let parsedSummary = 'Uploaded PDF';
       let parsedAbstract = '';
       let parsedKeywords: string[] = [];
       let parsedDate = formatNowDate();
       let parsedPublisher = '';
+      let parsedDoi = '';
+      let parsedReferences: string[] = [];
+      let parsedReferenceStats: Paper['referenceStats'] | undefined;
       let parseWithAI = false;
       let canUseAI = false;
       await logProgress('开始解析基本信息', id);
@@ -231,100 +232,61 @@ const App: React.FC = () => {
         }
       }
 
-      if (parseWithAI && canUseAI) {
-        try {
-          const fullTextTask = extractPdfFullText(fileData, { maxChars: 260000 });
-          const metadataTask = (async () => {
-            const firstPageText = await extractPdfFirstPageText(fileData);
-            return extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
-          })();
-          const aiMetadata = await metadataTask;
-          parsedTitle = aiMetadata.title || fallbackTitle;
-          parsedAuthor = aiMetadata.author || 'Unknown';
-          parsedAbstract = aiMetadata.summary || 'No abstract extracted.';
-          parsedSummary = parsedAbstract;
-          parsedKeywords = Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [];
-          parsedDate = aiMetadata.publishedDate || parsedDate;
-          parsedPublisher = aiMetadata.publisher || parsedPublisher;
-          await logProgress('完成解析基本信息', id);
-          await logProgress('开始入库', id);
-          finishParsingPaper({
-            title: parsedTitle,
-            author: parsedAuthor,
-            summary: parsedSummary,
-            abstract: parsedAbstract || parsedSummary,
-            keywords: parsedKeywords,
-            date: parsedDate,
-            publisher: parsedPublisher,
-            isBackgroundProcessing: true,
-            backgroundTask: '重写摘要中'
+      try {
+        const resolved = await resolvePaperMetadata({
+          fileData,
+          fallbackTitle,
+          fallbackDate: parsedDate,
+          priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
+          parsePdfWithAI: parseWithAI && canUseAI,
+          askAI: window.electronAPI?.askAI
+        });
+        parsedTitle = resolved.title;
+        parsedAuthor = isUnknownLike(resolved.author) ? 'Unknown' : resolved.author;
+        parsedAbstract = resolved.abstract || resolved.summary || '';
+        parsedKeywords = resolved.keywords;
+        parsedDate = resolved.date || parsedDate;
+        parsedPublisher = resolved.publisher || parsedPublisher;
+        parsedDoi = resolved.doi || '';
+        if (parsedDoi && window.electronAPI?.searchPaperReferences) {
+          const refs = await window.electronAPI.searchPaperReferences({
+            doi: parsedDoi,
+            title: parsedTitle
           });
-          await logProgress('完成入库', id);
-          let rewriteSummary = parsedSummary;
-          try {
-            const fullText = await fullTextTask;
-            patchPaper({
-              isRewritingSummary: true,
-              summaryRewriteDone: false
-            });
-            await logProgress('开始重写摘要', id);
-            const rewritten = await rewriteSummaryWithAI(
-              {
-                originalAbstract: parsedAbstract,
-                fullText
-              },
-              window.electronAPI!.askAI!
-            );
-            if (rewritten) {
-              rewriteSummary = rewritten;
-            }
-          } catch (error) {
-            console.warn('重写摘要失败，使用原始摘要:', error);
-          } finally {
-            await logProgress('完成重写摘要', id);
-            await logProgress('开始入库', id);
-            patchPaper({
-              summary: rewriteSummary,
-              abstract: parsedAbstract || rewriteSummary,
-              isRewritingSummary: false,
-              summaryRewriteDone: true,
-              isBackgroundProcessing: false,
-              backgroundTask: ''
-            });
-            await logProgress('完成入库', id);
+          if (refs?.ok) {
+            parsedReferences = Array.isArray(refs.references) ? refs.references : [];
+            parsedReferenceStats = {
+              totalOpenAlex: Number(refs.total_openalex || 0),
+              totalSemanticScholar: Number(refs.total_semanticscholar || 0),
+              intersectionCount: Number((refs.union_count ?? refs.intersection_count) || 0)
+            };
+          } else {
+            console.warn('参考文献解析失败:', refs?.error || 'unknown');
           }
-          return;
-        } catch (error) {
-          console.warn('AI解析失败，回退传统解析:', error);
-          parseWithAI = false;
         }
-      }
-
-      if (!parseWithAI || !canUseAI) {
-        try {
-          const parsed = await extractPdfFirstPageMetadata(fileData, fallbackTitle);
-          parsedTitle = parsed.metadata.title || fallbackTitle;
-          parsedAuthor = parsed.metadata.author || 'Unknown';
-          parsedSummary = parsed.metadata.summary || 'Uploaded PDF';
-          parsedAbstract = parsedSummary;
-          parsedKeywords = parsed.metadata.keywords || [];
-          parsedDate = parsed.metadata.publishedDate || parsedDate;
-          parsedPublisher = parsed.metadata.publisher || parsedPublisher;
-          await logProgress('完成解析基本信息', id);
-        } catch (error) {
-          console.warn('PDF首页解析失败，使用默认信息:', error);
-          await logProgress('完成解析基本信息', id);
+        if (!parsedReferences.length) {
+          const localRefs = await extractPdfReferencesFromLocal(fileData, { maxPages: 80, maxRefs: 200 });
+          if (localRefs.length) {
+            parsedReferences = localRefs;
+            parsedReferenceStats = undefined;
+            console.log(`[references][local] paper=${id} count=${localRefs.length}`);
+          }
         }
+      } catch (error) {
+        console.warn('解析论文信息失败，使用默认信息:', error);
       }
+      await logProgress('完成解析基本信息', id);
 
       const updates: Partial<Paper> = {
         title: parsedTitle,
         author: parsedAuthor,
-        summary: parsedSummary,
-        abstract: parsedAbstract || parsedSummary,
+        abstract: parsedAbstract || 'No abstract extracted.',
         keywords: parsedKeywords,
         date: parsedDate,
         publisher: parsedPublisher,
+        doi: parsedDoi,
+        references: parsedReferences,
+        referenceStats: parsedReferenceStats,
         isBackgroundProcessing: false,
         backgroundTask: ''
       };
@@ -332,6 +294,42 @@ const App: React.FC = () => {
       await logProgress('开始入库', id);
       finishParsingPaper(updates);
       await logProgress('完成入库', id);
+
+      if (parseWithAI && canUseAI) {
+        let rewriteSummary = '';
+        try {
+          patchPaper({
+            isBackgroundProcessing: true,
+            backgroundTask: '重写摘要中',
+            isRewritingSummary: true,
+            summaryRewriteDone: false
+          });
+          await logProgress('开始重写摘要', id);
+          const fullText = await extractPdfFullText(fileData, { maxChars: 260000 });
+            const rewritten = await rewriteSummaryWithAI(
+              {
+                originalAbstract: parsedAbstract || '',
+                fullText
+              },
+              window.electronAPI!.askAI!
+            );
+            if (rewritten) rewriteSummary = rewritten;
+          } catch (error) {
+            console.warn('重写摘要失败，使用原始摘要:', error);
+          } finally {
+            await logProgress('完成重写摘要', id);
+            await logProgress('开始入库', id);
+            patchPaper({
+              ...(rewriteSummary ? { summary: rewriteSummary } : {}),
+              abstract: parsedAbstract || '',
+              isRewritingSummary: false,
+              summaryRewriteDone: Boolean(rewriteSummary),
+              isBackgroundProcessing: false,
+              backgroundTask: ''
+            });
+            await logProgress('完成入库', id);
+          }
+        }
     })();
 
     return pendingPaper;
@@ -986,3 +984,7 @@ const App: React.FC = () => {
 };
 
 export default App;
+      const isUnknownLike = (value: string) => {
+        const v = String(value || '').trim().toLowerCase();
+        return !v || v === 'unknown' || v === 'unknow';
+      };

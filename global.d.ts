@@ -20,6 +20,24 @@ declare global {
         content?: string;
         error?: string;
       }>;
+      searchPaperOpenSource?: (title: string) => Promise<{
+        source: 'OpenAlex' | 'Semantic Scholar';
+        title?: string;
+        authors?: string[];
+        publication_date?: string;
+        venue?: string;
+        doi?: string | null;
+      } | null>;
+      searchPaperReferences?: (payload: { doi: string; title?: string }) => Promise<{
+        ok: boolean;
+        doi: string;
+        total_openalex: number;
+        total_semanticscholar: number;
+        intersection_count: number;
+        union_count?: number;
+        references: string[];
+        error?: string;
+      }>;
       getEmbedding?: (payload:
         | string
         | {

@@ -24,13 +24,11 @@ import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
 import {
-  extractMetadataWithAI,
   extractPdfFullText,
-  extractPdfFirstPageMetadata,
-  extractPdfFirstPageText,
-  extractPdfMetadataFromTextItems,
+  extractPdfReferencesFromLocal,
   rewriteSummaryWithAI
 } from '../services/pdfMetadataService';
+import { resolvePaperMetadata } from '../services/paperMetadataResolver';
 import {
   buildMindmapStateV2FromOutline,
   deriveLegacyMindmapDataFromV2,
@@ -932,99 +930,97 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
       const fallbackTitle = paper.title || 'Document';
       let updates: Partial<Paper> = {};
       let parseBuffer: ArrayBuffer | null = null;
-
-      if (parseWithAI && canUseAI) {
-        let firstPageText = '';
-        if (pdfDocRef.current) {
-          const page = await pdfDocRef.current.getPage(1);
-          const textContent = await page.getTextContent();
-          const parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
-          firstPageText = parsed.firstPageText;
+      parseBuffer = getPdfBufferForParsing();
+      if (!parseBuffer && typeof pdfFile === 'string') {
+        const response = await fetch(pdfFile);
+        parseBuffer = await response.arrayBuffer();
+      }
+      if (!parseBuffer) {
+        throw new Error('无法读取PDF内容');
+      }
+      const fallbackDate = paper.date || '';
+      const normalizedCurrentAuthor = String(paper.author || '').trim();
+      const isUnknownLike = (value: string) => {
+        const v = String(value || '').trim().toLowerCase();
+        return !v || v === 'unknown' || v === 'unknow';
+      };
+      const resolved = await resolvePaperMetadata({
+        fileData: parseBuffer,
+        fallbackTitle,
+        fallbackDate,
+        priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
+        parsePdfWithAI: parseWithAI && canUseAI,
+        askAI: window.electronAPI?.askAI
+      });
+      const originalAbstract = String(resolved.abstract || resolved.summary || '').trim();
+      const resolvedAuthor = String(resolved.author || '').trim();
+      const nextAuthor = isUnknownLike(resolvedAuthor)
+        ? normalizedCurrentAuthor || 'Unknown'
+        : resolvedAuthor;
+      const parsedAbstract = String(resolved.abstract || resolved.summary || '').trim();
+      updates = {
+        ...(resolved.title ? { title: resolved.title } : {}),
+        ...(nextAuthor ? { author: nextAuthor } : {}),
+        ...(parsedAbstract ? { abstract: parsedAbstract } : {}),
+        keywords: Array.isArray(resolved.keywords) ? resolved.keywords : [],
+        ...(resolved.date ? { date: resolved.date } : {}),
+        ...(resolved.publisher ? { publisher: resolved.publisher } : {}),
+        ...(resolved.doi ? { doi: resolved.doi } : {})
+      };
+      if (resolved.doi && window.electronAPI?.searchPaperReferences) {
+        const refs = await window.electronAPI.searchPaperReferences({
+          doi: resolved.doi,
+          title: resolved.title || paper.title
+        });
+        if (refs?.ok) {
+          updates.references = Array.isArray(refs.references) ? refs.references : [];
+          updates.referenceStats = {
+            totalOpenAlex: Number(refs.total_openalex || 0),
+            totalSemanticScholar: Number(refs.total_semanticscholar || 0),
+            intersectionCount: Number((refs.union_count ?? refs.intersection_count) || 0)
+          };
         } else {
-          const directBuffer = getPdfBufferForParsing();
-          if (directBuffer) {
-            firstPageText = await extractPdfFirstPageText(directBuffer);
-          } else if (typeof pdfFile === 'string') {
-            const response = await fetch(pdfFile);
-            const buffer = await response.arrayBuffer();
-            firstPageText = await extractPdfFirstPageText(buffer);
-          }
+          console.warn('参考文献解析失败:', refs?.error || 'unknown');
         }
+      }
+      if (
+        (!Array.isArray(updates.references) || !updates.references.length) &&
+        parseBuffer
+      ) {
+        const localRefs = await extractPdfReferencesFromLocal(parseBuffer, {
+          maxPages: 80,
+          maxRefs: 200
+        });
+        if (localRefs.length) {
+          updates.references = localRefs;
+          updates.referenceStats = undefined;
+          console.log(`[references][local] paper=${paper.id} count=${localRefs.length}`);
+        }
+      }
+      await logProgress('完成解析基本信息', paper.id);
 
-        if (!firstPageText) {
-          throw new Error('无法读取PDF首页内容');
-        }
-        const aiMetadata = await extractMetadataWithAI(firstPageText, window.electronAPI!.askAI!);
-        const originalAbstract = String(aiMetadata.summary || paper.abstract || paper.summary || '').trim();
-        updates = {
-          ...(aiMetadata.title ? { title: aiMetadata.title } : {}),
-          ...(aiMetadata.author ? { author: aiMetadata.author } : {}),
-          ...(originalAbstract ? { summary: originalAbstract } : {}),
-          ...(originalAbstract ? { abstract: originalAbstract } : {}),
-          keywords: Array.isArray(aiMetadata.keywords) ? aiMetadata.keywords : [],
-          ...(aiMetadata.publishedDate ? { date: aiMetadata.publishedDate } : {}),
-          ...(aiMetadata.publisher ? { publisher: aiMetadata.publisher } : {})
-        };
-        await logProgress('完成解析基本信息', paper.id);
-        parseBuffer = getPdfBufferForParsing();
-        if (!parseBuffer && typeof pdfFile === 'string') {
-          const response = await fetch(pdfFile);
-          parseBuffer = await response.arrayBuffer();
-        }
-
-        if (parseBuffer && originalAbstract) {
-          try {
-            await logProgress('开始重写摘要', paper.id);
-            const fullText = await extractPdfFullText(parseBuffer as ArrayBuffer, {
-              maxChars: 260000
-            });
-            if (fullText) {
-              const rewrittenSummary = await rewriteSummaryWithAI(
-                {
-                  originalAbstract,
-                  fullText
-                },
-                window.electronAPI!.askAI!
-              );
-              if (rewrittenSummary) {
-                updates.summary = rewrittenSummary;
-              }
+      if (parseWithAI && canUseAI && parseBuffer && originalAbstract) {
+        try {
+          await logProgress('开始重写摘要', paper.id);
+          const fullText = await extractPdfFullText(parseBuffer as ArrayBuffer, {
+            maxChars: 260000
+          });
+          if (fullText) {
+            const rewrittenSummary = await rewriteSummaryWithAI(
+              {
+                originalAbstract,
+                fullText
+              },
+              window.electronAPI!.askAI!
+            );
+            if (rewrittenSummary) {
+              updates.summary = rewrittenSummary;
             }
-            await logProgress('完成重写摘要', paper.id);
-          } catch (error) {
-            console.warn('重写摘要失败，保留原摘要:', error);
           }
+          await logProgress('完成重写摘要', paper.id);
+        } catch (error) {
+          console.warn('重写摘要失败，保留原摘要:', error);
         }
-      } else {
-        let parsed: { metadata: any } | null = null;
-        if (pdfDocRef.current) {
-          const page = await pdfDocRef.current.getPage(1);
-          const textContent = await page.getTextContent();
-          parsed = extractPdfMetadataFromTextItems(textContent.items, fallbackTitle);
-        } else {
-          const directBuffer = getPdfBufferForParsing();
-          if (directBuffer) {
-            parsed = await extractPdfFirstPageMetadata(directBuffer, fallbackTitle);
-          } else if (typeof pdfFile === 'string') {
-            const response = await fetch(pdfFile);
-            const buffer = await response.arrayBuffer();
-            parsed = await extractPdfFirstPageMetadata(buffer, fallbackTitle);
-          }
-        }
-        if (!parsed) {
-          throw new Error('无法读取PDF首页内容');
-        }
-        const meta = parsed.metadata || {};
-        updates = {
-          ...(meta.title ? { title: meta.title } : {}),
-          ...(meta.author ? { author: meta.author } : {}),
-          ...(meta.summary ? { summary: meta.summary } : {}),
-          ...(meta.summary ? { abstract: meta.summary } : {}),
-          ...(meta.keywords ? { keywords: meta.keywords } : {}),
-          ...(meta.publishedDate ? { date: meta.publishedDate } : {}),
-          ...(meta.publisher ? { publisher: meta.publisher } : {})
-        };
-        await logProgress('完成解析基本信息', paper.id);
       }
 
       if (Object.keys(updates).length) {
@@ -5837,6 +5833,32 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布机构</div>
                     <div>{paper.publisher || '-'}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-400 text-xs uppercase mb-1">参考文献</div>
+                    {Array.isArray(paper.references) && paper.references.length ? (
+                      <div className="space-y-1">
+                        {paper.referenceStats ? (
+                          <div className="text-[11px] text-gray-500">
+                            并集 {paper.referenceStats.intersectionCount} / OpenAlex{' '}
+                            {paper.referenceStats.totalOpenAlex} / Semantic Scholar{' '}
+                            {paper.referenceStats.totalSemanticScholar}
+                          </div>
+                        ) : null}
+                        <div className="max-h-44 overflow-y-auto rounded-md border border-gray-200 bg-white">
+                          {paper.references.map((ref, index) => (
+                            <div
+                              key={`${ref}-${index}`}
+                              className="px-2 py-1 text-xs text-gray-700 border-b border-gray-100 last:border-b-0 break-all"
+                            >
+                              {index + 1}. {ref}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-xs text-gray-500">暂无参考文献数据</div>
+                    )}
                   </div>
                   {infoRefreshError ? (
                     <div className="text-xs text-red-500">{infoRefreshError}</div>

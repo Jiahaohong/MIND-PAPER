@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electron', {
 contextBridge.exposeInMainWorld('electronAPI', {
   translateText: (payload) => ipcRenderer.invoke('translate-text', payload),
   askAI: (payload) => ipcRenderer.invoke('ask-ai', payload),
+  searchPaperOpenSource: (title) => ipcRenderer.invoke('search-paper-open-source', { title }),
+  searchPaperReferences: (payload) => ipcRenderer.invoke('search-paper-references', payload),
   getEmbedding: (payload) => ipcRenderer.invoke('get-embedding', payload),
   logSummaryRewrite: (payload) => ipcRenderer.invoke('log-summary-rewrite', payload),
   logProgress: (payload) => ipcRenderer.invoke('log-progress', payload),

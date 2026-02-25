@@ -20,6 +20,13 @@ export interface Paper {
   method?: string;
   keywords: string[];
   publisher?: string;
+  doi?: string;
+  references?: string[];
+  referenceStats?: {
+    totalOpenAlex: number;
+    totalSemanticScholar: number;
+    intersectionCount: number;
+  };
   fileUrl?: string;
   fileData?: ArrayBuffer;
   filePath?: string;
