@@ -470,9 +470,12 @@ const waitForQdrantReady = async (url, timeoutMs = 15000) => {
 };
 
 const getQdrantBinaryName = () => {
-  if (process.platform === 'darwin') return 'qdrant-macos';
-  if (process.platform === 'win32') return 'qdrant-win.exe';
-  return 'qdrant-linux';
+  const platformBinaryMap = {
+    darwin: 'qdrant-macos',
+    win32: 'qdrant-win.exe',
+    linux: 'qdrant-linux'
+  };
+  return platformBinaryMap[process.platform] || 'qdrant';
 };
 
 const resolveQdrantCandidates = (localTarget, storagePath) => {
@@ -493,9 +496,15 @@ const resolveQdrantCandidates = (localTarget, storagePath) => {
     candidates.push({ command, args: [], envOverrides, isPath });
   };
 
-  appendCandidates(envBin, true);
+  const envBinLooksLikePath =
+    envBin.startsWith('.') || envBin.startsWith('/') || envBin.startsWith('\\') || /[\\/]/.test(envBin);
+  appendCandidates(envBin, envBinLooksLikePath);
   appendCandidates(packagedPath, true);
   appendCandidates(devLocalPath, true);
+  appendCandidates('qdrant');
+  if (process.platform === 'win32') {
+    appendCandidates('qdrant.exe');
+  }
   return candidates;
 };
 
