@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     savePaperState: (paperId, state) =>
       ipcRenderer.invoke('library-save-paper-state', { paperId, state }),
     deletePaper: (payload) => ipcRenderer.invoke('library-delete-paper', payload),
-    deletePapers: (payload) => ipcRenderer.invoke('library-delete-papers', payload)
+    deletePapers: (payload) => ipcRenderer.invoke('library-delete-papers', payload),
+    matchReferences: (payload) => ipcRenderer.invoke('library-match-references', payload)
   }
 });

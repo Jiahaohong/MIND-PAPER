@@ -21,11 +21,13 @@ export interface Paper {
   keywords: string[];
   publisher?: string;
   doi?: string;
-  references?: string[];
+  references?: PaperReference[];
   referenceStats?: {
     totalOpenAlex: number;
     totalSemanticScholar: number;
     intersectionCount: number;
+    finalCount?: number;
+    matchedCount?: number;
   };
   fileUrl?: string;
   fileData?: ArrayBuffer;
@@ -44,6 +46,16 @@ export interface TOCItem {
   title: string;
   page: number;
   children?: TOCItem[];
+}
+
+export interface PaperReference {
+  refId: string;
+  title: string;
+  order?: number;
+  source: 'api' | 'local' | 'merged';
+  matchedPaperId?: string;
+  matchedTitle?: string;
+  matchScore?: number;
 }
 
 export enum ReaderMode {

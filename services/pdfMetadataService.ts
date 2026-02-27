@@ -1,4 +1,5 @@
 import { pdfjs } from 'react-pdf';
+import type { PaperReference } from '../types';
 
 type AskAIFn = (payload: {
   prompt: string;
@@ -1213,64 +1214,185 @@ export const extractPdfFullText = async (
 export const extractPdfReferencesFromLocal = async (
   fileData: ArrayBuffer,
   options?: { maxPages?: number; maxRefs?: number }
-): Promise<string[]> => {
+): Promise<PaperReference[]> => {
+  type RefLine = LineItem & { pageNo: number };
+
   const maxPages = Math.max(1, options?.maxPages || 80);
   const maxRefs = Math.max(10, options?.maxRefs || 200);
-  const fullText = await extractPdfFullText(fileData, {
-    maxPages,
-    maxChars: 420000
-  });
-  if (!fullText) return [];
-
-  const lines = fullText
-    .split('\n')
-    .map((line) => line.replace(/\[Page\s+\d+\]/gi, '').trim())
-    .filter(Boolean);
-  if (!lines.length) return [];
+  ensureWorker();
+  const loadingTask = pdfjs.getDocument({ data: fileData.slice(0) });
+  const doc = await loadingTask.promise;
+  const allLines: RefLine[] = [];
+  try {
+    const pageLimit = Math.max(1, Math.min(doc.numPages, maxPages));
+    for (let pageNo = 1; pageNo <= pageLimit; pageNo += 1) {
+      const page = await doc.getPage(pageNo);
+      const textContent = await page.getTextContent();
+      const pageLines = buildLines(textContent.items || []);
+      pageLines.forEach((line) => {
+        if (line.text) {
+          allLines.push({ ...line, pageNo });
+        }
+      });
+    }
+  } finally {
+    try {
+      await doc.destroy();
+    } catch {
+      // ignore
+    }
+  }
+  if (!allLines.length) return [];
 
   const headingRegex =
     /^(references?|bibliography|reference list|works cited|参考文献|参考资料|文献)\s*$/i;
-  const stopRegex =
+  const explicitStopRegex =
     /^(appendix|appendices|supplementary|acknowledg(?:e)?ments?|致谢|附录)\b/i;
   const entryStartRegex = /^\s*(\[\d{1,4}\]|\(\d{1,4}\)|\d{1,4}[.)])\s+/;
-  const spaceNorm = (value: string) => value.replace(/\s+/g, ' ').trim();
+  const allCapsHeadingRegex = /^[A-Z][A-Z\s/&-]{2,}$/;
+  const spaceNorm = (value: string) => normalizeLine(value).trim();
 
-  const headingIndex = lines.findIndex((line) => headingRegex.test(line));
+  const headingIndex = allLines.findIndex((line) => headingRegex.test(spaceNorm(line.text)));
   if (headingIndex < 0) return [];
+
+  const bodySizes = allLines
+    .map((line) => Number(line.size || 0))
+    .filter((size) => Number.isFinite(size) && size > 0)
+    .sort((a, b) => a - b);
+  const bodySizeMedian = bodySizes.length ? bodySizes[Math.floor(bodySizes.length / 2)] : 10;
+
+  const collectGapSamples = () => {
+    const gaps: number[] = [];
+    for (let i = headingIndex + 1; i < Math.min(allLines.length, headingIndex + 120); i += 1) {
+      const prev = allLines[i - 1];
+      const curr = allLines[i];
+      if (!prev || !curr) continue;
+      if (prev.pageNo !== curr.pageNo) continue;
+      const gap = prev.y - curr.y;
+      if (gap > 0 && gap < 80) gaps.push(gap);
+    }
+    gaps.sort((a, b) => a - b);
+    return gaps;
+  };
+
+  const gapSamples = collectGapSamples();
+  const medianGap = gapSamples.length ? gapSamples[Math.floor(gapSamples.length / 2)] : 10;
+  const entryGapThreshold = Math.max(14, medianGap * 1.8);
+
+  const looksLikeSectionHeading = (line: RefLine) => {
+    const text = spaceNorm(line.text);
+    if (!text) return false;
+    if (explicitStopRegex.test(text)) return true;
+    const maybeSection =
+      SECTION_HEADING_REGEX.test(text) ||
+      NUMBERED_SECTION_REGEX.test(text) ||
+      allCapsHeadingRegex.test(text);
+    if (!maybeSection) return false;
+    return Number(line.size || 0) >= bodySizeMedian * 1.02 || text.length <= 80;
+  };
+
+  const looksLikeReferenceStartWithoutMarker = (text: string) => {
+    const normalized = spaceNorm(text);
+    if (!normalized) return false;
+    if (entryStartRegex.test(normalized)) return true;
+    if (/^[A-Z][A-Za-z'`-]+,\s/.test(normalized)) return true;
+    if (/^[A-Z][A-Za-z'`-]+(?:\s+[A-Z][A-Za-z'`-]+){0,4}\s+\(\d{4}[a-z]?\)/.test(normalized)) {
+      return true;
+    }
+    if (/^[A-Z][A-Za-z'`-]+(?:\s+[A-Z]\.){1,3}/.test(normalized)) return true;
+    if (/^[\u4e00-\u9fff]{2,6}[，,、]/.test(normalized)) return true;
+    return false;
+  };
 
   const refs: string[] = [];
   let current = '';
+  let lastLine: RefLine | null = null;
+  let seenRefContent = false;
 
-  for (let i = headingIndex + 1; i < lines.length; i += 1) {
-    const raw = spaceNorm(lines[i]);
+  for (let i = headingIndex + 1; i < allLines.length; i += 1) {
+    const line = allLines[i];
+    const raw = spaceNorm(line.text);
     if (!raw) continue;
-    if (refs.length > 0 && stopRegex.test(raw)) break;
+    if (seenRefContent && looksLikeSectionHeading(line)) break;
 
     const isNewEntry = entryStartRegex.test(raw);
-    if (isNewEntry) {
+    const gap =
+      lastLine && lastLine.pageNo === line.pageNo ? Math.max(0, lastLine.y - line.y) : entryGapThreshold + 1;
+    const shouldSplitByGap =
+      !isNewEntry &&
+      Boolean(current) &&
+      gap >= entryGapThreshold &&
+      looksLikeReferenceStartWithoutMarker(raw);
+
+    if (isNewEntry || shouldSplitByGap) {
       if (current) refs.push(current);
       current = raw;
+      seenRefContent = true;
     } else if (current) {
       current = `${current} ${raw}`.trim();
     } else {
-      // Fallback for reference formats without numeric prefixes.
-      if (/\b(19|20)\d{2}\b/.test(raw) && /[.。]$/.test(raw) && raw.length > 35) {
-        refs.push(raw);
+      if (looksLikeReferenceStartWithoutMarker(raw)) {
+        current = raw;
+        seenRefContent = true;
       }
     }
 
     if (refs.length >= maxRefs) break;
+    lastLine = line;
   }
 
   if (current && refs.length < maxRefs) refs.push(current);
 
-  return Array.from(
-    new Set(
-      refs
-        .map((item) => item.replace(entryStartRegex, '').trim())
-        .filter((item) => item.length >= 18)
-    )
-  ).slice(0, maxRefs);
+  const parseOrder = (value: string) => {
+    const match = value.match(/^\s*(?:\[(\d{1,4})\]|\((\d{1,4})\)|(\d{1,4})[.)])\s+/);
+    const raw = match?.[1] || match?.[2] || match?.[3] || '';
+    const num = Number(raw);
+    return Number.isFinite(num) ? num : undefined;
+  };
+
+  const extractTitle = (value: string) => {
+    const line = value.replace(entryStartRegex, '').replace(/\s+/g, ' ').trim();
+    if (!line) return '';
+
+    const quoted =
+      line.match(/["“”](.{8,240}?)["“”]/)?.[1] ||
+      line.match(/[‘’'](.{8,240}?)[‘’']/)?.[1];
+    if (quoted) return quoted.trim();
+
+    const yearMatch = line.match(/\(?\b(19|20)\d{2}\b\)?[a-z]?[.,)]?\s*(.+)$/i);
+    if (yearMatch?.[2]) {
+      const afterYear = yearMatch[2].trim();
+      const sentence = afterYear.split(/\.\s+/).map((part) => part.trim()).find((part) => part.length > 8);
+      if (sentence) return sentence.replace(/\.$/, '').trim();
+    }
+
+    const parts = line
+      .split(/\.\s+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    const titleLike = parts.find(
+      (part) =>
+        part.length > 8 &&
+        !/\b(19|20)\d{2}\b/.test(part) &&
+        !/@/.test(part) &&
+        !/^(vol|pp|pages?)\b/i.test(part)
+    );
+    return (titleLike || line).replace(/\.$/, '').trim();
+  };
+
+  return refs
+    .map((item, index) => {
+      const title = extractTitle(item);
+      if (!title || title.length < 4) return null;
+      return {
+        refId: `local-ref-${index + 1}`,
+        order: parseOrder(item),
+        title,
+        source: 'local'
+      } satisfies PaperReference;
+    })
+    .filter(Boolean)
+    .slice(0, maxRefs) as PaperReference[];
 };
 
 const splitTextForAI = (text: string, maxChars = 16000) => {

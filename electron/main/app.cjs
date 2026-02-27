@@ -1029,6 +1029,87 @@ const fileExists = async (filePath) => {
   }
 };
 
+const normalizePaperReference = (reference, index = 0) => {
+  if (typeof reference === 'string') {
+    const title = String(reference || '').trim();
+    if (!title) return null;
+    return {
+      refId: `legacy-ref-${crypto.createHash('sha1').update(`${index}:${title}`).digest('hex').slice(0, 12)}`,
+      title,
+      source: 'local'
+    };
+  }
+  if (!reference || typeof reference !== 'object') return null;
+  const title = String(reference.title || reference.rawText || '').trim();
+  if (!title) return null;
+  return {
+    refId:
+      String(reference.refId || '').trim() ||
+      `ref-${crypto.createHash('sha1').update(`${index}:${title}`).digest('hex').slice(0, 12)}`,
+    title,
+    order: Number.isFinite(Number(reference.order)) ? Number(reference.order) : undefined,
+    source:
+      reference.source === 'api' || reference.source === 'merged' || reference.source === 'local'
+        ? reference.source
+        : 'local',
+    matchedPaperId: String(reference.matchedPaperId || '').trim() || undefined,
+    matchedTitle: String(reference.matchedTitle || '').trim() || undefined,
+    matchScore: Number.isFinite(Number(reference.matchScore)) ? Number(reference.matchScore) : undefined
+  };
+};
+
+const tokenizeNormalizedTitle = (value) =>
+  normalizeReferenceTitle(value)
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const computeTitleMatchScore = (left, right) => {
+  const a = tokenizeNormalizedTitle(left);
+  const b = tokenizeNormalizedTitle(right);
+  if (!a.length || !b.length) return 0;
+  const aJoined = a.join(' ');
+  const bJoined = b.join(' ');
+  if (aJoined === bJoined) return 1;
+  if (aJoined.includes(bJoined) || bJoined.includes(aJoined)) return 0.96;
+  const bSet = new Set(b);
+  let common = 0;
+  a.forEach((token) => {
+    if (bSet.has(token)) common += 1;
+  });
+  return common / Math.max(a.length, b.length);
+};
+
+const matchReferencesToLocalPapers = async (paperId, references) => {
+  const currentPaperId = String(paperId || '').trim();
+  const input = Array.isArray(references) ? references : [];
+  if (!input.length) return [];
+  await ensureLibraryMetaReady();
+  const localPapers = await loadPapersFromMeta();
+  const candidates = localPapers.filter((paper) => String(paper?.id || '').trim() !== currentPaperId);
+  return input.map((reference, index) => {
+    const normalized = normalizePaperReference(reference, index);
+    if (!normalized) return null;
+    const refTitle = String(normalized.title || '').trim();
+    if (!refTitle) return normalized;
+    let bestPaper = null;
+    let bestScore = 0;
+    candidates.forEach((paper) => {
+      const score = computeTitleMatchScore(refTitle, paper?.title || '');
+      if (score > bestScore) {
+        bestScore = score;
+        bestPaper = paper;
+      }
+    });
+    if (bestPaper && bestScore >= 0.72) {
+      normalized.matchedPaperId = String(bestPaper.id || '').trim() || undefined;
+      normalized.matchedTitle = String(bestPaper.title || '').trim() || undefined;
+      normalized.matchScore = Number(bestScore.toFixed(4));
+    }
+    return normalized;
+  }).filter(Boolean);
+};
+
 const moveFileSafe = async (fromPath, toPath) => {
   const from = String(fromPath || '').trim();
   const to = String(toPath || '').trim();
@@ -1066,14 +1147,18 @@ const sanitizePaperForMeta = (paper, targetPdfPath) => {
     publisher: String(source.publisher || '').trim(),
     doi: String(source.doi || '').trim(),
     references: Array.isArray(source.references)
-      ? source.references.map((item) => normalizeDoi(item)).filter(Boolean)
+      ? source.references
+          .map((item, index) => normalizePaperReference(item, index))
+          .filter(Boolean)
       : [],
     referenceStats:
       source.referenceStats && typeof source.referenceStats === 'object'
         ? {
             totalOpenAlex: Number(source.referenceStats.totalOpenAlex || 0),
             totalSemanticScholar: Number(source.referenceStats.totalSemanticScholar || 0),
-            intersectionCount: Number(source.referenceStats.intersectionCount || 0)
+            intersectionCount: Number(source.referenceStats.intersectionCount || 0),
+            finalCount: Number(source.referenceStats.finalCount || 0),
+            matchedCount: Number(source.referenceStats.matchedCount || 0)
           }
         : undefined,
     filePath: targetPdfPath
@@ -1643,7 +1728,7 @@ const getOpenAlexReferencesByDoi = async (doi) => {
     .map((item) => String(item || '').trim())
     .filter(Boolean);
   if (!ids.length) return [];
-  const allDois = [];
+  const refItems = [];
   const fetchRefDetailsBatch = async (batchIds) => {
     const keys = ['openalex', 'openalex_id', 'ids.openalex'];
     for (const key of keys) {
@@ -1667,13 +1752,22 @@ const getOpenAlexReferencesByDoi = async (doi) => {
     const chunk = ids.slice(index, index + chunkSize);
     // eslint-disable-next-line no-await-in-loop
     const results = await fetchRefDetailsBatch(chunk);
-    allDois.push(
-      ...results
-        .map((item) => normalizeDoi(item?.doi))
-        .filter(Boolean)
+    refItems.push(
+      ...results.map((item, resultIndex) => ({
+        doi: normalizeDoi(item?.doi),
+        title: String(item?.title || '').trim(),
+        index: index + resultIndex
+      }))
     );
   }
-  return Array.from(new Set(allDois));
+  const dedup = new Map();
+  refItems.forEach((item, idx) => {
+    const key = item.doi || normalizeReferenceTitle(item.title);
+    if (!key || dedup.has(key)) return;
+    const ref = buildApiReference(item.title || item.doi, idx, 'openalex');
+    if (ref) dedup.set(key, ref);
+  });
+  return Array.from(dedup.values());
 };
 
 const getOpenAlexReferencesByTitle = async (title) => {
@@ -1694,7 +1788,16 @@ const getOpenAlexReferencesByTitle = async (title) => {
     `https://api.openalex.org/works?filter=ids.openalex:${encodeURIComponent(batch.join('|'))}&per-page=${batch.length}`
   ).catch(() => null);
   const results = Array.isArray(detail?.results) ? detail.results : [];
-  return Array.from(new Set(results.map((item) => normalizeDoi(item?.doi)).filter(Boolean)));
+  const dedup = new Map();
+  results.forEach((item, index) => {
+    const doi = normalizeDoi(item?.doi);
+    const title = String(item?.title || '').trim();
+    const key = doi || normalizeReferenceTitle(title);
+    if (!key || dedup.has(key)) return;
+    const ref = buildApiReference(title || doi, index, 'openalex');
+    if (ref) dedup.set(key, ref);
+  });
+  return Array.from(dedup.values());
 };
 
 const searchSemanticScholarByTitle = async (title) => {
@@ -1734,41 +1837,60 @@ const searchSemanticScholarByTitle = async (title) => {
   return output;
 };
 
+const normalizeReferenceTitle = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+    .trim();
+
+const buildApiReference = (title, index, source) => {
+  const normalizedTitle = String(title || '').trim();
+  if (!normalizedTitle) return null;
+  return {
+    refId: `${source}-ref-${index + 1}`,
+    title: normalizedTitle,
+    source: 'api'
+  };
+};
+
 const getSemanticScholarReferencesByDoi = async (doi) => {
   const normalized = normalizeDoi(doi);
   if (!normalized) return [];
   const data = await fetchJsonWithTimeout(
     `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(
       normalized
-    )}?fields=references.externalIds`
+    )}?fields=references.title,references.externalIds`
   ).catch(() => null);
   const references = Array.isArray(data?.references) ? data.references : [];
-  let dois = Array.from(
-    new Set(
-      references
-        .map((item) => normalizeDoi(item?.externalIds?.DOI))
-        .filter(Boolean)
-    )
-  );
-  if (!dois.length) {
+  let refItems = references.map((item, index) => ({
+    doi: normalizeDoi(item?.externalIds?.DOI),
+    title: String(item?.title || '').trim(),
+    index
+  }));
+  if (!refItems.some((item) => item.doi || item.title)) {
     const arxivId = extractArxivIdFromDoi(normalized);
     if (arxivId) {
       const arxivData = await fetchJsonWithTimeout(
         `https://api.semanticscholar.org/graph/v1/paper/ARXIV:${encodeURIComponent(
           arxivId
-        )}?fields=references.externalIds`
+        )}?fields=references.title,references.externalIds`
       ).catch(() => null);
       const arxivRefs = Array.isArray(arxivData?.references) ? arxivData.references : [];
-      dois = Array.from(
-        new Set(
-          arxivRefs
-            .map((item) => normalizeDoi(item?.externalIds?.DOI))
-            .filter(Boolean)
-        )
-      );
+      refItems = arxivRefs.map((item, index) => ({
+        doi: normalizeDoi(item?.externalIds?.DOI),
+        title: String(item?.title || '').trim(),
+        index
+      }));
     }
   }
-  return dois;
+  const dedup = new Map();
+  refItems.forEach((item, idx) => {
+    const key = item.doi || normalizeReferenceTitle(item.title);
+    if (!key || dedup.has(key)) return;
+    const ref = buildApiReference(item.title || item.doi, idx, 'semanticscholar');
+    if (ref) dedup.set(key, ref);
+  });
+  return Array.from(dedup.values());
 };
 
 const getSemanticScholarReferencesByTitle = async (title) => {
@@ -1784,16 +1906,19 @@ const getSemanticScholarReferencesByTitle = async (title) => {
   const detail = await fetchJsonWithTimeout(
     `https://api.semanticscholar.org/graph/v1/paper/${encodeURIComponent(
       paperId
-    )}?fields=references.externalIds`
+    )}?fields=references.title,references.externalIds`
   ).catch(() => null);
   const references = Array.isArray(detail?.references) ? detail.references : [];
-  return Array.from(
-    new Set(
-      references
-        .map((item) => normalizeDoi(item?.externalIds?.DOI))
-        .filter(Boolean)
-    )
-  );
+  const dedup = new Map();
+  references.forEach((item, index) => {
+    const doi = normalizeDoi(item?.externalIds?.DOI);
+    const title = String(item?.title || '').trim();
+    const key = doi || normalizeReferenceTitle(title);
+    if (!key || dedup.has(key)) return;
+    const ref = buildApiReference(title || doi, index, 'semanticscholar');
+    if (ref) dedup.set(key, ref);
+  });
+  return Array.from(dedup.values());
 };
 
 const getReferenceIntersectionByDoi = async (doi, title = '') => {
@@ -1817,7 +1942,13 @@ const getReferenceIntersectionByDoi = async (doi, title = '') => {
       getSemanticScholarReferencesByTitle(title)
     ]);
   }
-  const union = Array.from(new Set([...openAlexRefs, ...semanticScholarRefs]));
+  const unionMap = new Map();
+  [...openAlexRefs, ...semanticScholarRefs].forEach((item) => {
+    const key = normalizeReferenceTitle(item?.title) || String(item?.refId || '');
+    if (!key || unionMap.has(key)) return;
+    unionMap.set(key, item);
+  });
+  const union = Array.from(unionMap.values());
   console.log(
     `[references] doi=${normalized} openalex=${openAlexRefs.length} semanticscholar=${semanticScholarRefs.length} union=${union.length}`
   );
@@ -2203,6 +2334,17 @@ ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
     await cleanupOrphanPaperStateFiles(paths, remainIds);
     return { ok: true };
   });
+});
+
+ipcMain.handle('library-match-references', async (_event, payload = {}) => {
+  try {
+    const paperId = String(payload?.paperId || '').trim();
+    const references = Array.isArray(payload?.references) ? payload.references : [];
+    const matched = await matchReferencesToLocalPapers(paperId, references);
+    return { ok: true, references: matched };
+  } catch (error) {
+    return { ok: false, error: error?.message || 'reference match failed', references: [] };
+  }
 });
 
 ipcMain.handle('vector-search-papers', async (_event, payload = {}) => {

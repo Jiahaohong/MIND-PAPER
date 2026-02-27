@@ -19,7 +19,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
-import { Paper, TOCItem, ReaderMode, AssistantTab, Message } from '../types';
+import { Paper, PaperReference, TOCItem, ReaderMode, AssistantTab, Message } from '../types';
 import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
@@ -46,6 +46,111 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   'pdfjs-dist/build/pdf.worker.min.mjs',
   import.meta.url
 ).toString();
+
+const createReferenceId = (paperId: string, title: string, index: number) => {
+  const normalized = `${paperId}:${index}:${String(title || '').trim()}`;
+  let hash = 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0;
+  }
+  return `ref-${hash.toString(16)}`;
+};
+
+const mapReferences = (
+  paperId: string,
+  refs: Array<string | Partial<PaperReference>>,
+  source: PaperReference['source']
+): PaperReference[] =>
+  refs
+    .map((item, index) => {
+      const title =
+        typeof item === 'string' ? String(item || '').trim() : String(item?.title || '').trim();
+      if (!title) return null;
+      return {
+        refId:
+          typeof item === 'string'
+            ? createReferenceId(paperId, title, index)
+            : String(item?.refId || '').trim() || createReferenceId(paperId, title, index),
+        order:
+          typeof item === 'string'
+            ? undefined
+            : Number.isFinite(Number(item?.order))
+            ? Number(item?.order)
+            : undefined,
+        title,
+        source
+      } satisfies PaperReference;
+    })
+    .filter(Boolean) as PaperReference[];
+
+const normalizeReferenceTitle = (value: string) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+    .trim();
+
+const dedupeReferences = (references: PaperReference[]) => {
+  const merged = new Map<string, PaperReference>();
+  references.forEach((reference) => {
+    const key = normalizeReferenceTitle(reference.title);
+    if (!key) return;
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, reference);
+      return;
+    }
+    merged.set(key, {
+      ...existing,
+      ...(existing.order === undefined && reference.order !== undefined
+        ? { order: reference.order }
+        : {}),
+      ...(existing.matchedPaperId ? {} : reference.matchedPaperId ? { matchedPaperId: reference.matchedPaperId } : {}),
+      ...(existing.matchedTitle ? {} : reference.matchedTitle ? { matchedTitle: reference.matchedTitle } : {}),
+      ...(existing.matchScore !== undefined
+        ? {}
+        : reference.matchScore !== undefined
+        ? { matchScore: reference.matchScore }
+        : {}),
+      source: existing.source === reference.source ? existing.source : 'merged'
+    });
+  });
+  return Array.from(merged.values());
+};
+
+const sortReferences = (references: PaperReference[]) =>
+  [...references].sort((a, b) => {
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+  });
+
+const buildReferenceStats = (
+  references: PaperReference[],
+  base?: Paper['referenceStats']
+): Paper['referenceStats'] | undefined => {
+  if (!references.length && !base) return undefined;
+  const matchedCount = references.filter((item) => Boolean(item.matchedPaperId)).length;
+  return {
+    totalOpenAlex: Number(base?.totalOpenAlex || 0),
+    totalSemanticScholar: Number(base?.totalSemanticScholar || 0),
+    intersectionCount: Number(base?.intersectionCount || references.length || 0),
+    finalCount: references.length,
+    matchedCount
+  };
+};
+
+const matchReferences = async (paperId: string, references: PaperReference[]) => {
+  if (!references.length || typeof window === 'undefined' || !window.electronAPI?.library?.matchReferences) {
+    return references;
+  }
+  try {
+    const response = await window.electronAPI.library.matchReferences({ paperId, references });
+    return response?.ok && Array.isArray(response.references) ? response.references : references;
+  } catch {
+    return references;
+  }
+};
 
 type OutlineNode = {
   id: string;
@@ -950,7 +1055,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         fallbackDate,
         priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
         parsePdfWithAI: parseWithAI && canUseAI,
-        askAI: window.electronAPI?.askAI
+        askAI: window.electronAPI?.askAI,
+        searchOpenSource: window.electronAPI?.searchPaperOpenSource
+          ? (title) => window.electronAPI!.searchPaperOpenSource!(title)
+          : undefined
       });
       const originalAbstract = String(resolved.abstract || resolved.summary || '').trim();
       const resolvedAuthor = String(resolved.author || '').trim();
@@ -967,13 +1075,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         ...(resolved.publisher ? { publisher: resolved.publisher } : {}),
         ...(resolved.doi ? { doi: resolved.doi } : {})
       };
+      let apiReferences: PaperReference[] = [];
+      let apiReferenceSuccess = false;
       if (resolved.doi && window.electronAPI?.searchPaperReferences) {
         const refs = await window.electronAPI.searchPaperReferences({
           doi: resolved.doi,
           title: resolved.title || paper.title
         });
         if (refs?.ok) {
-          updates.references = Array.isArray(refs.references) ? refs.references : [];
+          apiReferences = Array.isArray(refs.references)
+            ? mapReferences(paper.id, refs.references, 'api')
+            : [];
+          apiReferenceSuccess = apiReferences.length > 0;
           updates.referenceStats = {
             totalOpenAlex: Number(refs.total_openalex || 0),
             totalSemanticScholar: Number(refs.total_semanticscholar || 0),
@@ -983,20 +1096,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
           console.warn('参考文献解析失败:', refs?.error || 'unknown');
         }
       }
-      if (
-        (!Array.isArray(updates.references) || !updates.references.length) &&
-        parseBuffer
-      ) {
+      let localReferences: PaperReference[] = [];
+      if (!apiReferenceSuccess && parseBuffer) {
         const localRefs = await extractPdfReferencesFromLocal(parseBuffer, {
           maxPages: 80,
           maxRefs: 200
         });
         if (localRefs.length) {
-          updates.references = localRefs;
-          updates.referenceStats = undefined;
+          localReferences = mapReferences(paper.id, localRefs, 'local');
           console.log(`[references][local] paper=${paper.id} count=${localRefs.length}`);
         }
       }
+      updates.references = apiReferenceSuccess ? apiReferences : dedupeReferences(localReferences);
+      updates.references = await matchReferences(paper.id, updates.references);
+      updates.references = sortReferences(updates.references);
+      updates.referenceStats = buildReferenceStats(updates.references, updates.referenceStats);
       await logProgress('完成解析基本信息', paper.id);
 
       if (parseWithAI && canUseAI && parseBuffer && originalAbstract) {
@@ -5843,15 +5957,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
                             并集 {paper.referenceStats.intersectionCount} / OpenAlex{' '}
                             {paper.referenceStats.totalOpenAlex} / Semantic Scholar{' '}
                             {paper.referenceStats.totalSemanticScholar}
+                            {typeof paper.referenceStats.finalCount === 'number'
+                              ? ` / 最终 ${paper.referenceStats.finalCount}`
+                              : ''}
+                            {typeof paper.referenceStats.matchedCount === 'number'
+                              ? ` / 匹配 ${paper.referenceStats.matchedCount}`
+                              : ''}
                           </div>
                         ) : null}
                         <div className="max-h-44 overflow-y-auto rounded-md border border-gray-200 bg-white">
                           {paper.references.map((ref, index) => (
                             <div
-                              key={`${ref}-${index}`}
+                              key={ref.refId || `${ref.title}-${index}`}
                               className="px-2 py-1 text-xs text-gray-700 border-b border-gray-100 last:border-b-0 break-all"
                             >
-                              {index + 1}. {ref}
+                              {typeof ref.order === 'number' ? `${ref.order}. ` : `${index + 1}. `}
+                              {ref.title}
                             </div>
                           ))}
                         </div>

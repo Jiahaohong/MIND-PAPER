@@ -35,7 +35,15 @@ declare global {
         total_semanticscholar: number;
         intersection_count: number;
         union_count?: number;
-        references: string[];
+        references: Array<{
+          refId: string;
+          title: string;
+          order?: number;
+          source: 'api' | 'local' | 'merged';
+          matchedPaperId?: string;
+          matchedTitle?: string;
+          matchScore?: number;
+        }>;
         error?: string;
       }>;
       getEmbedding?: (payload:
@@ -158,6 +166,27 @@ declare global {
         savePaperState?: (paperId: string, state: any) => Promise<{ ok: boolean }>;
         deletePaper?: (payload: { paperId: string; filePath?: string }) => Promise<{ ok: boolean; error?: string }>;
         deletePapers?: (payload: { items: Array<{ id: string; filePath?: string }> }) => Promise<{ ok: boolean; error?: string }>;
+        matchReferences?: (payload: {
+          paperId?: string;
+          references: Array<{
+            refId: string;
+            title: string;
+            order?: number;
+            source: 'api' | 'local' | 'merged';
+          }>;
+        }) => Promise<{
+          ok: boolean;
+          references?: Array<{
+            refId: string;
+            title: string;
+            order?: number;
+            source: 'api' | 'local' | 'merged';
+            matchedPaperId?: string;
+            matchedTitle?: string;
+            matchScore?: number;
+          }>;
+          error?: string;
+        }>;
       };
     };
   }

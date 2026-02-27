@@ -2,7 +2,6 @@ import {
   extractMetadataWithAI,
   extractPdfFirstPageMetadata,
   extractPdfFirstPageText,
-  searchPaperOpenSourceByTitle,
   type OpenSourcePaperMetadata
 } from './pdfMetadataService';
 
@@ -133,7 +132,7 @@ export const resolvePaperMetadata = async (params: {
     askAI,
     searchOpenSource
   } = params;
-  const openSourceSearcher = searchOpenSource || searchPaperOpenSourceByTitle;
+  const openSourceSearcher = searchOpenSource;
 
   const resolved: ResolvedMetadata = {
     title: '',
@@ -215,7 +214,7 @@ export const resolvePaperMetadata = async (params: {
 
   // Fixed flow:
   // 1) local parse baseline
-  // 2) API by title (Semantic Scholar) overwrite when available
+  // 2) API by title overwrite when available
   // 3) if API failed and AI enabled -> AI overwrite
   try {
     const local = await ensureLocal();

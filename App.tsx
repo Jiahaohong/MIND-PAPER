@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { LibraryView } from './components/LibraryView';
 import { ReaderView } from './components/ReaderView';
-import { Folder, Paper } from './types';
+import { Folder, Paper, PaperReference } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
 import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
@@ -60,6 +60,111 @@ const App: React.FC = () => {
       const value = char === 'x' ? random : (random & 0x3) | 0x8;
       return value.toString(16);
     });
+  };
+
+  const createReferenceId = (paperId: string, title: string, index: number) => {
+    const normalized = `${paperId}:${index}:${String(title || '').trim()}`;
+    let hash = 0;
+    for (let i = 0; i < normalized.length; i += 1) {
+      hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0;
+    }
+    return `ref-${hash.toString(16)}`;
+  };
+
+  const mapReferences = (
+    paperId: string,
+    refs: Array<string | Partial<PaperReference>>,
+    source: PaperReference['source']
+  ): PaperReference[] =>
+    refs
+      .map((item, index) => {
+        const title =
+          typeof item === 'string' ? String(item || '').trim() : String(item?.title || '').trim();
+        if (!title) return null;
+        return {
+          refId:
+            typeof item === 'string'
+              ? createReferenceId(paperId, title, index)
+              : String(item?.refId || '').trim() || createReferenceId(paperId, title, index),
+          order:
+            typeof item === 'string'
+              ? undefined
+              : Number.isFinite(Number(item?.order))
+              ? Number(item?.order)
+              : undefined,
+          title,
+          source
+        } satisfies PaperReference;
+      })
+      .filter(Boolean) as PaperReference[];
+
+  const normalizeReferenceTitle = (value: string) =>
+    String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff]+/g, ' ')
+      .trim();
+
+  const dedupeReferences = (references: PaperReference[]) => {
+    const merged = new Map<string, PaperReference>();
+    references.forEach((reference) => {
+      const key = normalizeReferenceTitle(reference.title);
+      if (!key) return;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, reference);
+        return;
+      }
+      merged.set(key, {
+        ...existing,
+        ...(existing.order === undefined && reference.order !== undefined
+          ? { order: reference.order }
+          : {}),
+        ...(existing.matchedPaperId ? {} : reference.matchedPaperId ? { matchedPaperId: reference.matchedPaperId } : {}),
+        ...(existing.matchedTitle ? {} : reference.matchedTitle ? { matchedTitle: reference.matchedTitle } : {}),
+        ...(existing.matchScore !== undefined
+          ? {}
+          : reference.matchScore !== undefined
+          ? { matchScore: reference.matchScore }
+          : {}),
+        source: existing.source === reference.source ? existing.source : 'merged'
+      });
+    });
+    return Array.from(merged.values());
+  };
+
+  const sortReferences = (references: PaperReference[]) =>
+    [...references].sort((a, b) => {
+      const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+      const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+      if (orderA !== orderB) return orderA - orderB;
+      return a.title.localeCompare(b.title, undefined, { sensitivity: 'base' });
+    });
+
+  const buildReferenceStats = (
+    references: PaperReference[],
+    base?: Paper['referenceStats']
+  ): Paper['referenceStats'] | undefined => {
+    if (!references.length && !base) return undefined;
+    const matchedCount = references.filter((item) => Boolean(item.matchedPaperId)).length;
+    return {
+      totalOpenAlex: Number(base?.totalOpenAlex || 0),
+      totalSemanticScholar: Number(base?.totalSemanticScholar || 0),
+      intersectionCount: Number(base?.intersectionCount || references.length || 0),
+      finalCount: references.length,
+      matchedCount
+    };
+  };
+
+  const matchReferences = async (paperId: string, references: PaperReference[]) => {
+    if (!references.length || typeof window === 'undefined' || !window.electronAPI?.library?.matchReferences) {
+      return references;
+    }
+    try {
+      const response = await window.electronAPI.library.matchReferences({ paperId, references });
+      return response?.ok && Array.isArray(response.references) ? response.references : references;
+    } catch {
+      return references;
+    }
   };
 
   const hydratePaperRuntimeStatus = (paper: Paper): Paper => {
@@ -216,7 +321,7 @@ const App: React.FC = () => {
       let parsedDate = formatNowDate();
       let parsedPublisher = '';
       let parsedDoi = '';
-      let parsedReferences: string[] = [];
+      let parsedReferences: PaperReference[] = [];
       let parsedReferenceStats: Paper['referenceStats'] | undefined;
       let parseWithAI = false;
       let canUseAI = false;
@@ -239,7 +344,10 @@ const App: React.FC = () => {
           fallbackDate: parsedDate,
           priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
           parsePdfWithAI: parseWithAI && canUseAI,
-          askAI: window.electronAPI?.askAI
+          askAI: window.electronAPI?.askAI,
+          searchOpenSource: window.electronAPI?.searchPaperOpenSource
+            ? (title) => window.electronAPI!.searchPaperOpenSource!(title)
+            : undefined
         });
         parsedTitle = resolved.title;
         parsedAuthor = isUnknownLike(resolved.author) ? 'Unknown' : resolved.author;
@@ -248,13 +356,18 @@ const App: React.FC = () => {
         parsedDate = resolved.date || parsedDate;
         parsedPublisher = resolved.publisher || parsedPublisher;
         parsedDoi = resolved.doi || '';
+        let apiReferences: PaperReference[] = [];
+        let apiReferenceSuccess = false;
         if (parsedDoi && window.electronAPI?.searchPaperReferences) {
           const refs = await window.electronAPI.searchPaperReferences({
             doi: parsedDoi,
             title: parsedTitle
           });
           if (refs?.ok) {
-            parsedReferences = Array.isArray(refs.references) ? refs.references : [];
+            apiReferences = Array.isArray(refs.references)
+              ? mapReferences(id, refs.references, 'api')
+              : [];
+            apiReferenceSuccess = apiReferences.length > 0;
             parsedReferenceStats = {
               totalOpenAlex: Number(refs.total_openalex || 0),
               totalSemanticScholar: Number(refs.total_semanticscholar || 0),
@@ -264,14 +377,20 @@ const App: React.FC = () => {
             console.warn('参考文献解析失败:', refs?.error || 'unknown');
           }
         }
-        if (!parsedReferences.length) {
+        let localReferences: PaperReference[] = [];
+        if (!apiReferenceSuccess) {
           const localRefs = await extractPdfReferencesFromLocal(fileData, { maxPages: 80, maxRefs: 200 });
-          if (localRefs.length) {
-            parsedReferences = localRefs;
-            parsedReferenceStats = undefined;
+          localReferences = localRefs.length ? mapReferences(id, localRefs, 'local') : [];
+          if (localReferences.length) {
             console.log(`[references][local] paper=${id} count=${localRefs.length}`);
           }
         }
+        parsedReferences = apiReferenceSuccess
+          ? apiReferences
+          : dedupeReferences(localReferences);
+        parsedReferences = await matchReferences(id, parsedReferences);
+        parsedReferences = sortReferences(parsedReferences);
+        parsedReferenceStats = buildReferenceStats(parsedReferences, parsedReferenceStats);
       } catch (error) {
         console.warn('解析论文信息失败，使用默认信息:', error);
       }
