@@ -5,6 +5,8 @@
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
+    "postinstall": "electron-builder install-app-deps",
+    "rebuild:native": "electron-builder install-app-deps",
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:3001 && electron .\"",
     "electron": "electron .",
     "build": "vite build",
