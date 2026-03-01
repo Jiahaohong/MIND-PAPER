@@ -22,6 +22,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   logProgress: (payload) => ipcRenderer.invoke('log-progress', payload),
   settingsGet: () => ipcRenderer.invoke('settings-get'),
   settingsSet: (payload) => ipcRenderer.invoke('settings-set', payload),
+  webdav: {
+    test: (payload) => ipcRenderer.invoke('webdav-test', payload),
+    save: (payload) => ipcRenderer.invoke('webdav-save', payload),
+    syncUpload: () => ipcRenderer.invoke('webdav-sync-upload')
+  },
   vector: {
     status: () => ipcRenderer.invoke('vector-get-status'),
     getPaperStatuses: (payload) => ipcRenderer.invoke('vector-get-paper-statuses', payload),

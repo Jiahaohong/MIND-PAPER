@@ -23,7 +23,7 @@ const PAPERS_VECTOR_NAME = 'summary';
 const DEFAULT_SUMMARY_EMBEDDING_MODEL = 'text-embedding-3-small';
 const DEFAULT_SUMMARY_VECTOR_DIM = 1024;
 const SUMMARY_EMBED_MAX_TEXT_LEN = 6000;
-const LIBRARY_META_VERSION = 1;
+const LIBRARY_SQLITE_VERSION = 1;
 const LIBRARY_FOLDERS_POINT_KEY = '__folders__';
 const LIBRARY_MIGRATION_POINT_KEY = '__migration__';
 const TRANSLATE_SYSTEM_PROMPT =
@@ -33,6 +33,8 @@ const CNKI_TRANSLATE_URL = 'https://dict.cnki.net/fyzs-front-api/translate/liter
 const CNKI_REGEX = /(查看名企职位.+?https:\/\/dict\.cnki\.net[a-zA-Z./]+.html?)/g;
 const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
+const WEBDAV_KEYTAR_SERVICE = 'MindPaper-WebDAV';
+const DEFAULT_WEBDAV_REMOTE_PATH = '/mindpaper';
 
 let settingsLoaded = false;
 let writeChain = Promise.resolve();
@@ -44,14 +46,22 @@ let runtimeSettings = {
   baseUrl: '',
   model: '',
   parsePdfWithAI: false,
-  libraryPath: ''
+  libraryPath: '',
+  webdavServer: '',
+  webdavUsername: '',
+  webdavRemotePath: DEFAULT_WEBDAV_REMOTE_PATH
 };
 
 let cnkiTokenCache = { token: '', t: 0 };
 let qdrantBootPromise = null;
 let qdrantProcess = null;
 let qdrantStartedByApp = false;
-let libraryMetaReadyPromise = null;
+let libraryStoreReadyPromise = null;
+let sqliteDriver = null;
+let libraryDb = null;
+let libraryDbRoot = '';
+let webdavDriverPromise = null;
+let keytarDriver = null;
 let summaryVectorSyncChain = Promise.resolve();
 const PROGRESS_STAGES = new Set([
   '开始解析基本信息',
@@ -136,13 +146,95 @@ const resolveLibraryPath = (value) => {
   return path.resolve(raw);
 };
 
+const normalizeWebDavServer = (value) => String(value || '').trim().replace(/\/+$/, '');
+
+const normalizeWebDavRemotePath = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return DEFAULT_WEBDAV_REMOTE_PATH;
+  const normalized = raw.replace(/\/+$/, '');
+  return normalized.startsWith('/') ? normalized || DEFAULT_WEBDAV_REMOTE_PATH : `/${normalized}`;
+};
+
+const getWebDavDriver = async () => {
+  if (webdavDriverPromise) return webdavDriverPromise;
+  webdavDriverPromise = import('webdav')
+    .then((mod) => mod?.default || mod)
+    .catch((error) => {
+      webdavDriverPromise = null;
+      throw new Error(`缺少 webdav 依赖: ${error?.message || error}`);
+    });
+  return webdavDriverPromise;
+};
+
+const getKeytarDriver = () => {
+  if (keytarDriver) return keytarDriver;
+  try {
+    keytarDriver = require('keytar');
+    return keytarDriver;
+  } catch (error) {
+    throw new Error(`缺少 keytar 依赖: ${error?.message || error}`);
+  }
+};
+
+const getWebDavCredentialAccount = (server, username) =>
+  `${normalizeWebDavServer(server)}|${String(username || '').trim()}`;
+
+const saveWebDavCredential = async (server, username, password) => {
+  const normalizedServer = normalizeWebDavServer(server);
+  const normalizedUsername = String(username || '').trim();
+  const secret = String(password || '');
+  if (!normalizedServer || !normalizedUsername) {
+    throw new Error('缺少 WebDAV 服务器地址或用户名');
+  }
+  const keytar = getKeytarDriver();
+  if (secret) {
+    await keytar.setPassword(
+      WEBDAV_KEYTAR_SERVICE,
+      getWebDavCredentialAccount(normalizedServer, normalizedUsername),
+      secret
+    );
+    return true;
+  }
+  return false;
+};
+
+const getWebDavCredential = async (server, username) => {
+  const normalizedServer = normalizeWebDavServer(server);
+  const normalizedUsername = String(username || '').trim();
+  if (!normalizedServer || !normalizedUsername) return '';
+  const keytar = getKeytarDriver();
+  return (
+    (await keytar.getPassword(
+      WEBDAV_KEYTAR_SERVICE,
+      getWebDavCredentialAccount(normalizedServer, normalizedUsername)
+    )) || ''
+  );
+};
+
+const hasWebDavCredential = async (server, username) => Boolean(await getWebDavCredential(server, username));
+
+const createWebDavClient = async (server, username, password) => {
+  const driver = await getWebDavDriver();
+  const createClient = driver?.createClient;
+  if (typeof createClient !== 'function') {
+    throw new Error('webdav createClient 不可用');
+  }
+  return createClient(normalizeWebDavServer(server), {
+    username: String(username || '').trim(),
+    password: String(password || '')
+  });
+};
+
 const sanitizeSettings = (payload = {}) => ({
   translationEngine: payload.translationEngine === 'openai' ? 'openai' : 'cnki',
   apiKey: String(payload.apiKey || '').trim(),
   baseUrl: String(payload.baseUrl || '').trim(),
   model: String(payload.model || '').trim(),
   parsePdfWithAI: Boolean(payload.parsePdfWithAI),
-  libraryPath: resolveLibraryPath(payload.libraryPath)
+  libraryPath: resolveLibraryPath(payload.libraryPath),
+  webdavServer: normalizeWebDavServer(payload.webdavServer),
+  webdavUsername: String(payload.webdavUsername || '').trim(),
+  webdavRemotePath: normalizeWebDavRemotePath(payload.webdavRemotePath)
 });
 
 const getLibraryRoot = () => runtimeSettings.libraryPath || DEFAULT_LIBRARY_ROOT;
@@ -157,8 +249,48 @@ const getLibraryPaths = () => {
     statesDir: path.join(root, 'states'),
     papersPath: path.join(root, 'papers.json'),
     foldersPath: path.join(root, 'folders.json'),
-    indexPath: path.join(root, 'index.json')
+    indexPath: path.join(root, 'index.json'),
+    sqlitePath: path.join(root, 'library.sqlite')
   };
+};
+
+const getSqliteDriver = () => {
+  if (sqliteDriver) return sqliteDriver;
+  try {
+    sqliteDriver = require('better-sqlite3');
+    return sqliteDriver;
+  } catch (error) {
+    throw new Error(`缺少 better-sqlite3 依赖: ${error?.message || error}`);
+  }
+};
+
+const closeLibraryDb = () => {
+  if (!libraryDb) return;
+  try {
+    libraryDb.close();
+  } catch {
+    // ignore close errors
+  }
+  libraryDb = null;
+  libraryDbRoot = '';
+};
+
+const resetLibraryStore = () => {
+  closeLibraryDb();
+  libraryStoreReadyPromise = null;
+};
+
+const getLibraryDb = () => {
+  const paths = getLibraryPaths();
+  if (libraryDb && libraryDbRoot === paths.root) return libraryDb;
+  closeLibraryDb();
+  const Database = getSqliteDriver();
+  libraryDb = new Database(paths.sqlitePath);
+  libraryDbRoot = paths.root;
+  libraryDb.pragma('journal_mode = WAL');
+  libraryDb.pragma('synchronous = NORMAL');
+  libraryDb.pragma('foreign_keys = ON');
+  return libraryDb;
 };
 
 const loadSettings = async () => {
@@ -190,10 +322,254 @@ const saveSettings = async (payload = {}) => {
 
   const nextLibraryRoot = getLibraryRoot();
   if (prevLibraryRoot !== nextLibraryRoot) {
+    resetLibraryStore();
     await migrateLibrary(prevLibraryRoot, nextLibraryRoot);
   }
 
   return runtimeSettings;
+};
+
+const getWebDavConfigFromSettings = async () => {
+  const settings = await loadSettings();
+  const webdavServer = normalizeWebDavServer(settings.webdavServer);
+  const webdavUsername = String(settings.webdavUsername || '').trim();
+  const webdavRemotePath = normalizeWebDavRemotePath(settings.webdavRemotePath);
+  let webdavHasPassword = false;
+  try {
+    webdavHasPassword = await hasWebDavCredential(webdavServer, webdavUsername);
+  } catch {
+    webdavHasPassword = false;
+  }
+  return {
+    webdavServer,
+    webdavUsername,
+    webdavRemotePath,
+    webdavHasPassword
+  };
+};
+
+const resolveWebDavPassword = async (server, username, password) => {
+  const direct = String(password || '');
+  if (direct) return direct;
+  return getWebDavCredential(server, username);
+};
+
+const testWebDavConnection = async (payload = {}) => {
+  const server = normalizeWebDavServer(payload.server);
+  const username = String(payload.username || '').trim();
+  const remotePath = normalizeWebDavRemotePath(payload.remotePath);
+  const password = await resolveWebDavPassword(server, username, payload.password);
+  if (!server) {
+    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少服务器地址' };
+  }
+  if (!username) {
+    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少用户名' };
+  }
+  if (!password) {
+    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少密码或未保存凭据' };
+  }
+  let reachable = false;
+  let validPath = false;
+  let writable = false;
+  try {
+    const client = await createWebDavClient(server, username, password);
+    await client.getDirectoryContents('/');
+    reachable = true;
+    const exists = await client.exists(remotePath);
+    if (!exists) {
+      await client.createDirectory(remotePath, { recursive: true });
+    }
+    validPath = true;
+    const testFile = `${remotePath}/.mindpaper-webdav-test-${Date.now()}.tmp`;
+    const payloadText = `mindpaper test ${new Date().toISOString()}`;
+    await client.putFileContents(testFile, Buffer.from(payloadText, 'utf8'), { overwrite: true });
+    writable = true;
+    await client.deleteFile(testFile).catch(() => null);
+    return { success: true, reachable, writable, validPath, message: '连接成功' };
+  } catch (error) {
+    return {
+      success: false,
+      reachable,
+      writable,
+      validPath,
+      message: error?.message || 'WebDAV连接失败'
+    };
+  }
+};
+
+const saveWebDavConfig = async (payload = {}) => {
+  const server = normalizeWebDavServer(payload.server);
+  const username = String(payload.username || '').trim();
+  const remotePath = normalizeWebDavRemotePath(payload.remotePath);
+  const password = String(payload.password || '');
+  await saveSettings({
+    webdavServer: server,
+    webdavUsername: username,
+    webdavRemotePath: remotePath
+  });
+  const savedSecret = await saveWebDavCredential(server, username, password).catch((error) => {
+    throw error;
+  });
+  return {
+    success: true,
+    webdavServer: server,
+    webdavUsername: username,
+    webdavRemotePath: remotePath,
+    webdavHasPassword: savedSecret || Boolean(await hasWebDavCredential(server, username))
+  };
+};
+
+const createSqliteSyncSnapshot = async () => {
+  await ensureLibraryStoreReady();
+  const paths = getLibraryPaths();
+  const db = getLibraryDb();
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {
+    // ignore checkpoint failures and still try snapshot copy
+  }
+  const snapshotPath = `${paths.sqlitePath}.sync`;
+  await fs.copyFile(paths.sqlitePath, snapshotPath);
+  return {
+    snapshotPath,
+    fileName: 'library.sqlite'
+  };
+};
+
+const uploadFileToWebDav = async (client, remotePath, localPath) => {
+  const data = await fs.readFile(localPath);
+  await client.putFileContents(remotePath, data, { overwrite: true });
+  return data.length;
+};
+
+const downloadFileFromWebDav = async (client, remotePath, localPath) => {
+  const file = await client.getFileContents(remotePath, { format: 'binary' });
+  const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
+  await fs.mkdir(path.dirname(localPath), { recursive: true });
+  await fs.writeFile(localPath, buffer);
+  return buffer.length;
+};
+
+const syncLibraryFromWebDavToLocal = async () => {
+  const config = await getWebDavConfigFromSettings();
+  const server = config.webdavServer;
+  const username = config.webdavUsername;
+  const remotePath = config.webdavRemotePath;
+  const password = await getWebDavCredential(server, username);
+  if (!server || !username || !password) {
+    console.log('[webdav-sync] startup download skipped: missing config or credential');
+    return { success: false, skipped: true, reason: 'missing config or credential' };
+  }
+
+  const client = await createWebDavClient(server, username, password);
+  await client.getDirectoryContents('/');
+  if (!(await client.exists(remotePath))) {
+    console.log(`[webdav-sync] startup download skipped: remote path not found (${server}${remotePath})`);
+    return { success: false, skipped: true, reason: 'remote path not found' };
+  }
+
+  const remoteSqlitePath = `${remotePath}/library.sqlite`;
+  if (!(await client.exists(remoteSqlitePath))) {
+    console.log(`[webdav-sync] startup download skipped: remote sqlite not found (${server}${remoteSqlitePath})`);
+    return { success: false, skipped: true, reason: 'remote sqlite not found' };
+  }
+
+  await ensureLibrary();
+  resetLibraryStore();
+  const paths = getLibraryPaths();
+  const tempSqlitePath = `${paths.sqlitePath}.download`;
+  let downloadedPdfCount = 0;
+  let downloadedPdfBytes = 0;
+  let sqliteBytes = 0;
+
+  try {
+    sqliteBytes = await downloadFileFromWebDav(client, remoteSqlitePath, tempSqlitePath);
+    await fs.rename(tempSqlitePath, paths.sqlitePath);
+
+    const remotePapersPath = `${remotePath}/papers`;
+    if (await client.exists(remotePapersPath)) {
+      const remoteEntries = await client.getDirectoryContents(remotePapersPath);
+      for (const entry of Array.isArray(remoteEntries) ? remoteEntries : []) {
+        if (entry?.type !== 'file') continue;
+        const basename = path.basename(String(entry.filename || ''));
+        if (!basename.toLowerCase().endsWith('.pdf')) continue;
+        const localPdfPath = path.join(paths.papersDir, basename);
+        downloadedPdfBytes += await downloadFileFromWebDav(
+          client,
+          `${remotePapersPath}/${basename}`,
+          localPdfPath
+        );
+        downloadedPdfCount += 1;
+      }
+    }
+  } catch (error) {
+    await removeFileIfExists(tempSqlitePath);
+    throw error;
+  }
+
+  console.log(
+    `[webdav-sync] download complete: sqlite=${sqliteBytes}B, pdfs=${downloadedPdfCount}, pdfBytes=${downloadedPdfBytes}B, remote=${server}${remotePath}`
+  );
+  return {
+    success: true,
+    sqliteBytes,
+    downloadedPdfCount,
+    downloadedPdfBytes,
+    remotePath,
+    server
+  };
+};
+
+const syncLibraryToWebDav = async () => {
+  const config = await getWebDavConfigFromSettings();
+  const server = config.webdavServer;
+  const username = config.webdavUsername;
+  const remotePath = config.webdavRemotePath;
+  const password = await getWebDavCredential(server, username);
+  if (!server || !username || !password) {
+    throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
+  }
+
+  const client = await createWebDavClient(server, username, password);
+  await client.getDirectoryContents('/');
+  if (!(await client.exists(remotePath))) {
+    await client.createDirectory(remotePath, { recursive: true });
+  }
+  const remotePapersPath = `${remotePath}/papers`;
+  if (!(await client.exists(remotePapersPath))) {
+    await client.createDirectory(remotePapersPath, { recursive: true });
+  }
+
+  const paths = getLibraryPaths();
+  const snapshot = await createSqliteSyncSnapshot();
+  let uploadedPdfCount = 0;
+  let uploadedPdfBytes = 0;
+  let sqliteBytes = 0;
+
+  try {
+    sqliteBytes = await uploadFileToWebDav(client, `${remotePath}/${snapshot.fileName}`, snapshot.snapshotPath);
+    const paperFiles = await fs.readdir(paths.papersDir).catch(() => []);
+    for (const file of paperFiles) {
+      if (!file.toLowerCase().endsWith('.pdf')) continue;
+      const localPath = path.join(paths.papersDir, file);
+      uploadedPdfBytes += await uploadFileToWebDav(client, `${remotePapersPath}/${file}`, localPath);
+      uploadedPdfCount += 1;
+    }
+  } finally {
+    await removeFileIfExists(snapshot.snapshotPath);
+  }
+
+  console.log(
+    `[webdav-sync] upload complete: sqlite=${sqliteBytes}B, pdfs=${uploadedPdfCount}, pdfBytes=${uploadedPdfBytes}B, remote=${server}${remotePath}`
+  );
+  return {
+    success: true,
+    sqliteBytes,
+    uploadedPdfCount,
+    uploadedPdfBytes,
+    remotePath,
+    server
+  };
 };
 
 const buildOpenAIUrl = (baseUrl) => {
@@ -711,6 +1087,15 @@ const ensureLibraryMetaCollection = async () => {
   });
 };
 
+const hasLibraryMetaCollection = async () => {
+  try {
+    await qdrantRequest(`/collections/${getLibraryMetaCollection()}`);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const extractNamedVectorDim = (collectionResult) => {
   const vectors = collectionResult?.config?.params?.vectors;
   if (!vectors) return 0;
@@ -1084,8 +1469,8 @@ const matchReferencesToLocalPapers = async (paperId, references) => {
   const currentPaperId = String(paperId || '').trim();
   const input = Array.isArray(references) ? references : [];
   if (!input.length) return [];
-  await ensureLibraryMetaReady();
-  const localPapers = await loadPapersFromMeta();
+  await ensureLibraryStoreReady();
+  const localPapers = await loadPapersFromSqlite();
   const candidates = localPapers.filter((paper) => String(paper?.id || '').trim() !== currentPaperId);
   return input.map((reference, index) => {
     const normalized = normalizePaperReference(reference, index);
@@ -1168,7 +1553,7 @@ const sanitizePaperForMeta = (paper, targetPdfPath) => {
   return next;
 };
 
-const normalizePaperForMeta = async (paper, order, paths) => {
+const normalizePaperForStorage = async (paper, paths) => {
   const raw = paper && typeof paper === 'object' ? { ...paper } : {};
   const paperId = String(raw.id || '').trim();
   if (!paperId) return null;
@@ -1178,7 +1563,13 @@ const normalizePaperForMeta = async (paper, order, paths) => {
   if (sourcePdfPath && sourcePdfPath !== targetPdfPath) {
     await moveFileSafe(sourcePdfPath, targetPdfPath);
   }
-  const next = sanitizePaperForMeta(raw, targetPdfPath);
+  return sanitizePaperForMeta(raw, targetPdfPath);
+};
+
+const normalizePaperForMeta = async (paper, order, paths) => {
+  const next = await normalizePaperForStorage(paper, paths);
+  if (!next) return null;
+  const paperPointId = getPaperArticleId(next.id);
   return {
     point: {
       id: paperPointId,
@@ -1349,9 +1740,289 @@ const loadLegacyStates = async (paths) => {
   return result;
 };
 
+const safeJsonParse = (value, fallback) => {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+};
+
+const ensureLibrarySqliteSchema = () => {
+  const db = getLibraryDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_kv (
+      key TEXT PRIMARY KEY,
+      value_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS papers (
+      id TEXT PRIMARY KEY,
+      sort_order INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      author TEXT NOT NULL DEFAULT '',
+      date TEXT NOT NULL DEFAULT '',
+      added_date TEXT NOT NULL DEFAULT '',
+      uploaded_at INTEGER NOT NULL DEFAULT 0,
+      folder_id TEXT NOT NULL DEFAULT '',
+      previous_folder_id TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',
+      abstract TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '',
+      keywords_json TEXT NOT NULL DEFAULT '[]',
+      publisher TEXT NOT NULL DEFAULT '',
+      doi TEXT NOT NULL DEFAULT '',
+      references_json TEXT NOT NULL DEFAULT '[]',
+      reference_stats_json TEXT,
+      file_path TEXT NOT NULL DEFAULT '',
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS paper_states (
+      paper_id TEXT PRIMARY KEY,
+      state_json TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_papers_sort_order ON papers(sort_order);
+    CREATE INDEX IF NOT EXISTS idx_papers_folder_id ON papers(folder_id);
+  `);
+};
+
+const getLibraryKv = (key, fallback = null) => {
+  const db = getLibraryDb();
+  const row = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get(String(key || '').trim());
+  if (!row) return fallback;
+  return safeJsonParse(row.value_json, fallback);
+};
+
+const setLibraryKv = (key, value) => {
+  const db = getLibraryDb();
+  db.prepare(
+    `
+      INSERT INTO app_kv (key, value_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(String(key || '').trim(), JSON.stringify(value ?? null), Date.now());
+};
+
+const deletePaperStatesFromSqlite = (paperIds = []) => {
+  const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
+  if (!ids.length) return;
+  const db = getLibraryDb();
+  const placeholders = ids.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM paper_states WHERE paper_id IN (${placeholders})`).run(...ids);
+};
+
+const deletePapersFromSqlite = (paperIds = []) => {
+  const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
+  if (!ids.length) return [];
+  deletePaperStatesFromSqlite(ids);
+  const db = getLibraryDb();
+  const placeholders = ids.map(() => '?').join(', ');
+  db.prepare(`DELETE FROM papers WHERE id IN (${placeholders})`).run(...ids);
+  return ids;
+};
+
+const mapSqlitePaperRow = (row, paths = getLibraryPaths()) =>
+  sanitizePaperForMeta(
+    {
+      id: row?.id,
+      title: row?.title,
+      author: row?.author,
+      date: row?.date,
+      addedDate: row?.added_date,
+      uploadedAt: row?.uploaded_at,
+      folderId: row?.folder_id,
+      previousFolderId: row?.previous_folder_id,
+      summary: row?.summary,
+      abstract: row?.abstract,
+      content: row?.content,
+      keywords: safeJsonParse(row?.keywords_json, []),
+      publisher: row?.publisher,
+      doi: row?.doi,
+      references: safeJsonParse(row?.references_json, []),
+      referenceStats: safeJsonParse(row?.reference_stats_json, undefined),
+      filePath: row?.file_path
+    },
+    String(row?.file_path || '').trim() || path.join(paths.papersDir, `${getPaperArticleId(row?.id)}.pdf`)
+  );
+
+const loadFoldersFromSqlite = async () => {
+  const folders = getLibraryKv('folders', []);
+  return Array.isArray(folders) ? folders : [];
+};
+
+const saveFoldersToSqlite = async (folders) => {
+  const payload = Array.isArray(folders) ? folders : [];
+  setLibraryKv('folders', payload);
+  return payload;
+};
+
+const loadPapersFromSqlite = async () => {
+  const db = getLibraryDb();
+  const paths = getLibraryPaths();
+  const rows = db
+    .prepare('SELECT * FROM papers ORDER BY sort_order ASC, uploaded_at ASC, id ASC')
+    .all();
+  return rows.map((row) => mapSqlitePaperRow(row, paths));
+};
+
+const savePapersToSqlite = async (papers, paths) => {
+  const source = Array.isArray(papers) ? papers : [];
+  const runtimeStateById = new Map(
+    source
+      .map((paper) => [
+        String(paper?.id || '').trim(),
+        {
+          isParsing: Boolean(paper?.isParsing),
+          isBackgroundProcessing: Boolean(paper?.isBackgroundProcessing)
+        }
+      ])
+      .filter((entry) => entry[0])
+  );
+
+  const normalizedPapers = [];
+  for (let index = 0; index < source.length; index += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const normalized = await normalizePaperForStorage(source[index], paths);
+    if (!normalized) continue;
+    normalizedPapers.push({ order: index, paper: normalized });
+  }
+
+  const db = getLibraryDb();
+  const existingIds = db.prepare('SELECT id FROM papers').all().map((row) => String(row.id || '').trim());
+  const nextIds = new Set(normalizedPapers.map((item) => String(item.paper?.id || '').trim()).filter(Boolean));
+  const removedPaperIds = existingIds.filter((id) => id && !nextIds.has(id));
+
+  const upsertPaper = db.prepare(`
+    INSERT INTO papers (
+      id, sort_order, title, author, date, added_date, uploaded_at, folder_id, previous_folder_id,
+      summary, abstract, content, keywords_json, publisher, doi, references_json,
+      reference_stats_json, file_path, updated_at
+    ) VALUES (
+      @id, @sort_order, @title, @author, @date, @added_date, @uploaded_at, @folder_id, @previous_folder_id,
+      @summary, @abstract, @content, @keywords_json, @publisher, @doi, @references_json,
+      @reference_stats_json, @file_path, @updated_at
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      sort_order = excluded.sort_order,
+      title = excluded.title,
+      author = excluded.author,
+      date = excluded.date,
+      added_date = excluded.added_date,
+      uploaded_at = excluded.uploaded_at,
+      folder_id = excluded.folder_id,
+      previous_folder_id = excluded.previous_folder_id,
+      summary = excluded.summary,
+      abstract = excluded.abstract,
+      content = excluded.content,
+      keywords_json = excluded.keywords_json,
+      publisher = excluded.publisher,
+      doi = excluded.doi,
+      references_json = excluded.references_json,
+      reference_stats_json = excluded.reference_stats_json,
+      file_path = excluded.file_path,
+      updated_at = excluded.updated_at
+  `);
+
+  const writeTransaction = db.transaction((items) => {
+    items.forEach(({ order, paper }) => {
+      upsertPaper.run({
+        id: paper.id,
+        sort_order: order,
+        title: paper.title || '',
+        author: paper.author || '',
+        date: paper.date || '',
+        added_date: paper.addedDate || '',
+        uploaded_at: Number(paper.uploadedAt || 0),
+        folder_id: paper.folderId || '',
+        previous_folder_id: paper.previousFolderId || '',
+        summary: paper.summary || '',
+        abstract: paper.abstract || '',
+        content: paper.content || '',
+        keywords_json: JSON.stringify(Array.isArray(paper.keywords) ? paper.keywords : []),
+        publisher: paper.publisher || '',
+        doi: paper.doi || '',
+        references_json: JSON.stringify(Array.isArray(paper.references) ? paper.references : []),
+        reference_stats_json: paper.referenceStats ? JSON.stringify(paper.referenceStats) : null,
+        file_path: paper.filePath || '',
+        updated_at: Date.now()
+      });
+    });
+    if (!items.length) {
+      db.prepare('DELETE FROM papers').run();
+      db.prepare('DELETE FROM paper_states').run();
+      return;
+    }
+    if (removedPaperIds.length) {
+      deletePaperStatesFromSqlite(removedPaperIds);
+      const placeholders = removedPaperIds.map(() => '?').join(', ');
+      db.prepare(`DELETE FROM papers WHERE id IN (${placeholders})`).run(...removedPaperIds);
+    }
+  });
+
+  writeTransaction(normalizedPapers);
+
+  if (removedPaperIds.length) {
+    await deletePaperVectorPoints(removedPaperIds);
+  }
+
+  const persistedPapers = normalizedPapers.map((item) => item.paper);
+  const vectorReadyPapers = persistedPapers.filter((paper) => {
+    const state = runtimeStateById.get(String(paper?.id || '').trim());
+    return !state?.isParsing && !state?.isBackgroundProcessing;
+  });
+  if (vectorReadyPapers.length) {
+    void enqueueSummaryVectorSync(vectorReadyPapers);
+  }
+  return persistedPapers;
+};
+
+const savePaperStateToSqlite = async (paperId, state) => {
+  const normalizedPaperId = String(paperId || '').trim();
+  if (!normalizedPaperId) return { ok: false, error: '缺少paperId' };
+  const db = getLibraryDb();
+  db.prepare(
+    `
+      INSERT INTO paper_states (paper_id, state_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(paper_id) DO UPDATE SET
+        state_json = excluded.state_json,
+        updated_at = excluded.updated_at
+    `
+  ).run(normalizedPaperId, JSON.stringify(state || {}), Date.now());
+  return { ok: true };
+};
+
+const loadPaperStateFromSqlite = async (paperId) => {
+  const normalizedPaperId = String(paperId || '').trim();
+  if (!normalizedPaperId) return null;
+  const db = getLibraryDb();
+  const row = db.prepare('SELECT state_json FROM paper_states WHERE paper_id = ?').get(normalizedPaperId);
+  return row ? safeJsonParse(row.state_json, null) : null;
+};
+
+const loadPaperStatesFromMeta = async () => {
+  const points = await scrollLibraryMetaPoints({
+    must: [{ key: 'type', match: { value: 'state' } }]
+  });
+  return points
+    .map((point) => ({
+      paperId: String(point?.payload?.paperId || '').trim(),
+      state: point?.payload?.state || {}
+    }))
+    .filter((item) => item.paperId);
+};
+
 const migrateLegacyLibraryToQdrant = async (paths) => {
   const migrationPoint = await getLibraryMetaPoint(getLibraryMigrationPointId()).catch(() => null);
-  if (Number(migrationPoint?.payload?.version || 0) >= LIBRARY_META_VERSION) return;
+  if (Number(migrationPoint?.payload?.version || 0) >= LIBRARY_SQLITE_VERSION) return;
   const folders = await readJsonFile(paths.foldersPath, []);
   const papers = await readJsonFile(paths.papersPath, []);
   const normalizedPapers = await savePapersToMeta(papers, paths);
@@ -1376,7 +2047,7 @@ const migrateLegacyLibraryToQdrant = async (paths) => {
       vector: buildMetaVector(),
       payload: {
         type: 'migration',
-        version: LIBRARY_META_VERSION,
+        version: LIBRARY_SQLITE_VERSION,
         migratedAt: Date.now(),
         paperCount: normalizedPapers.length
       }
@@ -1385,21 +2056,74 @@ const migrateLegacyLibraryToQdrant = async (paths) => {
   console.log(`[library-meta] migrated legacy json to qdrant: papers=${normalizedPapers.length}`);
 };
 
-const ensureLibraryMetaReady = async () => {
-  if (libraryMetaReadyPromise) return libraryMetaReadyPromise;
-  libraryMetaReadyPromise = (async () => {
-    await ensureLibrary();
+const migrateExistingLibraryToSqlite = async (paths) => {
+  const migratedVersion = Number(getLibraryKv('sqlite_migration_version', 0) || 0);
+  const paperCountRow = getLibraryDb().prepare('SELECT COUNT(*) AS count FROM papers').get();
+  const paperCount = Number(paperCountRow?.count || 0);
+  if (migratedVersion >= LIBRARY_SQLITE_VERSION && paperCount >= 0) return;
+  if (paperCount > 0) {
+    setLibraryKv('sqlite_migration_version', LIBRARY_SQLITE_VERSION);
+    return;
+  }
+
+  let folders = await readJsonFile(paths.foldersPath, []);
+  let papers = await readJsonFile(paths.papersPath, []);
+  let states = await loadLegacyStates(paths);
+  let source = 'legacy-json';
+
+  try {
     const ready = await ensureQdrantReady();
-    if (!ready) throw new Error('qdrant not ready');
-    await ensureLibraryMetaCollection();
+    if (ready && (await hasLibraryMetaCollection())) {
+      const metaFolders = await loadFoldersFromMeta();
+      const metaPapers = await loadPapersFromMeta();
+      const metaStates = await loadPaperStatesFromMeta();
+      if ((Array.isArray(metaPapers) && metaPapers.length) || (Array.isArray(metaFolders) && metaFolders.length)) {
+        folders = Array.isArray(metaFolders) ? metaFolders : [];
+        papers = Array.isArray(metaPapers) ? metaPapers : [];
+        states = Array.isArray(metaStates) ? metaStates : [];
+        source = 'qdrant-meta';
+      }
+    }
+  } catch (error) {
+    console.warn('[library-sqlite] qdrant migration source unavailable:', error?.message || error);
+  }
+
+  await saveFoldersToSqlite(folders);
+  const normalizedPapers = await savePapersToSqlite(papers, paths);
+  for (const item of states) {
+    // eslint-disable-next-line no-await-in-loop
+    await savePaperStateToSqlite(item.paperId, item.state || {});
+  }
+  setLibraryKv('sqlite_migration_version', LIBRARY_SQLITE_VERSION);
+  setLibraryKv('sqlite_migration_source', {
+    source,
+    migratedAt: Date.now(),
+    paperCount: normalizedPapers.length
+  });
+  console.log(`[library-sqlite] migrated ${source}: papers=${normalizedPapers.length}`);
+};
+
+const ensureLibraryStoreReady = async () => {
+  if (libraryStoreReadyPromise) return libraryStoreReadyPromise;
+  libraryStoreReadyPromise = (async () => {
+    await ensureLibrary();
+    ensureLibrarySqliteSchema();
     const paths = getLibraryPaths();
-    await migrateLegacyLibraryToQdrant(paths);
+    await migrateExistingLibraryToSqlite(paths);
+    const db = getLibraryDb();
+    const paperCount = Number(db.prepare('SELECT COUNT(*) AS count FROM papers').get()?.count || 0);
+    const stateCount = Number(db.prepare('SELECT COUNT(*) AS count FROM paper_states').get()?.count || 0);
+    const folders = getLibraryKv('folders', []);
+    const folderCount = Array.isArray(folders) ? folders.length : 0;
+    console.log(
+      `[library-sqlite] ready: path=${paths.sqlitePath}, papers=${paperCount}, states=${stateCount}, folders=${folderCount}`
+    );
     return true;
   })().catch((error) => {
-    libraryMetaReadyPromise = null;
+    libraryStoreReadyPromise = null;
     throw error;
   });
-  return libraryMetaReadyPromise;
+  return libraryStoreReadyPromise;
 };
 
 const ensureLibrary = async () => {
@@ -1998,10 +2722,34 @@ const searchPaperOpenSource = async (title) => {
 
 ipcMain.handle('settings-get', async () => {
   const settings = await loadSettings();
-  return { ...settings, libraryPath: getLibraryRoot() };
+  const webdav = await getWebDavConfigFromSettings();
+  return { ...settings, libraryPath: getLibraryRoot(), ...webdav };
 });
 ipcMain.handle('settings-set', async (_event, payload = {}) =>
-  enqueueWrite(() => saveSettings(payload))
+  enqueueWrite(async () => {
+    const settings = await saveSettings(payload);
+    const webdav = await getWebDavConfigFromSettings();
+    return { ...settings, libraryPath: getLibraryRoot(), ...webdav };
+  })
+);
+
+ipcMain.handle('webdav-test', async (_event, payload = {}) => testWebDavConnection(payload));
+
+ipcMain.handle('webdav-save', async (_event, payload = {}) =>
+  enqueueWrite(() => saveWebDavConfig(payload))
+);
+
+ipcMain.handle('webdav-sync-upload', async () =>
+  enqueueWrite(async () => {
+    try {
+      return await syncLibraryToWebDav();
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || 'WebDAV 上传失败'
+      };
+    }
+  })
 );
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
@@ -2166,29 +2914,29 @@ ipcMain.handle('get-embedding', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('library-get-folders', async () => {
-  await ensureLibraryMetaReady();
-  const folders = await loadFoldersFromMeta();
+  await ensureLibraryStoreReady();
+  const folders = await loadFoldersFromSqlite();
   return Array.isArray(folders) ? folders : [];
 });
 
 ipcMain.handle('library-save-folders', async (_event, payload = []) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
-    await saveFoldersToMeta(payload);
+    await ensureLibraryStoreReady();
+    await saveFoldersToSqlite(payload);
     return { ok: true };
   });
 });
 
 ipcMain.handle('library-get-papers', async () => {
-  await ensureLibraryMetaReady();
-  return loadPapersFromMeta();
+  await ensureLibraryStoreReady();
+  return loadPapersFromSqlite();
 });
 
 ipcMain.handle('library-save-papers', async (_event, payload = []) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
-    const papers = await savePapersToMeta(payload, paths);
+    const papers = await savePapersToSqlite(payload, paths);
     await cleanupOrphanPaperStateFiles(
       paths,
       papers.map((paper) => String(paper?.id || '').trim())
@@ -2199,10 +2947,10 @@ ipcMain.handle('library-save-papers', async (_event, payload = []) => {
 
 ipcMain.handle('library-save-snapshot', async (_event, payload = {}) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
-    const folders = await saveFoldersToMeta(payload.folders);
-    const papers = await savePapersToMeta(payload.papers, paths);
+    const folders = await saveFoldersToSqlite(payload.folders);
+    const papers = await savePapersToSqlite(payload.papers, paths);
     await cleanupOrphanPaperStateFiles(
       paths,
       papers.map((paper) => String(paper?.id || '').trim())
@@ -2216,7 +2964,7 @@ ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {
   return enqueueWrite(async () => {
     const paperId = String(payload.paperId || '').trim();
     if (!paperId) return { ok: false, error: '缺少paperId' };
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
     const data = payload.data;
     if (!data) return { ok: false, error: '缺少PDF数据' };
@@ -2230,7 +2978,7 @@ ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
-  await ensureLibraryMetaReady();
+  await ensureLibraryStoreReady();
   const paths = getLibraryPaths();
   const filePath = payload.filePath ? String(payload.filePath) : '';
   const paperId = payload.paperId ? String(payload.paperId) : '';
@@ -2243,7 +2991,7 @@ ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
     if (await fileExists(expectedPath)) {
       resolvedPath = expectedPath;
     } else {
-      const papers = await loadPapersFromMeta();
+      const papers = await loadPapersFromSqlite();
       const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
       resolvedPath = entry?.filePath || '';
     }
@@ -2260,24 +3008,24 @@ ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('library-get-paper-state', async (_event, payload = {}) => {
-  await ensureLibraryMetaReady();
+  await ensureLibraryStoreReady();
   const paperId = String(payload.paperId || '').trim();
   if (!paperId) return null;
-  return loadPaperStateFromMeta(paperId);
+  return loadPaperStateFromSqlite(paperId);
 });
 
 ipcMain.handle('library-save-paper-state', async (_event, payload = {}) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paperId = String(payload.paperId || '').trim();
     if (!paperId) return { ok: false, error: '缺少paperId' };
-    return savePaperStateToMeta(paperId, payload.state || {});
+    return savePaperStateToSqlite(paperId, payload.state || {});
   });
 });
 
 ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
     const paperId = String(payload.paperId || '').trim();
     if (!paperId) return { ok: false, error: '缺少paperId' };
@@ -2288,9 +3036,9 @@ ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
     await removeFileIfExists(resolvedPath);
     await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
     await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-    await deleteLibraryMetaPoints([getPaperArticleId(paperId), getLibraryStatePointId(paperId)]);
+    deletePapersFromSqlite([paperId]);
     await deletePaperVectorPoints([paperId]);
-    const papers = await loadPapersFromMeta();
+    const papers = await loadPapersFromSqlite();
     const remainIds = Array.isArray(papers)
       ? papers
           .map((paper) => String(paper?.id || '').trim())
@@ -2303,15 +3051,13 @@ ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
 
 ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
   return enqueueWrite(async () => {
-    await ensureLibraryMetaReady();
+    await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
     const items = Array.isArray(payload.items) ? payload.items : [];
     const ids = items
       .map((item) => String(item?.id || '').trim())
       .filter(Boolean);
     if (!ids.length) return { ok: true };
-    const pointIdsToDelete = [];
-    const stateIdsToDelete = [];
     for (const item of items) {
       const paperId = String(item?.id || '').trim();
       if (!paperId) continue;
@@ -2319,12 +3065,10 @@ ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
       await removeFileIfExists(resolvedPath);
       await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
       await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-      pointIdsToDelete.push(getPaperArticleId(paperId));
-      stateIdsToDelete.push(getLibraryStatePointId(paperId));
     }
-    await deleteLibraryMetaPoints([...pointIdsToDelete, ...stateIdsToDelete]);
+    deletePapersFromSqlite(ids);
     await deletePaperVectorPoints(ids);
-    const papers = await loadPapersFromMeta();
+    const papers = await loadPapersFromSqlite();
     const idSet = new Set(ids);
     const remainIds = Array.isArray(papers)
       ? papers
@@ -2419,24 +3163,23 @@ ipcMain.handle('vector-get-paper-statuses', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('vector-get-status', async () => {
+  await ensureLibraryStoreReady();
   const startup = await debugQdrantStartup();
   const ready = Boolean(startup?.ok);
-  const collectionName = getLibraryMetaCollection();
+  const paths = getLibraryPaths();
   const papersCollectionName = getPapersVectorCollection();
   let pointCount = -1;
   let summaryVectorCount = -1;
+  try {
+    const db = getLibraryDb();
+    const row = db.prepare('SELECT COUNT(*) AS count FROM papers').get();
+    pointCount = Number(row?.count || 0);
+  } catch {
+    pointCount = -1;
+  }
   if (ready) {
     try {
       const qdrantUrl = getQdrantUrl().replace(/\/$/, '');
-      const response = await fetch(`${qdrantUrl}/collections/${collectionName}/points/count`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exact: true })
-      });
-      if (response.ok) {
-        const data = await response.json();
-        pointCount = Number(data?.result?.count || 0);
-      }
       const summaryResp = await fetch(`${qdrantUrl}/collections/${papersCollectionName}/points/count`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2447,19 +3190,20 @@ ipcMain.handle('vector-get-status', async () => {
         summaryVectorCount = Number(data?.result?.count || 0);
       }
     } catch {
-      pointCount = -1;
+      summaryVectorCount = -1;
     }
   }
   return {
     ok: ready,
-    collection: collectionName,
-    vectorFields: ['meta'],
-    vectorDim: LIBRARY_META_VECTOR_DIM,
+    collection: 'sqlite',
+    vectorFields: [PAPERS_VECTOR_NAME],
+    vectorDim: getConfiguredSummaryVectorDim(),
     pointCount,
     summaryVectorCollection: papersCollectionName,
     summaryVectorCount,
     qdrantUrl: getQdrantUrl(),
     qdrantStoragePath: getQdrantStoragePath(),
+    metadataDbPath: paths.sqlitePath,
     qdrantManagedByApp: qdrantStartedByApp,
     error: ready ? undefined : startup?.error || 'qdrant not ready'
   };
@@ -2474,18 +3218,27 @@ ipcMain.handle('vector-debug-dump-qdrant', async () => {
 });
 
 app.whenReady().then(() => {
-  createMainWindow({
-    isDev,
-    devServerURL,
-    preloadPath: path.join(__dirname, '..', 'bridge', 'preload.cjs'),
-    indexHtmlPath: path.join(__dirname, '..', '..', 'dist', 'index.html')
-  });
+  const createWindow = () =>
+    createMainWindow({
+      isDev,
+      devServerURL,
+      preloadPath: path.join(__dirname, '..', 'bridge', 'preload.cjs'),
+      indexHtmlPath: path.join(__dirname, '..', '..', 'dist', 'index.html')
+    });
 
   void (async () => {
     try {
-      await ensureLibraryMetaReady();
+      await syncLibraryFromWebDavToLocal();
+    } catch (error) {
+      console.warn('[webdav-sync] startup download failed:', error?.message || error);
+    }
+
+    createWindow();
+
+    try {
+      await ensureLibraryStoreReady();
       await debugQdrantStartup();
-      const papers = await loadPapersFromMeta();
+      const papers = await loadPapersFromSqlite();
       if (Array.isArray(papers) && papers.length) {
         void enqueueSummaryVectorSync(papers);
       }
@@ -2496,12 +3249,7 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow({
-        isDev,
-        devServerURL,
-        preloadPath: path.join(__dirname, '..', 'bridge', 'preload.cjs'),
-        indexHtmlPath: path.join(__dirname, '..', '..', 'dist', 'index.html')
-      });
+      createWindow();
     }
   });
 });
@@ -2517,6 +3265,7 @@ app.on('before-quit', (event) => {
       } catch {
         // ignore
       }
+      closeLibraryDb();
     })
     .finally(() => {
       app.quit();

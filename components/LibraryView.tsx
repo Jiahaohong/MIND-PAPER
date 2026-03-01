@@ -718,6 +718,7 @@ interface LibraryViewProps {
   onDeletePaper: (paperId: string) => void;
   onMovePaperToFolder: (paperId: string, folderId: string) => void;
   onRestorePaper: (paperId: string) => void;
+  onCloudSyncUpload: () => Promise<{ success: boolean; error?: string } | void>;
 }
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
@@ -731,7 +732,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onMovePaperToTrash,
   onDeletePaper,
   onMovePaperToFolder,
-  onRestorePaper
+  onRestorePaper,
+  onCloudSyncUpload
 }) => {
   const MIN_LEFT_WIDTH = 180;
   const MIN_MIDDLE_WIDTH = 240;
@@ -787,6 +789,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const [sortField, setSortField] = useState<'title' | 'author' | 'publishedDate' | 'uploadedAt'>('uploadedAt');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
   const [searchOpen, setSearchOpen] = useState(false);
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudSyncMessage, setCloudSyncMessage] = useState('');
   const [searchMode, setSearchMode] = useState<'traditional' | 'hybrid'>('traditional');
   const [searchQuery, setSearchQuery] = useState('');
   const [searchCommittedQuery, setSearchCommittedQuery] = useState('');
@@ -1393,6 +1397,30 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   }, [searchOpen]);
 
   useEffect(() => {
+    if (!cloudSyncMessage) return;
+    const timer = window.setTimeout(() => setCloudSyncMessage(''), 3000);
+    return () => window.clearTimeout(timer);
+  }, [cloudSyncMessage]);
+
+  const handleCloudSync = async () => {
+    if (cloudSyncing) return;
+    setCloudSyncing(true);
+    setCloudSyncMessage('');
+    try {
+      const result = await onCloudSyncUpload();
+      if (result && result.success === false) {
+        setCloudSyncMessage(result.error || '云同步失败');
+      } else {
+        setCloudSyncMessage('云同步完成');
+      }
+    } catch (error: any) {
+      setCloudSyncMessage(error?.message || '云同步失败');
+    } finally {
+      setCloudSyncing(false);
+    }
+  };
+
+  useEffect(() => {
     if (!searchOpen) return;
     const handleMouseDown = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
@@ -1955,6 +1983,32 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             {selectedFolderId ? findFolderName(folders, selectedFolderId) || 'Documents' : 'Documents'}
           </div>
           <div className="relative flex items-center gap-1">
+            <Tooltip label="云同步">
+              <button
+                type="button"
+                onClick={handleCloudSync}
+                disabled={cloudSyncing}
+                className="p-1 rounded-md text-gray-500 hover:bg-gray-200 hover:text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="云同步"
+              >
+                <svg
+                  className="h-[14px] w-[14px]"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
+                </svg>
+              </button>
+            </Tooltip>
+            {cloudSyncMessage ? (
+              <div className="absolute right-16 top-8 whitespace-nowrap rounded-md border border-gray-200 bg-white px-2 py-1 text-[11px] text-gray-500 shadow-sm">
+                {cloudSyncMessage}
+              </div>
+            ) : null}
             <div className="relative" data-search-anchor>
               <Tooltip label={searchOpen ? '关闭搜索' : '搜索'}>
                 <button

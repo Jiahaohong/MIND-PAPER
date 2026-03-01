@@ -3,7 +3,7 @@ import { LibraryView } from './components/LibraryView';
 import { ReaderView } from './components/ReaderView';
 import { Folder, Paper, PaperReference } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
-import { LayoutGrid, Settings, X, FileText } from 'lucide-react';
+import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
   extractPdfFullText,
@@ -19,7 +19,11 @@ const App: React.FC = () => {
     baseUrl: '',
     model: '',
     parsePdfWithAI: false,
-    libraryPath: ''
+    libraryPath: '',
+    webdavServer: '',
+    webdavUsername: '',
+    webdavRemotePath: '/mindpaper',
+    webdavHasPassword: false
   };
   // State for tabs
   const [openPapers, setOpenPapers] = useState<Paper[]>([]);
@@ -35,6 +39,18 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync'>('ai');
+  const [webdavPassword, setWebdavPassword] = useState('');
+  const [webdavStatus, setWebdavStatus] = useState('');
+  const [webdavTesting, setWebdavTesting] = useState(false);
+  const [webdavSaving, setWebdavSaving] = useState(false);
+
+  const getWebDavServerEditablePart = (value: string) =>
+    String(value || '')
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/mindpaper\/?$/i, '')
+      .replace(/\/+$/, '');
 
   const activePaper = openPapers.find(p => p.id === activePaperId);
   const MAX_FULL_PDF_CACHE = 20;
@@ -828,6 +844,8 @@ const App: React.FC = () => {
 
   const loadSettings = async () => {
     setSettingsError('');
+    setWebdavStatus('');
+    setWebdavPassword('');
     if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
       setSettingsError('设置仅桌面端可用');
       return;
@@ -864,8 +882,72 @@ const App: React.FC = () => {
     }
   };
 
+  const handleTestWebDav = async () => {
+    setWebdavStatus('');
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.test) {
+      setWebdavStatus('WebDAV 仅桌面端可用');
+      return;
+    }
+    setWebdavTesting(true);
+    try {
+      const result = await window.electronAPI.webdav.test({
+        server: settingsForm.webdavServer,
+        username: settingsForm.webdavUsername,
+        password: webdavPassword,
+        remotePath: '/mindpaper'
+      });
+      if (result?.success) {
+        setWebdavStatus('连接成功，可访问并写入远程目录');
+      } else {
+        setWebdavStatus(result?.message || '连接失败');
+      }
+    } catch (error: any) {
+      setWebdavStatus(error?.message || '连接失败');
+    } finally {
+      setWebdavTesting(false);
+    }
+  };
+
+  const handleSaveWebDav = async () => {
+    setWebdavStatus('');
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.save) {
+      setWebdavStatus('WebDAV 仅桌面端可用');
+      return;
+    }
+    setWebdavSaving(true);
+    try {
+      const result = await window.electronAPI.webdav.save({
+        server: settingsForm.webdavServer,
+        username: settingsForm.webdavUsername,
+        password: webdavPassword,
+        remotePath: '/mindpaper'
+      });
+      setSettingsForm((prev) => ({
+        ...prev,
+        webdavServer: result?.webdavServer || prev.webdavServer,
+        webdavUsername: result?.webdavUsername || prev.webdavUsername,
+        webdavRemotePath: '/mindpaper',
+        webdavHasPassword: Boolean(result?.webdavHasPassword)
+      }));
+      setWebdavPassword('');
+      setWebdavStatus('WebDAV 配置和凭据已保存');
+    } catch (error: any) {
+      setWebdavStatus(error?.message || 'WebDAV 保存失败');
+    } finally {
+      setWebdavSaving(false);
+    }
+  };
+
+  const handleCloudSyncUpload = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.syncUpload) {
+      return { success: false, error: '当前环境不支持云同步' };
+    }
+    return window.electronAPI.webdav.syncUpload();
+  };
+
   useEffect(() => {
     if (!settingsOpen) return;
+    setSettingsSection('ai');
     loadSettings();
   }, [settingsOpen]);
 
@@ -950,6 +1032,7 @@ const App: React.FC = () => {
             onDeletePaper={handleDeletePaper}
             onMovePaperToFolder={handleMovePaperToFolder}
             onRestorePaper={handleRestorePaper}
+            onCloudSyncUpload={handleCloudSyncUpload}
           />
         </div>
         <div className={activePaperId === null ? 'hidden' : 'absolute inset-0'}>
@@ -982,46 +1065,38 @@ const App: React.FC = () => {
               </button>
             </div>
 
+            <div className="mb-3 flex gap-1 bg-gray-100 p-1 rounded-lg">
+              <Tooltip label="AI功能">
+                <button
+                  type="button"
+                  onClick={() => setSettingsSection('ai')}
+                  className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                    settingsSection === 'ai'
+                      ? 'bg-gray-200 text-gray-900'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                  }`}
+                  aria-label="AI功能"
+                >
+                  <Sparkles size={14} />
+                </button>
+              </Tooltip>
+              <Tooltip label="同步功能">
+                <button
+                  type="button"
+                  onClick={() => setSettingsSection('sync')}
+                  className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                    settingsSection === 'sync'
+                      ? 'bg-gray-200 text-gray-900'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                  }`}
+                  aria-label="同步功能"
+                >
+                  <Cloud size={14} />
+                </button>
+              </Tooltip>
+            </div>
+
             <div className="space-y-3">
-              <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">API KEY</label>
-                <input
-                  type="password"
-                  value={settingsForm.apiKey}
-                  onChange={(e) =>
-                    setSettingsForm((prev) => ({ ...prev, apiKey: e.target.value }))
-                  }
-                  className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
-                  placeholder="sk-..."
-                />
-              </div>
-
-              <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">API URL</label>
-                <input
-                  type="text"
-                  value={settingsForm.baseUrl}
-                  onChange={(e) =>
-                    setSettingsForm((prev) => ({ ...prev, baseUrl: e.target.value }))
-                  }
-                  className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
-                  placeholder="https://api.openai.com/v1"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">OpenAI模型</label>
-                <input
-                  type="text"
-                  value={settingsForm.model}
-                  onChange={(e) =>
-                    setSettingsForm((prev) => ({ ...prev, model: e.target.value }))
-                  }
-                  className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
-                  placeholder="gpt-3.5-turbo"
-                />
-              </div>
-
               <div className="grid grid-cols-1 gap-2">
                 <label className="text-xs text-gray-500">数据保存路径</label>
                 <input
@@ -1035,47 +1110,171 @@ const App: React.FC = () => {
                 />
               </div>
 
-              <div className="space-y-2">
-                <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
-                  <div className="text-xs text-gray-700">AI翻译</div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((prev) => ({
-                        ...prev,
-                        translationEngine: prev.translationEngine === 'openai' ? 'cnki' : 'openai'
-                      }))
-                    }
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      settingsForm.translationEngine === 'openai' ? 'bg-emerald-500' : 'bg-gray-300'
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                        settingsForm.translationEngine === 'openai' ? 'translate-x-5' : 'translate-x-1'
-                      }`}
+              {settingsSection === 'ai' ? (
+                <>
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">API KEY</label>
+                    <input
+                      type="password"
+                      value={settingsForm.apiKey}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({ ...prev, apiKey: e.target.value }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
+                      placeholder="sk-..."
                     />
-                  </button>
-                </div>
-                <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
-                  <div className="text-xs text-gray-700">AI解析</div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSettingsForm((prev) => ({ ...prev, parsePdfWithAI: !prev.parsePdfWithAI }))
-                    }
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      settingsForm.parsePdfWithAI ? 'bg-emerald-500' : 'bg-gray-300'
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                        settingsForm.parsePdfWithAI ? 'translate-x-5' : 'translate-x-1'
-                      }`}
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">API URL</label>
+                    <input
+                      type="text"
+                      value={settingsForm.baseUrl}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({ ...prev, baseUrl: e.target.value }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
+                      placeholder="https://api.openai.com/v1"
                     />
-                  </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">OpenAI模型</label>
+                    <input
+                      type="text"
+                      value={settingsForm.model}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({ ...prev, model: e.target.value }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
+                      placeholder="gpt-3.5-turbo"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                      <div className="text-xs text-gray-700">AI翻译</div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettingsForm((prev) => ({
+                            ...prev,
+                            translationEngine: prev.translationEngine === 'openai' ? 'cnki' : 'openai'
+                          }))
+                        }
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                          settingsForm.translationEngine === 'openai' ? 'bg-emerald-500' : 'bg-gray-300'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                            settingsForm.translationEngine === 'openai' ? 'translate-x-5' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                    <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                      <div className="text-xs text-gray-700">AI解析</div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettingsForm((prev) => ({ ...prev, parsePdfWithAI: !prev.parsePdfWithAI }))
+                        }
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                          settingsForm.parsePdfWithAI ? 'bg-emerald-500' : 'bg-gray-300'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                            settingsForm.parsePdfWithAI ? 'translate-x-5' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="rounded-lg border border-gray-200 p-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs font-semibold text-gray-700">WebDAV</div>
+                    <div className="text-[11px] text-gray-400">
+                      {settingsForm.webdavHasPassword ? '凭据已保存' : '未保存凭据'}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">服务器地址</label>
+                    <div className="flex items-center overflow-hidden rounded-md border border-gray-200 focus-within:ring-2 focus-within:ring-blue-200">
+                      <span className="shrink-0 bg-gray-50 px-2 py-1 text-xs text-gray-500 border-r border-gray-200">
+                        https://
+                      </span>
+                      <input
+                        type="text"
+                        value={getWebDavServerEditablePart(settingsForm.webdavServer)}
+                        onChange={(e) =>
+                          setSettingsForm((prev) => ({
+                            ...prev,
+                            webdavServer: `https://${e.target.value.trim().replace(/^https?:\/\//i, '').replace(/\/mindpaper\/?$/i, '').replace(/\/+$/, '')}`,
+                            webdavRemotePath: '/mindpaper'
+                          }))
+                        }
+                        className="min-w-0 flex-1 px-2 py-1 text-xs focus:outline-none"
+                        placeholder="dav.example.com/path"
+                      />
+                      <span className="shrink-0 bg-gray-50 px-2 py-1 text-xs text-gray-500 border-l border-gray-200">
+                        /mindpaper
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">用户名</label>
+                    <input
+                      type="text"
+                      value={settingsForm.webdavUsername}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({ ...prev, webdavUsername: e.target.value }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      placeholder="username"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">应用专用密码</label>
+                    <input
+                      type="password"
+                      value={webdavPassword}
+                      onChange={(e) => setWebdavPassword(e.target.value)}
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      placeholder={settingsForm.webdavHasPassword ? '留空则继续使用已保存密码' : '输入 WebDAV 密码'}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={handleTestWebDav}
+                      disabled={webdavTesting}
+                      className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      {webdavTesting ? '验证中...' : '验证连接'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSaveWebDav}
+                      disabled={webdavSaving}
+                      className="px-3 py-1.5 rounded-md text-xs bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
+                    >
+                      {webdavSaving ? '保存中...' : '保存凭据'}
+                    </button>
+                  </div>
+
+                  {webdavStatus ? (
+                    <div className="text-[11px] text-gray-500">{webdavStatus}</div>
+                  ) : null}
                 </div>
-              </div>
+              )}
             </div>
 
             {settingsError ? (
@@ -1084,7 +1283,9 @@ const App: React.FC = () => {
 
             <div className="mt-4 flex items-center justify-between">
               <div className="text-[11px] text-gray-400">
-                开启 AI 功能需填写 API KEY / URL / 模型。
+                {settingsSection === 'ai'
+                  ? '开启 AI 功能需填写 API KEY / URL / 模型。'
+                  : 'WebDAV 密码使用系统安全存储，需单独保存凭据。'}
               </div>
               <button
                 type="button"

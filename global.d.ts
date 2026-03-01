@@ -78,6 +78,10 @@ declare global {
         model?: string;
         parsePdfWithAI?: boolean;
         libraryPath?: string;
+        webdavServer?: string;
+        webdavUsername?: string;
+        webdavRemotePath?: string;
+        webdavHasPassword?: boolean;
       }>;
       settingsSet?: (payload: {
         translationEngine?: 'cnki' | 'openai';
@@ -86,6 +90,9 @@ declare global {
         model?: string;
         parsePdfWithAI?: boolean;
         libraryPath?: string;
+        webdavServer?: string;
+        webdavUsername?: string;
+        webdavRemotePath?: string;
       }) => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
@@ -93,12 +100,52 @@ declare global {
         model?: string;
         parsePdfWithAI?: boolean;
         libraryPath?: string;
+        webdavServer?: string;
+        webdavUsername?: string;
+        webdavRemotePath?: string;
+        webdavHasPassword?: boolean;
       }>;
+      webdav?: {
+        test?: (payload: {
+          server?: string;
+          username?: string;
+          password?: string;
+          remotePath?: string;
+        }) => Promise<{
+          success: boolean;
+          reachable?: boolean;
+          writable?: boolean;
+          validPath?: boolean;
+          message?: string;
+        }>;
+        save?: (payload: {
+          server?: string;
+          username?: string;
+          password?: string;
+          remotePath?: string;
+        }) => Promise<{
+          success: boolean;
+          webdavServer?: string;
+          webdavUsername?: string;
+          webdavRemotePath?: string;
+          webdavHasPassword?: boolean;
+        }>;
+        syncUpload?: () => Promise<{
+          success: boolean;
+          sqliteBytes?: number;
+          uploadedPdfCount?: number;
+          uploadedPdfBytes?: number;
+          remotePath?: string;
+          server?: string;
+          error?: string;
+        }>;
+      };
       vector?: {
         status?: () => Promise<{
           ok: boolean;
           qdrantUrl?: string;
           qdrantStoragePath?: string;
+          metadataDbPath?: string;
           collection?: string;
           vectorFields?: string[];
           vectorDim?: number;
