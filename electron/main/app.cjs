@@ -1219,6 +1219,7 @@ const sanitizePaperForMeta = (paper, targetPdfPath) => {
     publisher: String(source.publisher || '').trim(),
     doi: String(source.doi || '').trim(),
     version: Math.max(1, Number(source.version || 1) || 1),
+    baseVersion: Math.max(0, Number(source.baseVersion ?? source.base_version ?? 0) || 0),
     updatedAt: Number(source.updatedAt || 0),
     references: Array.isArray(source.references)
       ? source.references
@@ -1240,6 +1241,9 @@ const sanitizePaperForMeta = (paper, targetPdfPath) => {
   const uploadedAtMs = Number(source.uploadedAt || Date.parse(next.addedDate));
   next.uploadedAt = Number.isFinite(uploadedAtMs) && uploadedAtMs > 0 ? uploadedAtMs : Date.now();
   next.updatedAt = Number.isFinite(next.updatedAt) && next.updatedAt > 0 ? next.updatedAt : Date.now();
+  if (!next.baseVersion && next.version > 1 && source.baseVersion != null) {
+    next.baseVersion = Math.max(0, Number(source.baseVersion || 0) || 0);
+  }
   return next;
 };
 
@@ -1520,7 +1524,7 @@ const migrateExistingLibraryToSqlite = async (paths) => {
   }
 
   await saveFoldersToSqlite(folders);
-  const normalizedPapers = await savePapersToSqlite(papers, paths);
+  const normalizedPapers = await savePapersToSqlite(papers, paths, { preserveIncomingVersion: true });
   for (const item of states) {
     // eslint-disable-next-line no-await-in-loop
     await savePaperStateToSqlite(item.paperId, item.state || {});
@@ -1567,6 +1571,7 @@ const {
   saveFoldersToSqlite,
   loadPapersFromSqlite,
   savePapersToSqlite,
+  markAllPapersBaseVersionCurrent,
   savePaperStateToSqlite,
   loadPaperStateFromSqlite,
   loadPaperStatesFromSqlite,
@@ -2177,12 +2182,14 @@ const webDavSyncModule = createWebDavSyncModule({
   getWebDavCredential,
   createWebDavClient,
   ensureWebDavLock,
+  releaseWebDavLock,
   loadFoldersFromSqlite,
   loadPapersFromSqlite,
   loadPaperStatesFromSqlite,
   loadLibraryDataFromSqliteFile,
   saveFoldersToSqlite,
   savePapersToSqlite,
+  markAllPapersBaseVersionCurrent,
   savePaperStateToSqlite,
   deletePaperStatesFromSqlite,
   setSyncPending,

@@ -22,6 +22,7 @@ export interface Paper {
   publisher?: string;
   doi?: string;
   version?: number;
+  baseVersion?: number;
   updatedAt?: number;
   references?: PaperReference[];
   referenceStats?: {

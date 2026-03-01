@@ -65,12 +65,14 @@ const createWebDavSyncModule = (deps = {}) => {
     getWebDavCredential,
     createWebDavClient,
     ensureWebDavLock,
+    releaseWebDavLock,
     loadFoldersFromSqlite,
     loadPapersFromSqlite,
     loadPaperStatesFromSqlite,
     loadLibraryDataFromSqliteFile,
     saveFoldersToSqlite,
     savePapersToSqlite,
+    markAllPapersBaseVersionCurrent,
     savePaperStateToSqlite,
     deletePaperStatesFromSqlite,
     setSyncPending,
@@ -211,6 +213,7 @@ const createWebDavSyncModule = (deps = {}) => {
   const normalizePaperForConflictCompare = (paper = {}) => ({
     id: String(paper.id || '').trim(),
     version: Math.max(1, Number(paper.version || 1) || 1),
+    baseVersion: Math.max(0, Number(paper.baseVersion ?? paper.base_version ?? 0) || 0),
     updatedAt: Number(paper.updatedAt || 0),
     title: String(paper.title || '').trim(),
     author: String(paper.author || '').trim(),
@@ -228,6 +231,27 @@ const createWebDavSyncModule = (deps = {}) => {
     references: Array.isArray(paper.references) ? paper.references : [],
     referenceStats: paper.referenceStats || null
   });
+
+  const getPaperVersionInfo = (paper = {}) => {
+    const normalized = normalizePaperForConflictCompare(paper);
+    const version = Math.max(1, Number(normalized.version || 1) || 1);
+    const baseVersion = Math.max(0, Number(normalized.baseVersion || 0) || 0);
+    return {
+      version,
+      baseVersion,
+      updatedAt: Number(normalized.updatedAt || 0),
+      changedSinceBase: version > baseVersion
+    };
+  };
+
+  const buildSyncedRemotePaper = (paper = {}) => {
+    const version = Math.max(1, Number(paper?.version || 1) || 1);
+    return {
+      ...paper,
+      version,
+      baseVersion: version
+    };
+  };
 
   const buildPaperMap = (papers = []) =>
     new Map(
@@ -268,8 +292,10 @@ const createWebDavSyncModule = (deps = {}) => {
         const remotePdf = remoteFiles[pdfFile] || null;
         const localVersion = Math.max(1, Number(localNormalized.version || 1) || 1);
         const remoteVersion = Math.max(1, Number(remoteNormalized.version || 1) || 1);
-        const localBehindRemote = remoteVersion > localVersion;
-        if (!localBehindRemote) return;
+        const localBaseVersion = Math.max(0, Number(localNormalized.baseVersion || 0) || 0);
+        const localChanged = localVersion > localBaseVersion;
+        const remoteChanged = remoteVersion > localBaseVersion;
+        if (!(localChanged && remoteChanged)) return;
         conflicts.push({
           paperId,
           title: String(localPaper.title || remotePaper.title || paperId),
@@ -283,6 +309,7 @@ const createWebDavSyncModule = (deps = {}) => {
           },
           localVersion,
           remoteVersion,
+          localBaseVersion,
           localUpdatedAt: Number(localNormalized.updatedAt || 0),
           remoteUpdatedAt: Number(remoteNormalized.updatedAt || 0),
           localBehindRemote: true
@@ -294,7 +321,7 @@ const createWebDavSyncModule = (deps = {}) => {
         `[webdav-conflict] detected ${conflicts.length} outdated local papers: ${conflicts
           .map(
             (item) =>
-              `${item.paperId}(local=v${item.localVersion}@${formatLogTime(
+              `${item.paperId}(base=v${item.localBaseVersion},local=v${item.localVersion}@${formatLogTime(
                 item.localUpdatedAt
               )},remote=v${item.remoteVersion}@${formatLogTime(item.remoteUpdatedAt)})`
           )
@@ -382,19 +409,32 @@ const createWebDavSyncModule = (deps = {}) => {
       const localPaper = localPaperMap.get(paperId) || null;
       const remotePaper = remotePaperMap.get(paperId) || null;
       if (localPaper && remotePaper) {
-        const localVersion = Math.max(1, Number(localPaper.version || 1) || 1);
-        const remoteVersion = Math.max(1, Number(remotePaper.version || 1) || 1);
-        if (remoteVersion > localVersion) {
-          finalPaperMap.set(paperId, remotePaper);
+        const { version: localVersion, baseVersion: localBaseVersion, changedSinceBase: localChanged } =
+          getPaperVersionInfo(localPaper);
+        const { version: remoteVersion } = getPaperVersionInfo(remotePaper);
+        const remoteChanged = remoteVersion > localBaseVersion;
+        if (!localChanged && remoteChanged) {
+          finalPaperMap.set(paperId, buildSyncedRemotePaper(remotePaper));
           finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
           pdfSources.set(paperId, 'remote');
+        } else if (localChanged && !remoteChanged) {
+          finalPaperMap.set(paperId, localPaper);
+          finalStateMap.set(paperId, localStateMap.get(paperId) || {});
+          pdfSources.set(paperId, 'local');
+          hasLocalAheadChanges = true;
+        } else if (!localChanged && !remoteChanged) {
+          const resolvedPaper = remoteVersion >= localVersion ? buildSyncedRemotePaper(remotePaper) : localPaper;
+          finalPaperMap.set(paperId, resolvedPaper);
+          finalStateMap.set(
+            paperId,
+            remoteVersion >= localVersion ? remoteStateMap.get(paperId) || {} : localStateMap.get(paperId) || {}
+          );
+          pdfSources.set(paperId, remoteVersion >= localVersion ? 'remote' : 'local');
         } else {
           finalPaperMap.set(paperId, localPaper);
           finalStateMap.set(paperId, localStateMap.get(paperId) || {});
           pdfSources.set(paperId, 'local');
-          if (localVersion > remoteVersion) {
-            hasLocalAheadChanges = true;
-          }
+          hasLocalAheadChanges = true;
         }
         return;
       }
@@ -406,7 +446,7 @@ const createWebDavSyncModule = (deps = {}) => {
         return;
       }
       if (remotePaper) {
-        finalPaperMap.set(paperId, remotePaper);
+        finalPaperMap.set(paperId, buildSyncedRemotePaper(remotePaper));
         finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
         pdfSources.set(paperId, 'remote');
       }
@@ -494,7 +534,7 @@ const createWebDavSyncModule = (deps = {}) => {
     await ensureLibraryStoreReady();
     const paths = getLibraryPaths();
     await saveFoldersToSqlite(mergedFolders);
-    await savePapersToSqlite(finalPapers, paths);
+    await savePapersToSqlite(finalPapers, paths, { preserveIncomingVersion: true });
     const retainedIds = new Set(finalPapers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
     deletePaperStatesFromSqlite(
       Array.from(new Set([...localStateMap.keys(), ...remoteStateMap.keys()])).filter(
@@ -580,8 +620,6 @@ const createWebDavSyncModule = (deps = {}) => {
         });
         return { success: false, skipped: true, reason: 'remote path not found' };
       }
-      await ensureWebDavLock(client, remotePath);
-
       const remoteSqlitePath = `${remotePath}/library.sqlite`;
       if (!(await client.exists(remoteSqlitePath))) {
         console.log(
@@ -618,7 +656,7 @@ const createWebDavSyncModule = (deps = {}) => {
       const sqliteBytes = Number(sqliteStat?.size || 0);
       await ensureLibraryStoreReady();
       await saveFoldersToSqlite(merged.folders);
-      await savePapersToSqlite(merged.papers, paths);
+      await savePapersToSqlite(merged.papers, paths, { preserveIncomingVersion: true });
       const retainedIds = new Set(merged.papers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
       deletePaperStatesFromSqlite(
         Array.from(
@@ -749,7 +787,7 @@ const createWebDavSyncModule = (deps = {}) => {
           });
           await ensureLibraryStoreReady();
           await saveFoldersToSqlite(merged.folders);
-          await savePapersToSqlite(merged.papers, paths);
+          await savePapersToSqlite(merged.papers, paths, { preserveIncomingVersion: true });
           const retainedIds = new Set(
             merged.papers.map((paper) => String(paper?.id || '').trim()).filter(Boolean)
           );
@@ -832,6 +870,7 @@ const createWebDavSyncModule = (deps = {}) => {
       console.log(
         `[webdav-sync] upload complete: sqlite=${sqliteBytes}B, pdfs=${uploadedPdfCount}, pdfBytes=${uploadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
       );
+      markAllPapersBaseVersionCurrent();
       setSyncPending(false);
       await clearPendingWebDavConflict();
       emitWebDavSyncState({
@@ -855,6 +894,8 @@ const createWebDavSyncModule = (deps = {}) => {
         message: error?.message || '上传失败'
       });
       throw error;
+    } finally {
+      await releaseWebDavLock();
     }
   };
 

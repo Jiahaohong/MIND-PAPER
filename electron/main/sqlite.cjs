@@ -80,6 +80,7 @@ module.exports = function createSqliteModule(deps = {}) {
         id TEXT PRIMARY KEY,
         sort_order INTEGER NOT NULL,
         version INTEGER NOT NULL DEFAULT 1,
+        base_version INTEGER NOT NULL DEFAULT 0,
         title TEXT NOT NULL DEFAULT '',
         author TEXT NOT NULL DEFAULT '',
         date TEXT NOT NULL DEFAULT '',
@@ -112,6 +113,10 @@ module.exports = function createSqliteModule(deps = {}) {
     const columnNames = new Set(columns.map((column) => String(column?.name || '').trim()));
     if (!columnNames.has('version')) {
       db.exec('ALTER TABLE papers ADD COLUMN version INTEGER NOT NULL DEFAULT 1;');
+    }
+    if (!columnNames.has('base_version')) {
+      db.exec('ALTER TABLE papers ADD COLUMN base_version INTEGER NOT NULL DEFAULT 0;');
+      db.exec('UPDATE papers SET base_version = version WHERE base_version = 0;');
     }
   };
 
@@ -177,6 +182,7 @@ module.exports = function createSqliteModule(deps = {}) {
         publisher: row?.publisher,
         doi: row?.doi,
         version: row?.version,
+        baseVersion: row?.base_version,
         updatedAt: row?.updated_at,
         references: safeJsonParse(row?.references_json, []),
         referenceStats: safeJsonParse(row?.reference_stats_json, undefined),
@@ -257,12 +263,14 @@ module.exports = function createSqliteModule(deps = {}) {
       keywords: Array.isArray(paper?.keywords) ? paper.keywords : [],
       publisher: String(paper?.publisher || '').trim(),
       doi: String(paper?.doi || '').trim(),
+      baseVersion: Math.max(0, Number(paper?.baseVersion ?? 0) || 0),
       references: Array.isArray(paper?.references) ? paper.references : [],
       referenceStats: paper?.referenceStats || null,
       filePath: String(paper?.filePath || '').trim()
     });
 
-  const savePapersToSqlite = async (papers, paths) => {
+  const savePapersToSqlite = async (papers, paths, options = {}) => {
+    const preserveIncomingVersion = Boolean(options?.preserveIncomingVersion);
     const source = Array.isArray(papers) ? papers : [];
     const runtimeStateById = new Map(
       source
@@ -310,11 +318,11 @@ module.exports = function createSqliteModule(deps = {}) {
     const upsertPaper = db.prepare(`
       INSERT INTO papers (
         id, sort_order, title, author, date, added_date, uploaded_at, folder_id, previous_folder_id,
-        version, summary, abstract, content, keywords_json, publisher, doi, references_json,
+        version, base_version, summary, abstract, content, keywords_json, publisher, doi, references_json,
         reference_stats_json, file_path, updated_at
       ) VALUES (
         @id, @sort_order, @title, @author, @date, @added_date, @uploaded_at, @folder_id, @previous_folder_id,
-        @version,
+        @version, @base_version,
         @summary, @abstract, @content, @keywords_json, @publisher, @doi, @references_json,
         @reference_stats_json, @file_path, @updated_at
       )
@@ -328,6 +336,7 @@ module.exports = function createSqliteModule(deps = {}) {
         folder_id = excluded.folder_id,
         previous_folder_id = excluded.previous_folder_id,
         version = excluded.version,
+        base_version = excluded.base_version,
         summary = excluded.summary,
         abstract = excluded.abstract,
         content = excluded.content,
@@ -345,12 +354,31 @@ module.exports = function createSqliteModule(deps = {}) {
         const existing = existingById.get(String(paper?.id || '').trim());
         const nextComparable = buildPaperStorageComparable(paper);
         const unchanged = existing && existing.comparable === nextComparable;
-        const version = unchanged
-          ? Number(existing.row?.version || existing.mapped?.version || 1)
-          : Number(existing?.row?.version || existing?.mapped?.version || 0) + 1;
-        const updatedAt = unchanged
-          ? Number(existing.row?.updated_at || existing.mapped?.updatedAt || Date.now())
-          : Date.now();
+        const existingVersion = Number(existing?.row?.version || existing?.mapped?.version || 1);
+        const existingBaseVersion = Math.max(
+          0,
+          Number(existing?.row?.base_version ?? existing?.mapped?.baseVersion ?? existingVersion) || 0
+        );
+        const incomingVersion = Math.max(1, Number(paper?.version || existingVersion || 1) || 1);
+        const incomingBaseVersion = Math.max(
+          0,
+          Number(paper?.baseVersion ?? existingBaseVersion ?? 0) || 0
+        );
+        const version = preserveIncomingVersion
+          ? incomingVersion
+          : unchanged
+            ? existingVersion
+            : existingVersion + 1;
+        const baseVersion = preserveIncomingVersion
+          ? incomingBaseVersion
+          : unchanged
+            ? existingBaseVersion
+            : existingBaseVersion;
+        const updatedAt = preserveIncomingVersion
+          ? Number(paper?.updatedAt || existing?.row?.updated_at || existing?.mapped?.updatedAt || Date.now())
+          : unchanged
+            ? Number(existing?.row?.updated_at || existing?.mapped?.updatedAt || Date.now())
+            : Date.now();
         upsertPaper.run({
           id: paper.id,
           sort_order: order,
@@ -362,6 +390,7 @@ module.exports = function createSqliteModule(deps = {}) {
           folder_id: paper.folderId || '',
           previous_folder_id: paper.previousFolderId || '',
           version,
+          base_version: baseVersion,
           summary: paper.summary || '',
           abstract: paper.abstract || '',
           content: paper.content || '',
@@ -374,6 +403,7 @@ module.exports = function createSqliteModule(deps = {}) {
           updated_at: updatedAt
         });
         paper.version = version;
+        paper.baseVersion = baseVersion;
         paper.updatedAt = updatedAt;
       });
       if (!items.length) {
@@ -403,6 +433,21 @@ module.exports = function createSqliteModule(deps = {}) {
       void enqueueSummaryVectorSync(vectorReadyPapers);
     }
     return persistedPapers;
+  };
+
+  const markAllPapersBaseVersionCurrent = (paperIds = null) => {
+    const db = getLibraryDb();
+    const ids = Array.isArray(paperIds)
+      ? paperIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : null;
+    if (ids && !ids.length) return 0;
+    if (!ids) {
+      const result = db.prepare('UPDATE papers SET base_version = version').run();
+      return Number(result?.changes || 0);
+    }
+    const placeholders = ids.map(() => '?').join(', ');
+    const result = db.prepare(`UPDATE papers SET base_version = version WHERE id IN (${placeholders})`).run(...ids);
+    return Number(result?.changes || 0);
   };
 
   const savePaperStateToSqlite = async (paperId, state) => {
@@ -490,6 +535,7 @@ module.exports = function createSqliteModule(deps = {}) {
     saveFoldersToSqlite,
     loadPapersFromSqlite,
     savePapersToSqlite,
+    markAllPapersBaseVersionCurrent,
     savePaperStateToSqlite,
     loadPaperStateFromSqlite,
     loadPaperStatesFromSqlite,

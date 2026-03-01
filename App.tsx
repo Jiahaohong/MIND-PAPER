@@ -15,6 +15,7 @@ import { resolvePaperMetadata } from './services/paperMetadataResolver';
 type WebDavConflictItem = {
   paperId: string;
   title: string;
+  localBaseVersion?: number;
   localVersion?: number;
   remoteVersion?: number;
   localUpdatedAt?: number;
@@ -1564,7 +1565,8 @@ const App: React.FC = () => {
                   <div key={item.paperId} className="px-3 py-3 border-b border-gray-100 last:border-b-0">
                     <div className="text-sm font-medium text-gray-800">{item.title || item.paperId}</div>
                     <div className="mt-1 text-[11px] text-gray-500">
-                      本地版本 v{item.localVersion || 1} / 云端版本 v{item.remoteVersion || 1}
+                      基线版本 v{item.localBaseVersion || 0} / 本地版本 v{item.localVersion || 1} / 云端版本 v
+                      {item.remoteVersion || 1}
                     </div>
                     <div className="mt-1 text-[11px] text-gray-400">
                       本地更新时间 {formatConflictTime(item.localUpdatedAt)} / 云端更新时间{' '}
