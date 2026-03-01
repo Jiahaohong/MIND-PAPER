@@ -3,9 +3,12 @@ const path = require('path');
 const fs = require('fs/promises');
 const fsNative = require('fs');
 const crypto = require('crypto');
-const os = require('os');
 const { spawn } = require('child_process');
 const { createMainWindow } = require('./window.cjs');
+const createSqliteModule = require('./sqlite.cjs');
+const { createWebDavModule, registerWebDavIpc } = require('./webdav.cjs');
+const { createWebDavSyncModule, registerWebDavSyncIpc } = require('./webdav-sync.cjs');
+const { registerLibraryIpc } = require('./library.cjs');
 
 const isDev = !app.isPackaged;
 const devServerURL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:3001';
@@ -41,10 +44,7 @@ const CNKI_TRANSLATE_URL = 'https://dict.cnki.net/fyzs-front-api/translate/liter
 const CNKI_REGEX = /(查看名企职位.+?https:\/\/dict\.cnki\.net[a-zA-Z./]+.html?)/g;
 const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
-const WEBDAV_KEYTAR_SERVICE = 'MindPaper-WebDAV';
 const DEFAULT_WEBDAV_REMOTE_PATH = '/mindpaper';
-const WEBDAV_PDF_MANIFEST_FILE = 'papers-manifest.json';
-const WEBDAV_LOCK_FILE = 'lock.json';
 const WEBDAV_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
 
 let settingsLoaded = false;
@@ -67,26 +67,8 @@ let cnkiTokenCache = { token: '', t: 0 };
 let qdrantBootPromise = null;
 let qdrantProcess = null;
 let qdrantStartedByApp = false;
-let libraryStoreReadyPromise = null;
-let sqliteDriver = null;
-let libraryDb = null;
-let libraryDbRoot = '';
-let webdavDriverPromise = null;
-let keytarDriver = null;
 let summaryVectorSyncChain = Promise.resolve();
 let startupWebDavSyncPromise = null;
-let webdavSyncState = {
-  active: false,
-  direction: 'idle',
-  message: ''
-};
-const webdavLockOwner = {
-  sessionId: crypto.randomUUID(),
-  device: `${os.hostname()}-${app.getName()}`,
-  appVersion: app.getVersion()
-};
-let activeWebDavLock = null;
-let pendingWebDavConflict = null;
 const PROGRESS_STAGES = new Set([
   '开始解析基本信息',
   '完成解析基本信息',
@@ -127,42 +109,6 @@ const formatLogTime = (value) => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
     date.getHours()
   )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-};
-
-const emitWebDavSyncState = (next = {}) => {
-  webdavSyncState = {
-    ...webdavSyncState,
-    ...next
-  };
-  BrowserWindow.getAllWindows().forEach((win) => {
-    try {
-      if (win?.isDestroyed?.()) return;
-      if (win?.webContents?.isDestroyed?.()) return;
-      win.webContents.send('webdav-sync-event', webdavSyncState);
-    } catch {
-      // ignore sync event dispatch errors
-    }
-  });
-};
-
-const emitWebDavConflict = (payload = {}) => {
-  BrowserWindow.getAllWindows().forEach((win) => {
-    try {
-      if (win?.isDestroyed?.()) return;
-      if (win?.webContents?.isDestroyed?.()) return;
-      win.webContents.send('webdav-conflict-event', payload);
-    } catch {
-      // ignore window dispatch errors
-    }
-  });
-};
-
-const clearPendingWebDavConflict = async () => {
-  const tempPath = String(pendingWebDavConflict?.remoteTempSqlitePath || '').trim();
-  pendingWebDavConflict = null;
-  if (tempPath) {
-    await removeFileIfExists(tempPath);
-  }
 };
 
 const getQdrantUrl = () => process.env.MINDPAPER_QDRANT_URL || DEFAULT_QDRANT_URL;
@@ -226,76 +172,6 @@ const normalizeWebDavRemotePath = (value) => {
   return normalized.startsWith('/') ? normalized || DEFAULT_WEBDAV_REMOTE_PATH : `/${normalized}`;
 };
 
-const getWebDavDriver = async () => {
-  if (webdavDriverPromise) return webdavDriverPromise;
-  webdavDriverPromise = import('webdav')
-    .then((mod) => mod?.default || mod)
-    .catch((error) => {
-      webdavDriverPromise = null;
-      throw new Error(`缺少 webdav 依赖: ${error?.message || error}`);
-    });
-  return webdavDriverPromise;
-};
-
-const getKeytarDriver = () => {
-  if (keytarDriver) return keytarDriver;
-  try {
-    keytarDriver = require('keytar');
-    return keytarDriver;
-  } catch (error) {
-    throw new Error(`缺少 keytar 依赖: ${error?.message || error}`);
-  }
-};
-
-const getWebDavCredentialAccount = (server, username) =>
-  `${normalizeWebDavServer(server)}|${String(username || '').trim()}`;
-
-const saveWebDavCredential = async (server, username, password) => {
-  const normalizedServer = normalizeWebDavServer(server);
-  const normalizedUsername = String(username || '').trim();
-  const secret = String(password || '');
-  if (!normalizedServer || !normalizedUsername) {
-    throw new Error('缺少 WebDAV 服务器地址或用户名');
-  }
-  const keytar = getKeytarDriver();
-  if (secret) {
-    await keytar.setPassword(
-      WEBDAV_KEYTAR_SERVICE,
-      getWebDavCredentialAccount(normalizedServer, normalizedUsername),
-      secret
-    );
-    return true;
-  }
-  return false;
-};
-
-const getWebDavCredential = async (server, username) => {
-  const normalizedServer = normalizeWebDavServer(server);
-  const normalizedUsername = String(username || '').trim();
-  if (!normalizedServer || !normalizedUsername) return '';
-  const keytar = getKeytarDriver();
-  return (
-    (await keytar.getPassword(
-      WEBDAV_KEYTAR_SERVICE,
-      getWebDavCredentialAccount(normalizedServer, normalizedUsername)
-    )) || ''
-  );
-};
-
-const hasWebDavCredential = async (server, username) => Boolean(await getWebDavCredential(server, username));
-
-const createWebDavClient = async (server, username, password) => {
-  const driver = await getWebDavDriver();
-  const createClient = driver?.createClient;
-  if (typeof createClient !== 'function') {
-    throw new Error('webdav createClient 不可用');
-  }
-  return createClient(normalizeWebDavServer(server), {
-    username: String(username || '').trim(),
-    password: String(password || '')
-  });
-};
-
 const sanitizeSettings = (payload = {}) => ({
   translationEngine: payload.translationEngine === 'openai' ? 'openai' : 'cnki',
   apiKey: String(payload.apiKey || '').trim(),
@@ -323,45 +199,6 @@ const getLibraryPaths = () => {
     indexPath: path.join(root, 'index.json'),
     sqlitePath: path.join(root, 'library.sqlite')
   };
-};
-
-const getSqliteDriver = () => {
-  if (sqliteDriver) return sqliteDriver;
-  try {
-    sqliteDriver = require('better-sqlite3');
-    return sqliteDriver;
-  } catch (error) {
-    throw new Error(`缺少 better-sqlite3 依赖: ${error?.message || error}`);
-  }
-};
-
-const closeLibraryDb = () => {
-  if (!libraryDb) return;
-  try {
-    libraryDb.close();
-  } catch {
-    // ignore close errors
-  }
-  libraryDb = null;
-  libraryDbRoot = '';
-};
-
-const resetLibraryStore = () => {
-  closeLibraryDb();
-  libraryStoreReadyPromise = null;
-};
-
-const getLibraryDb = () => {
-  const paths = getLibraryPaths();
-  if (libraryDb && libraryDbRoot === paths.root) return libraryDb;
-  closeLibraryDb();
-  const Database = getSqliteDriver();
-  libraryDb = new Database(paths.sqlitePath);
-  libraryDbRoot = paths.root;
-  libraryDb.pragma('journal_mode = WAL');
-  libraryDb.pragma('synchronous = NORMAL');
-  libraryDb.pragma('foreign_keys = ON');
-  return libraryDb;
 };
 
 const loadSettings = async () => {
@@ -400,919 +237,27 @@ const saveSettings = async (payload = {}) => {
   return runtimeSettings;
 };
 
-const getWebDavConfigFromSettings = async () => {
-  const settings = await loadSettings();
-  const webdavServer = normalizeWebDavServer(settings.webdavServer);
-  const webdavUsername = String(settings.webdavUsername || '').trim();
-  const webdavRemotePath = normalizeWebDavRemotePath(settings.webdavRemotePath);
-  let webdavHasPassword = false;
-  try {
-    webdavHasPassword = await hasWebDavCredential(webdavServer, webdavUsername);
-  } catch {
-    webdavHasPassword = false;
-  }
-  return {
-    webdavServer,
-    webdavUsername,
-    webdavRemotePath,
-    webdavHasPassword
-  };
-};
-
-const resolveWebDavPassword = async (server, username, password) => {
-  const direct = String(password || '');
-  if (direct) return direct;
-  return getWebDavCredential(server, username);
-};
-
-const testWebDavConnection = async (payload = {}) => {
-  const server = normalizeWebDavServer(payload.server);
-  const username = String(payload.username || '').trim();
-  const remotePath = normalizeWebDavRemotePath(payload.remotePath);
-  const password = await resolveWebDavPassword(server, username, payload.password);
-  if (!server) {
-    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少服务器地址' };
-  }
-  if (!username) {
-    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少用户名' };
-  }
-  if (!password) {
-    return { success: false, reachable: false, writable: false, validPath: false, message: '缺少密码或未保存凭据' };
-  }
-  let reachable = false;
-  let validPath = false;
-  let writable = false;
-  try {
-    const client = await createWebDavClient(server, username, password);
-    await client.getDirectoryContents('/');
-    reachable = true;
-    const exists = await client.exists(remotePath);
-    if (!exists) {
-      await client.createDirectory(remotePath, { recursive: true });
-    }
-    validPath = true;
-    const testFile = `${remotePath}/.mindpaper-webdav-test-${Date.now()}.tmp`;
-    const payloadText = `mindpaper test ${new Date().toISOString()}`;
-    await client.putFileContents(testFile, Buffer.from(payloadText, 'utf8'), { overwrite: true });
-    writable = true;
-    await client.deleteFile(testFile).catch(() => null);
-    return { success: true, reachable, writable, validPath, message: '连接成功' };
-  } catch (error) {
-    return {
-      success: false,
-      reachable,
-      writable,
-      validPath,
-      message: error?.message || 'WebDAV连接失败'
-    };
-  }
-};
-
-const saveWebDavConfig = async (payload = {}) => {
-  const server = normalizeWebDavServer(payload.server);
-  const username = String(payload.username || '').trim();
-  const remotePath = normalizeWebDavRemotePath(payload.remotePath);
-  const password = String(payload.password || '');
-  await saveSettings({
-    webdavServer: server,
-    webdavUsername: username,
-    webdavRemotePath: remotePath
-  });
-  const savedSecret = await saveWebDavCredential(server, username, password).catch((error) => {
-    throw error;
-  });
-  return {
-    success: true,
-    webdavServer: server,
-    webdavUsername: username,
-    webdavRemotePath: remotePath,
-    webdavHasPassword: savedSecret || Boolean(await hasWebDavCredential(server, username))
-  };
-};
-
-const createSqliteSyncSnapshot = async () => {
-  await ensureLibraryStoreReady();
-  const paths = getLibraryPaths();
-  const db = getLibraryDb();
-  try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
-  } catch {
-    // ignore checkpoint failures and still try snapshot copy
-  }
-  const snapshotPath = `${paths.sqlitePath}.sync`;
-  await fs.copyFile(paths.sqlitePath, snapshotPath);
-  return {
-    snapshotPath,
-    fileName: 'library.sqlite'
-  };
-};
-
-const uploadFileToWebDav = async (client, remotePath, localPath) => {
-  const data = await fs.readFile(localPath);
-  await client.putFileContents(remotePath, data, { overwrite: true });
-  return data.length;
-};
-
-const downloadFileFromWebDav = async (client, remotePath, localPath) => {
-  const file = await client.getFileContents(remotePath, { format: 'binary' });
-  const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
-  await fs.mkdir(path.dirname(localPath), { recursive: true });
-  await fs.writeFile(localPath, buffer);
-  return buffer.length;
-};
-
-const hashFileSha1 = async (filePath) =>
-  new Promise((resolve, reject) => {
-    const hash = crypto.createHash('sha1');
-    const stream = fsNative.createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
-    stream.on('error', reject);
-    stream.on('end', () => resolve(hash.digest('hex')));
-  });
-
-const buildLocalPdfManifest = async (papersDir) => {
-  const files = await fs.readdir(papersDir).catch(() => []);
-  const entries = {};
-  for (const file of files) {
-    if (!String(file || '').toLowerCase().endsWith('.pdf')) continue;
-    const fullPath = path.join(papersDir, file);
-    let stat = null;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      stat = await fs.stat(fullPath);
-    } catch {
-      stat = null;
-    }
-    if (!stat?.isFile?.()) continue;
-    // eslint-disable-next-line no-await-in-loop
-    const sha1 = await hashFileSha1(fullPath);
-    entries[file] = {
-      size: Number(stat.size || 0),
-      mtimeMs: Number(stat.mtimeMs || 0),
-      sha1
-    };
-  }
-  return {
-    version: 1,
-    updatedAt: Date.now(),
-    files: entries
-  };
-};
-
-const listExpectedPdfFilesFromSqlite = (sqlitePath) => {
-  try {
-    const Database = getSqliteDriver();
-    const db = new Database(sqlitePath, { readonly: true, fileMustExist: true });
-    try {
-      const rows = db.prepare('SELECT id FROM papers').all();
-      return new Set(
-        rows
-          .map((row) => `${getPaperArticleId(row?.id)}.pdf`)
-          .filter((name) => String(name || '').trim().toLowerCase().endsWith('.pdf'))
-      );
-    } finally {
-      db.close();
-    }
-  } catch {
-    return new Set();
-  }
-};
-
-const getRemotePdfManifestPath = (remotePath) => `${remotePath}/${WEBDAV_PDF_MANIFEST_FILE}`;
-
-const readRemoteJsonFile = async (client, remotePath) => {
-  const exists = await client.exists(remotePath);
-  if (!exists) return null;
-  const content = await client.getFileContents(remotePath, { format: 'text' });
-  return safeJsonParse(String(content || ''), null);
-};
-
-const writeRemoteJsonFile = async (client, remotePath, payload) => {
-  await client.putFileContents(remotePath, JSON.stringify(payload, null, 2), {
-    overwrite: true
-  });
-};
-
-const getRemoteWebDavLockPath = (remotePath) => `${remotePath}/${WEBDAV_LOCK_FILE}`;
-
-const buildWebDavLockPayload = () => {
-  const now = Date.now();
-  return {
-    sessionId: webdavLockOwner.sessionId,
-    device: webdavLockOwner.device,
-    appVersion: webdavLockOwner.appVersion,
-    acquiredAt: activeWebDavLock?.acquiredAt || now,
-    refreshedAt: now,
-    expiresAt: now + WEBDAV_LOCK_TTL_MS
-  };
-};
-
-const isWebDavLockAlive = (lock) =>
-  Boolean(lock && Number(lock.expiresAt || 0) > Date.now() && String(lock.sessionId || '').trim());
-
-const isWebDavLockOwnedBySelf = (lock) =>
-  String(lock?.sessionId || '').trim() === webdavLockOwner.sessionId;
-
-const isWebDavLockOwnedBySameDevice = (lock) =>
-  String(lock?.device || '').trim() === String(webdavLockOwner.device || '').trim();
-
-const refreshWebDavLock = async (client, remotePath) => {
-  const payload = buildWebDavLockPayload();
-  await writeRemoteJsonFile(client, getRemoteWebDavLockPath(remotePath), payload);
-  activeWebDavLock = payload;
-};
-
-const acquireWebDavLock = async (client, remotePath) => {
-  const lockPath = getRemoteWebDavLockPath(remotePath);
-  const existing = await readRemoteJsonFile(client, lockPath);
-  if (
-    isWebDavLockAlive(existing) &&
-    !isWebDavLockOwnedBySelf(existing) &&
-    !isWebDavLockOwnedBySameDevice(existing)
-  ) {
-    const owner = String(existing.device || 'unknown');
-    throw new Error(`云端正在被其他设备使用: ${owner}`);
-  }
-  const payload = buildWebDavLockPayload();
-  await writeRemoteJsonFile(client, lockPath, payload);
-  activeWebDavLock = payload;
-  if (isWebDavLockAlive(existing) && isWebDavLockOwnedBySameDevice(existing) && !isWebDavLockOwnedBySelf(existing)) {
-    console.log(`[webdav-lock] took over stale same-device lock: device=${payload.device}, remote=${remotePath}`);
-  }
-  console.log(`[webdav-lock] acquired: device=${payload.device}, remote=${remotePath}`);
-  return payload;
-};
-
-const ensureWebDavLock = async (client, remotePath) => {
-  if (activeWebDavLock && isWebDavLockOwnedBySelf(activeWebDavLock) && isWebDavLockAlive(activeWebDavLock)) {
-    await refreshWebDavLock(client, remotePath);
-    return activeWebDavLock;
-  }
-  return acquireWebDavLock(client, remotePath);
-};
-
-const releaseWebDavLock = async () => {
-  if (!activeWebDavLock) return;
-  try {
-    const config = await getWebDavConfigFromSettings();
-    const password = await getWebDavCredential(config.webdavServer, config.webdavUsername);
-    if (!config.webdavServer || !config.webdavUsername || !password) {
-      activeWebDavLock = null;
-      return;
-    }
-    const client = await createWebDavClient(config.webdavServer, config.webdavUsername, password);
-    const lockPath = getRemoteWebDavLockPath(config.webdavRemotePath);
-    const remoteLock = await readRemoteJsonFile(client, lockPath);
-    if (isWebDavLockOwnedBySelf(remoteLock)) {
-      await client.deleteFile(lockPath).catch(() => null);
-      console.log(`[webdav-lock] released: remote=${config.webdavRemotePath}`);
-    }
-  } catch (error) {
-    console.warn('[webdav-lock] release failed:', error?.message || error);
-  } finally {
-    activeWebDavLock = null;
-  }
-};
-
-const clearWebDavLock = async () => {
-  const config = await getWebDavConfigFromSettings();
-  const server = config.webdavServer;
-  const username = config.webdavUsername;
-  const remotePath = config.webdavRemotePath;
-  const password = await getWebDavCredential(server, username);
-  if (!server || !username || !password) {
-    throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
-  }
-  const client = await createWebDavClient(server, username, password);
-  await client.getDirectoryContents('/');
-  const lockPath = getRemoteWebDavLockPath(remotePath);
-  const exists = await client.exists(lockPath);
-  if (!exists) {
-    return { success: true, cleared: false, message: '云端锁不存在' };
-  }
-  await client.deleteFile(lockPath).catch((error) => {
-    throw new Error(error?.message || '删除云端锁失败');
-  });
-  activeWebDavLock = null;
-  console.log(`[webdav-lock] force cleared: remote=${remotePath}`);
-  return { success: true, cleared: true, message: '已清除云端锁' };
-};
-
-const getChangedPdfFilesForUpload = (localManifest, remoteManifest) => {
-  const localFiles = localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
-  const remoteFiles = remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
-  return Object.entries(localFiles)
-    .filter(([file, meta]) => {
-      const remote = remoteFiles[file];
-      if (!remote) return true;
-      return String(meta?.sha1 || '') !== String(remote?.sha1 || '');
-    })
-    .map(([file]) => file);
-};
-
-const normalizePaperForConflictCompare = (paper = {}) => ({
-  id: String(paper.id || '').trim(),
-  version: Math.max(1, Number(paper.version || 1) || 1),
-  updatedAt: Number(paper.updatedAt || 0),
-  title: String(paper.title || '').trim(),
-  author: String(paper.author || '').trim(),
-  date: String(paper.date || '').trim(),
-  addedDate: String(paper.addedDate || '').trim(),
-  uploadedAt: Number(paper.uploadedAt || 0),
-  folderId: String(paper.folderId || '').trim(),
-  previousFolderId: String(paper.previousFolderId || '').trim(),
-  summary: String(paper.summary || '').trim(),
-  abstract: String(paper.abstract || '').trim(),
-  content: String(paper.content || '').trim(),
-  keywords: Array.isArray(paper.keywords) ? [...paper.keywords] : [],
-  publisher: String(paper.publisher || '').trim(),
-  doi: String(paper.doi || '').trim(),
-  references: Array.isArray(paper.references) ? paper.references : [],
-  referenceStats: paper.referenceStats || null
+const webDavModule = createWebDavModule({
+  app,
+  normalizeWebDavServer,
+  normalizeWebDavRemotePath,
+  loadSettings,
+  saveSettings,
+  lockTtlMs: WEBDAV_LOCK_TTL_MS
 });
 
-const buildPaperMap = (papers = []) =>
-  new Map(
-    (Array.isArray(papers) ? papers : [])
-      .map((paper) => [String(paper?.id || '').trim(), paper])
-      .filter((entry) => entry[0])
-  );
-
-const buildStateMap = (states = []) =>
-  new Map(
-    (Array.isArray(states) ? states : [])
-      .map((item) => [String(item?.paperId || '').trim(), item?.state || {}])
-      .filter((entry) => entry[0])
-  );
-
-const buildConflictPayload = ({ localData, remoteData, localManifest, remoteManifest, remoteInfo }) => {
-  const localPapers = Array.isArray(localData?.papers) ? localData.papers : [];
-  const remotePapers = Array.isArray(remoteData?.papers) ? remoteData.papers : [];
-  const localPaperMap = buildPaperMap(localPapers);
-  const remotePaperMap = buildPaperMap(remotePapers);
-  const localFiles = localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
-  const remoteFiles = remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
-  const allPaperIds = new Set([...localPaperMap.keys(), ...remotePaperMap.keys()]);
-  const conflicts = [];
-
-  Array.from(allPaperIds)
-    .sort()
-    .forEach((paperId) => {
-      const localPaper = localPaperMap.get(paperId) || null;
-      const remotePaper = remotePaperMap.get(paperId) || null;
-      if (!localPaper || !remotePaper) return;
-      const localNormalized = normalizePaperForConflictCompare(localPaper);
-      const remoteNormalized = normalizePaperForConflictCompare(remotePaper);
-      const pdfFile = `${getPaperArticleId(paperId)}.pdf`;
-      const localPdf = localFiles[pdfFile] || null;
-      const remotePdf = remoteFiles[pdfFile] || null;
-      const localVersion = Math.max(1, Number(localNormalized.version || 1) || 1);
-      const remoteVersion = Math.max(1, Number(remoteNormalized.version || 1) || 1);
-      const localBehindRemote = remoteVersion > localVersion;
-      if (!localBehindRemote) return;
-      conflicts.push({
-        paperId,
-        title: String(localPaper.title || remotePaper.title || paperId),
-        local: {
-          paper: localPaper,
-          pdf: localPdf
-        },
-        remote: {
-          paper: remotePaper,
-          pdf: remotePdf
-        },
-        localVersion,
-        remoteVersion,
-        localUpdatedAt: Number(localNormalized.updatedAt || 0),
-        remoteUpdatedAt: Number(remoteNormalized.updatedAt || 0),
-        localBehindRemote: true
-      });
-    });
-
-  if (conflicts.length) {
-    console.log(
-      `[webdav-conflict] detected ${conflicts.length} outdated local papers: ${conflicts
-        .map(
-          (item) =>
-            `${item.paperId}(local=v${item.localVersion}@${formatLogTime(
-              item.localUpdatedAt
-            )},remote=v${item.remoteVersion}@${formatLogTime(item.remoteUpdatedAt)})`
-        )
-        .join(', ')}`
-    );
-  }
-
-  return {
-    ok: false,
-    conflict: true,
-    server: remoteInfo.server,
-    remotePath: remoteInfo.remotePath,
-    items: conflicts
-  };
-};
-
-const prepareWebDavConflictIfNeeded = async (client, remotePath, remoteSqlitePath) => {
-  const paths = getLibraryPaths();
-  const localData = {
-    folders: await loadFoldersFromSqlite(),
-    papers: await loadPapersFromSqlite(),
-    states: await loadPaperStatesFromSqlite()
-  };
-  const remoteTempSqlitePath = `${paths.sqlitePath}.remote-conflict`;
-  await removeFileIfExists(remoteTempSqlitePath);
-  await downloadFileFromWebDav(client, remoteSqlitePath, remoteTempSqlitePath);
-  const remoteData = loadLibraryDataFromSqliteFile(remoteTempSqlitePath, { root: paths.root, papersDir: paths.papersDir });
-  const localManifest = await buildLocalPdfManifest(paths.papersDir);
-  const remoteManifest = (await readRemoteJsonFile(client, getRemotePdfManifestPath(remotePath))) || {
-    version: 1,
-    updatedAt: Date.now(),
-    files: {}
-  };
-  const payload = buildConflictPayload({
-    localData,
-    remoteData,
-    localManifest,
-    remoteManifest,
-    remoteInfo: {
-      server: normalizeWebDavServer((await getWebDavConfigFromSettings()).webdavServer),
-      remotePath
-    }
-  });
-    await clearPendingWebDavConflict();
-    pendingWebDavConflict = {
-    remotePath,
-    remoteSqlitePath,
-    remoteTempSqlitePath,
-    localData,
-    remoteData,
-    localManifest,
-    remoteManifest,
-    payload
-  };
-  return payload.items.length ? payload : null;
-};
-
-const mergeFoldersForConflictResolution = (localFolders = [], remoteFolders = []) => {
-  const merged = new Map();
-  [...(Array.isArray(localFolders) ? localFolders : []), ...(Array.isArray(remoteFolders) ? remoteFolders : [])].forEach(
-    (folder) => {
-      const id = String(folder?.id || '').trim();
-      if (!id || merged.has(id)) return;
-      merged.set(id, folder);
-    }
-  );
-  return Array.from(merged.values());
-};
-
-const resolveWebDavConflicts = async (payload = {}) => {
-  if (!pendingWebDavConflict?.payload?.items?.length) {
-    throw new Error('当前没有待处理的云端冲突');
-  }
-  const decisions = payload?.decisions && typeof payload.decisions === 'object' ? payload.decisions : {};
-  const strategy = String(payload?.strategy || '').trim();
-  const localPapers = Array.isArray(pendingWebDavConflict.localData?.papers)
-    ? pendingWebDavConflict.localData.papers
-    : [];
-  const remotePapers = Array.isArray(pendingWebDavConflict.remoteData?.papers)
-    ? pendingWebDavConflict.remoteData.papers
-    : [];
-  const localPaperMap = buildPaperMap(localPapers);
-  const remotePaperMap = buildPaperMap(remotePapers);
-  const localStateMap = buildStateMap(pendingWebDavConflict.localData?.states);
-  const remoteStateMap = buildStateMap(pendingWebDavConflict.remoteData?.states);
-  const conflictIds = new Set(pendingWebDavConflict.payload.items.map((item) => String(item.paperId || '').trim()));
-  const finalPaperMap = new Map();
-  const finalStateMap = new Map();
-  const pdfSources = new Map();
-
-  const chooseSource = (paperId) => {
-    if (!conflictIds.has(paperId)) {
-      if (localPaperMap.has(paperId) && remotePaperMap.has(paperId)) return 'local';
-      return localPaperMap.has(paperId) ? 'local' : 'remote';
-    }
-    const explicit = String(decisions[paperId] || '').trim();
-    if (explicit === 'local' || explicit === 'remote') return explicit;
-    if (strategy === 'keep-local') return 'local';
-    if (strategy === 'keep-remote') return 'remote';
-    throw new Error(`缺少冲突项选择: ${paperId}`);
-  };
-
-  new Set([...localPaperMap.keys(), ...remotePaperMap.keys()]).forEach((paperId) => {
-    const source = chooseSource(paperId);
-    const paper = source === 'local' ? localPaperMap.get(paperId) : remotePaperMap.get(paperId);
-    if (!paper) return;
-    finalPaperMap.set(paperId, paper);
-    finalStateMap.set(
-      paperId,
-      source === 'local' ? localStateMap.get(paperId) || {} : remoteStateMap.get(paperId) || {}
-    );
-    pdfSources.set(paperId, source);
-  });
-
-  const mergedFolders =
-    strategy === 'keep-remote'
-      ? mergeFoldersForConflictResolution(
-          pendingWebDavConflict.remoteData?.folders,
-          pendingWebDavConflict.localData?.folders
-        )
-      : mergeFoldersForConflictResolution(
-          pendingWebDavConflict.localData?.folders,
-          pendingWebDavConflict.remoteData?.folders
-        );
-  const finalPapers = Array.from(finalPaperMap.values()).sort((a, b) => {
-    const aTime = Number(a?.uploadedAt || 0);
-    const bTime = Number(b?.uploadedAt || 0);
-    if (aTime !== bTime) return bTime - aTime;
-    return String(a?.title || '').localeCompare(String(b?.title || ''), 'zh-Hans-CN');
-  });
-
-  await ensureLibrary();
-  await ensureLibraryStoreReady();
-  const paths = getLibraryPaths();
-  await saveFoldersToSqlite(mergedFolders);
-  await savePapersToSqlite(finalPapers, paths);
-  const retainedIds = new Set(finalPapers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
-  deletePaperStatesFromSqlite(
-    Array.from(new Set([...localStateMap.keys(), ...remoteStateMap.keys()])).filter((paperId) => !retainedIds.has(paperId))
-  );
-  for (const paperId of retainedIds) {
-    // eslint-disable-next-line no-await-in-loop
-    await savePaperStateToSqlite(paperId, finalStateMap.get(paperId) || {});
-  }
-
-  const server = normalizeWebDavServer((await getWebDavConfigFromSettings()).webdavServer);
-  const username = (await getWebDavConfigFromSettings()).webdavUsername;
-  const password = await getWebDavCredential(server, username);
-  if (!server || !username || !password) {
-    throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
-  }
-  const client = await createWebDavClient(server, username, password);
-  const remotePapersPath = `${pendingWebDavConflict.remotePath}/papers`;
-  const expectedPdfFiles = new Set();
-  for (const paper of finalPapers) {
-    const paperId = String(paper?.id || '').trim();
-    if (!paperId) continue;
-    const fileName = `${getPaperArticleId(paperId)}.pdf`;
-    expectedPdfFiles.add(fileName);
-    const targetPath = path.join(paths.papersDir, fileName);
-    const source = pdfSources.get(paperId) || 'local';
-    if (source === 'remote') {
-      if (pendingWebDavConflict.remoteManifest?.files?.[fileName]) {
-        // eslint-disable-next-line no-await-in-loop
-        await downloadFileFromWebDav(client, `${remotePapersPath}/${fileName}`, targetPath);
-      } else {
-        // eslint-disable-next-line no-await-in-loop
-        await removeFileIfExists(targetPath);
-      }
-    }
-  }
-  const localPdfFiles = await fs.readdir(paths.papersDir).catch(() => []);
-  for (const file of localPdfFiles) {
-    if (!String(file || '').toLowerCase().endsWith('.pdf')) continue;
-    if (expectedPdfFiles.has(file)) continue;
-    // eslint-disable-next-line no-await-in-loop
-    await removeFileIfExists(path.join(paths.papersDir, file));
-  }
-
-  setSyncPending(true);
-  const uploadResult = await syncLibraryToWebDav();
-  await clearPendingWebDavConflict();
-  emitWebDavConflict({ active: false });
-  return {
-    success: Boolean(uploadResult?.success),
-    resolved: true,
-    uploaded: uploadResult
-  };
-};
-
-const buildMergedLibraryState = ({ localData, remoteData }) => {
-  const localPaperMap = buildPaperMap(localData?.papers);
-  const remotePaperMap = buildPaperMap(remoteData?.papers);
-  const localStateMap = buildStateMap(localData?.states);
-  const remoteStateMap = buildStateMap(remoteData?.states);
-  const finalPaperMap = new Map();
-  const finalStateMap = new Map();
-  const pdfSources = new Map();
-  let hasLocalAheadChanges = false;
-  const allPaperIds = new Set([...localPaperMap.keys(), ...remotePaperMap.keys()]);
-
-  Array.from(allPaperIds).forEach((paperId) => {
-    const localPaper = localPaperMap.get(paperId) || null;
-    const remotePaper = remotePaperMap.get(paperId) || null;
-    if (localPaper && remotePaper) {
-      const localVersion = Math.max(1, Number(localPaper.version || 1) || 1);
-      const remoteVersion = Math.max(1, Number(remotePaper.version || 1) || 1);
-      if (remoteVersion > localVersion) {
-        finalPaperMap.set(paperId, remotePaper);
-        finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
-        pdfSources.set(paperId, 'remote');
-      } else {
-        finalPaperMap.set(paperId, localPaper);
-        finalStateMap.set(paperId, localStateMap.get(paperId) || {});
-        pdfSources.set(paperId, 'local');
-        if (localVersion > remoteVersion) {
-          hasLocalAheadChanges = true;
-        }
-      }
-      return;
-    }
-    if (localPaper) {
-      finalPaperMap.set(paperId, localPaper);
-      finalStateMap.set(paperId, localStateMap.get(paperId) || {});
-      pdfSources.set(paperId, 'local');
-      hasLocalAheadChanges = true;
-      return;
-    }
-    if (remotePaper) {
-      finalPaperMap.set(paperId, remotePaper);
-      finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
-      pdfSources.set(paperId, 'remote');
-    }
-  });
-
-  return {
-    folders: mergeFoldersForConflictResolution(localData?.folders, remoteData?.folders),
-    papers: Array.from(finalPaperMap.values()).sort((a, b) => {
-      const aTime = Number(a?.uploadedAt || 0);
-      const bTime = Number(b?.uploadedAt || 0);
-      if (aTime !== bTime) return bTime - aTime;
-      return String(a?.title || '').localeCompare(String(b?.title || ''), 'zh-Hans-CN');
-    }),
-    stateMap: finalStateMap,
-    pdfSources,
-    hasLocalAheadChanges
-  };
-};
-
-const getChangedPdfFilesForDownload = (remoteManifest, localManifest) => {
-  const remoteFiles = remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
-  const localFiles = localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
-  return Object.entries(remoteFiles)
-    .filter(([file, meta]) => {
-      const local = localFiles[file];
-      if (!local) return true;
-      return String(meta?.sha1 || '') !== String(local?.sha1 || '');
-    })
-    .map(([file]) => file);
-};
-
-const syncLibraryFromWebDavToLocal = async () => {
-  const config = await getWebDavConfigFromSettings();
-  const server = config.webdavServer;
-  const username = config.webdavUsername;
-  const remotePath = config.webdavRemotePath;
-  const password = await getWebDavCredential(server, username);
-  if (!server || !username || !password) {
-    console.log('[webdav-sync] startup download skipped: missing config or credential');
-    return { success: false, skipped: true, reason: 'missing config or credential' };
-  }
-
-  emitWebDavSyncState({
-    active: true,
-    direction: 'download',
-    message: '正在从云端同步'
-  });
-
-  try {
-    const client = await createWebDavClient(server, username, password);
-    await client.getDirectoryContents('/');
-    if (!(await client.exists(remotePath))) {
-      console.log(`[webdav-sync] startup download skipped: remote path not found (${server}${remotePath})`);
-      emitWebDavSyncState({
-        active: false,
-        direction: 'download',
-        message: '云端目录不存在'
-      });
-      return { success: false, skipped: true, reason: 'remote path not found' };
-    }
-    await ensureWebDavLock(client, remotePath);
-
-    const remoteSqlitePath = `${remotePath}/library.sqlite`;
-    if (!(await client.exists(remoteSqlitePath))) {
-      console.log(`[webdav-sync] startup download skipped: remote sqlite not found (${server}${remoteSqlitePath})`);
-      emitWebDavSyncState({
-        active: false,
-        direction: 'download',
-        message: '云端数据库不存在'
-      });
-      return { success: false, skipped: true, reason: 'remote sqlite not found' };
-    }
-
-    const conflict = await prepareWebDavConflictIfNeeded(client, remotePath, remoteSqlitePath);
-    if (conflict) {
-      emitWebDavSyncState({
-        active: false,
-        direction: 'download',
-        message: '检测到本地与云端冲突'
-      });
-      emitWebDavConflict({ active: true, mode: 'download', ...conflict });
-      return conflict;
-    }
-
-    await ensureLibrary();
-    const paths = getLibraryPaths();
-    let downloadedPdfCount = 0;
-    let downloadedPdfBytes = 0;
-    const merged = buildMergedLibraryState({
-      localData: pendingWebDavConflict?.localData || { folders: [], papers: [], states: [] },
-      remoteData: pendingWebDavConflict?.remoteData || { folders: [], papers: [], states: [] }
-    });
-    const sqliteStat = await fs.stat(pendingWebDavConflict?.remoteTempSqlitePath).catch(() => null);
-    const sqliteBytes = Number(sqliteStat?.size || 0);
-    await ensureLibraryStoreReady();
-    await saveFoldersToSqlite(merged.folders);
-    await savePapersToSqlite(merged.papers, paths);
-    const retainedIds = new Set(merged.papers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
-    deletePaperStatesFromSqlite(
-      Array.from(
-        new Set([
-          ...buildStateMap(pendingWebDavConflict?.localData?.states).keys(),
-          ...buildStateMap(pendingWebDavConflict?.remoteData?.states).keys()
-        ])
-      ).filter((paperId) => !retainedIds.has(paperId))
-    );
-    for (const paperId of retainedIds) {
-      // eslint-disable-next-line no-await-in-loop
-      await savePaperStateToSqlite(paperId, merged.stateMap.get(paperId) || {});
-    }
-
-    const remotePapersPath = `${remotePath}/papers`;
-    const expectedPdfFiles = new Set();
-    for (const paper of merged.papers) {
-      const paperId = String(paper?.id || '').trim();
-      if (!paperId) continue;
-      const fileName = `${getPaperArticleId(paperId)}.pdf`;
-      expectedPdfFiles.add(fileName);
-      if (merged.pdfSources.get(paperId) !== 'remote') continue;
-      if (pendingWebDavConflict?.remoteManifest?.files?.[fileName]) {
-        const localPdfPath = path.join(paths.papersDir, fileName);
-        // eslint-disable-next-line no-await-in-loop
-        downloadedPdfBytes += await downloadFileFromWebDav(client, `${remotePapersPath}/${fileName}`, localPdfPath);
-        downloadedPdfCount += 1;
-      }
-    }
-    const localPdfFiles = await fs.readdir(paths.papersDir).catch(() => []);
-    for (const file of localPdfFiles) {
-      if (!String(file || '').toLowerCase().endsWith('.pdf')) continue;
-      if (expectedPdfFiles.has(file)) continue;
-      // eslint-disable-next-line no-await-in-loop
-      await removeFileIfExists(path.join(paths.papersDir, file));
-    }
-
-    console.log(
-      `[webdav-sync] download complete: sqlite=${sqliteBytes}B, pdfs=${downloadedPdfCount}, pdfBytes=${downloadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
-    );
-    setSyncPending(Boolean(merged.hasLocalAheadChanges));
-    await clearPendingWebDavConflict();
-    emitWebDavSyncState({
-      active: false,
-      direction: 'download',
-      message: '云端同步完成'
-    });
-    return {
-      success: true,
-      sqliteBytes,
-      downloadedPdfCount,
-      downloadedPdfBytes,
-      remotePath,
-      server
-    };
-  } catch (error) {
-    emitWebDavSyncState({
-      active: false,
-      direction: 'download',
-      message: error?.message || '云端同步失败'
-    });
-    throw error;
-  }
-};
-
-const syncLibraryToWebDav = async () => {
-  const config = await getWebDavConfigFromSettings();
-  const server = config.webdavServer;
-  const username = config.webdavUsername;
-  const remotePath = config.webdavRemotePath;
-  const password = await getWebDavCredential(server, username);
-  if (!server || !username || !password) {
-    throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
-  }
-
-  emitWebDavSyncState({
-    active: true,
-    direction: 'upload',
-    message: '正在上传到云端'
-  });
-
-  try {
-    const client = await createWebDavClient(server, username, password);
-    await client.getDirectoryContents('/');
-    if (!(await client.exists(remotePath))) {
-      await client.createDirectory(remotePath, { recursive: true });
-    }
-    await ensureWebDavLock(client, remotePath);
-    const remotePapersPath = `${remotePath}/papers`;
-    if (!(await client.exists(remotePapersPath))) {
-      await client.createDirectory(remotePapersPath, { recursive: true });
-    }
-
-    const paths = getLibraryPaths();
-    const remoteSqlitePath = `${remotePath}/library.sqlite`;
-    if (await client.exists(remoteSqlitePath)) {
-      const conflict = await prepareWebDavConflictIfNeeded(client, remotePath, remoteSqlitePath);
-      if (conflict) {
-        emitWebDavSyncState({
-          active: false,
-          direction: 'upload',
-          message: '检测到本地与云端冲突'
-        });
-        emitWebDavConflict({ active: true, mode: 'upload', ...conflict });
-        return conflict;
-      }
-      if (pendingWebDavConflict) {
-        const merged = buildMergedLibraryState({
-          localData: pendingWebDavConflict.localData,
-          remoteData: pendingWebDavConflict.remoteData
-        });
-        await ensureLibraryStoreReady();
-        await saveFoldersToSqlite(merged.folders);
-        await savePapersToSqlite(merged.papers, paths);
-        const retainedIds = new Set(merged.papers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
-        deletePaperStatesFromSqlite(
-          Array.from(
-            new Set([
-              ...buildStateMap(pendingWebDavConflict.localData?.states).keys(),
-              ...buildStateMap(pendingWebDavConflict.remoteData?.states).keys()
-            ])
-          ).filter((paperId) => !retainedIds.has(paperId))
-        );
-        for (const paperId of retainedIds) {
-          // eslint-disable-next-line no-await-in-loop
-          await savePaperStateToSqlite(paperId, merged.stateMap.get(paperId) || {});
-        }
-        for (const paper of merged.papers) {
-          const paperId = String(paper?.id || '').trim();
-          if (!paperId) continue;
-          if (merged.pdfSources.get(paperId) !== 'remote') continue;
-          const fileName = `${getPaperArticleId(paperId)}.pdf`;
-          if (!pendingWebDavConflict.remoteManifest?.files?.[fileName]) continue;
-          // eslint-disable-next-line no-await-in-loop
-          await downloadFileFromWebDav(client, `${remotePapersPath}/${fileName}`, path.join(paths.papersDir, fileName));
-        }
-      }
-    }
-    const snapshot = await createSqliteSyncSnapshot();
-    let uploadedPdfCount = 0;
-    let uploadedPdfBytes = 0;
-    let sqliteBytes = 0;
-
-    try {
-      sqliteBytes = await uploadFileToWebDav(client, `${remotePath}/${snapshot.fileName}`, snapshot.snapshotPath);
-      const localManifest = await buildLocalPdfManifest(paths.papersDir);
-      const remoteManifest = await readRemoteJsonFile(client, getRemotePdfManifestPath(remotePath));
-      const filesToUpload = getChangedPdfFilesForUpload(localManifest, remoteManifest);
-      const remoteFiles =
-        remoteManifest?.files && typeof remoteManifest.files === 'object' ? Object.keys(remoteManifest.files) : [];
-      for (const file of filesToUpload) {
-        const localPath = path.join(paths.papersDir, file);
-        uploadedPdfBytes += await uploadFileToWebDav(client, `${remotePapersPath}/${file}`, localPath);
-        uploadedPdfCount += 1;
-      }
-      for (const remoteFile of remoteFiles) {
-        if (localManifest.files[remoteFile]) continue;
-        await client.deleteFile(`${remotePapersPath}/${remoteFile}`).catch(() => null);
-      }
-      await writeRemoteJsonFile(client, getRemotePdfManifestPath(remotePath), localManifest);
-    } finally {
-      await removeFileIfExists(snapshot.snapshotPath);
-    }
-
-    console.log(
-      `[webdav-sync] upload complete: sqlite=${sqliteBytes}B, pdfs=${uploadedPdfCount}, pdfBytes=${uploadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
-    );
-    setSyncPending(false);
-    await clearPendingWebDavConflict();
-    emitWebDavSyncState({
-      active: false,
-      direction: 'upload',
-      message: '上传完成'
-    });
-    return {
-      success: true,
-      sqliteBytes,
-      uploadedPdfCount,
-      uploadedPdfBytes,
-      remotePath,
-      server
-    };
-  } catch (error) {
-    emitWebDavSyncState({
-      active: false,
-      direction: 'upload',
-      message: error?.message || '上传失败'
-    });
-    throw error;
-  }
-};
+const {
+  getWebDavCredential,
+  createWebDavClient,
+  getWebDavConfigFromSettings,
+  testWebDavConnection,
+  saveWebDavConfig,
+  ensureWebDavLock,
+  releaseWebDavLock,
+  clearWebDavLock,
+  readRemoteJsonFile,
+  writeRemoteJsonFile
+} = webDavModule;
 
 const buildOpenAIUrl = (baseUrl) => {
   const resolved = String(baseUrl || '').trim() || DEFAULT_BASE_URL;
@@ -2494,380 +1439,6 @@ const safeJsonParse = (value, fallback) => {
   }
 };
 
-const ensureLibrarySqliteSchema = () => {
-  const db = getLibraryDb();
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS app_kv (
-      key TEXT PRIMARY KEY,
-      value_json TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS papers (
-      id TEXT PRIMARY KEY,
-      sort_order INTEGER NOT NULL,
-      version INTEGER NOT NULL DEFAULT 1,
-      title TEXT NOT NULL DEFAULT '',
-      author TEXT NOT NULL DEFAULT '',
-      date TEXT NOT NULL DEFAULT '',
-      added_date TEXT NOT NULL DEFAULT '',
-      uploaded_at INTEGER NOT NULL DEFAULT 0,
-      folder_id TEXT NOT NULL DEFAULT '',
-      previous_folder_id TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT '',
-      abstract TEXT NOT NULL DEFAULT '',
-      content TEXT NOT NULL DEFAULT '',
-      keywords_json TEXT NOT NULL DEFAULT '[]',
-      publisher TEXT NOT NULL DEFAULT '',
-      doi TEXT NOT NULL DEFAULT '',
-      references_json TEXT NOT NULL DEFAULT '[]',
-      reference_stats_json TEXT,
-      file_path TEXT NOT NULL DEFAULT '',
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS paper_states (
-      paper_id TEXT PRIMARY KEY,
-      state_json TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_papers_sort_order ON papers(sort_order);
-    CREATE INDEX IF NOT EXISTS idx_papers_folder_id ON papers(folder_id);
-  `);
-  const columns = db.prepare("PRAGMA table_info('papers')").all();
-  const columnNames = new Set(columns.map((column) => String(column?.name || '').trim()));
-  if (!columnNames.has('version')) {
-    db.exec('ALTER TABLE papers ADD COLUMN version INTEGER NOT NULL DEFAULT 1;');
-  }
-};
-
-const getLibraryKv = (key, fallback = null) => {
-  const db = getLibraryDb();
-  const row = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get(String(key || '').trim());
-  if (!row) return fallback;
-  return safeJsonParse(row.value_json, fallback);
-};
-
-const setLibraryKv = (key, value) => {
-  const db = getLibraryDb();
-  db.prepare(
-    `
-      INSERT INTO app_kv (key, value_json, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET
-        value_json = excluded.value_json,
-        updated_at = excluded.updated_at
-    `
-  ).run(String(key || '').trim(), JSON.stringify(value ?? null), Date.now());
-};
-
-const getSyncPending = () => Boolean(getLibraryKv(LIBRARY_SYNC_PENDING_KEY, false));
-
-const setSyncPending = (value) => {
-  setLibraryKv(LIBRARY_SYNC_PENDING_KEY, Boolean(value));
-};
-
-const deletePaperStatesFromSqlite = (paperIds = []) => {
-  const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
-  if (!ids.length) return;
-  const db = getLibraryDb();
-  const placeholders = ids.map(() => '?').join(', ');
-  db.prepare(`DELETE FROM paper_states WHERE paper_id IN (${placeholders})`).run(...ids);
-};
-
-const deletePapersFromSqlite = (paperIds = []) => {
-  const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
-  if (!ids.length) return [];
-  deletePaperStatesFromSqlite(ids);
-  const db = getLibraryDb();
-  const placeholders = ids.map(() => '?').join(', ');
-  db.prepare(`DELETE FROM papers WHERE id IN (${placeholders})`).run(...ids);
-  return ids;
-};
-
-const mapSqlitePaperRow = (row, paths = getLibraryPaths()) =>
-  sanitizePaperForMeta(
-    {
-      id: row?.id,
-      title: row?.title,
-      author: row?.author,
-      date: row?.date,
-      addedDate: row?.added_date,
-      uploadedAt: row?.uploaded_at,
-      folderId: row?.folder_id,
-      previousFolderId: row?.previous_folder_id,
-      summary: row?.summary,
-      abstract: row?.abstract,
-      content: row?.content,
-      keywords: safeJsonParse(row?.keywords_json, []),
-      publisher: row?.publisher,
-      doi: row?.doi,
-      version: row?.version,
-      updatedAt: row?.updated_at,
-      references: safeJsonParse(row?.references_json, []),
-      referenceStats: safeJsonParse(row?.reference_stats_json, undefined),
-      filePath: row?.file_path
-    },
-    String(row?.file_path || '').trim() || path.join(paths.papersDir, `${getPaperArticleId(row?.id)}.pdf`)
-  );
-
-const loadFoldersFromSqlite = async () => {
-  const folders = getLibraryKv('folders', []);
-  return Array.isArray(folders) ? folders : [];
-};
-
-const loadLibraryDataFromSqliteFile = (sqlitePath, options = {}) => {
-  const targetPath = String(sqlitePath || '').trim();
-  if (!targetPath || !fsNative.existsSync(targetPath)) {
-    return { folders: [], papers: [], states: [] };
-  }
-  const Database = getSqliteDriver();
-  const db = new Database(targetPath, { readonly: true, fileMustExist: true });
-  const paths = {
-    ...getLibraryPaths(),
-    root: options.root || path.dirname(targetPath),
-    papersDir: options.papersDir || path.join(options.root || path.dirname(targetPath), 'papers'),
-    sqlitePath: targetPath
-  };
-  try {
-    const foldersRow = db.prepare('SELECT value_json FROM app_kv WHERE key = ?').get('folders');
-    const folders = Array.isArray(safeJsonParse(foldersRow?.value_json, []))
-      ? safeJsonParse(foldersRow?.value_json, [])
-      : [];
-    const paperRows = db.prepare('SELECT * FROM papers ORDER BY sort_order ASC, uploaded_at ASC, id ASC').all();
-    const stateRows = db
-      .prepare('SELECT paper_id, state_json FROM paper_states ORDER BY updated_at ASC, paper_id ASC')
-      .all();
-    return {
-      folders,
-      papers: paperRows.map((row) => mapSqlitePaperRow(row, paths)),
-      states: stateRows.map((row) => ({
-        paperId: String(row?.paper_id || '').trim(),
-        state: safeJsonParse(row?.state_json, {})
-      }))
-    };
-  } finally {
-    try {
-      db.close();
-    } catch {
-      // ignore close errors
-    }
-  }
-};
-
-const saveFoldersToSqlite = async (folders) => {
-  const payload = Array.isArray(folders) ? folders : [];
-  setLibraryKv('folders', payload);
-  return payload;
-};
-
-const loadPapersFromSqlite = async () => {
-  const db = getLibraryDb();
-  const paths = getLibraryPaths();
-  const rows = db
-    .prepare('SELECT * FROM papers ORDER BY sort_order ASC, uploaded_at ASC, id ASC')
-    .all();
-  return rows.map((row) => mapSqlitePaperRow(row, paths));
-};
-
-const buildPaperStorageComparable = (paper) =>
-  JSON.stringify({
-    title: String(paper?.title || '').trim(),
-    author: String(paper?.author || '').trim(),
-    date: String(paper?.date || '').trim(),
-    addedDate: String(paper?.addedDate || '').trim(),
-    uploadedAt: Number(paper?.uploadedAt || 0),
-    folderId: String(paper?.folderId || '').trim(),
-    previousFolderId: String(paper?.previousFolderId || '').trim(),
-    summary: String(paper?.summary || '').trim(),
-    abstract: String(paper?.abstract || '').trim(),
-    content: String(paper?.content || ''),
-    keywords: Array.isArray(paper?.keywords) ? paper.keywords : [],
-    publisher: String(paper?.publisher || '').trim(),
-    doi: String(paper?.doi || '').trim(),
-    references: Array.isArray(paper?.references) ? paper.references : [],
-    referenceStats: paper?.referenceStats || null,
-    filePath: String(paper?.filePath || '').trim()
-  });
-
-const savePapersToSqlite = async (papers, paths) => {
-  const source = Array.isArray(papers) ? papers : [];
-  const runtimeStateById = new Map(
-    source
-      .map((paper) => [
-        String(paper?.id || '').trim(),
-        {
-          isParsing: Boolean(paper?.isParsing),
-          isBackgroundProcessing: Boolean(paper?.isBackgroundProcessing)
-        }
-      ])
-      .filter((entry) => entry[0])
-  );
-
-  const normalizedPapers = [];
-  for (let index = 0; index < source.length; index += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    const normalized = await normalizePaperForStorage(source[index], paths);
-    if (!normalized) continue;
-    normalizedPapers.push({ order: index, paper: normalized });
-  }
-
-  const db = getLibraryDb();
-  const existingRows = db.prepare('SELECT * FROM papers').all();
-  const existingById = new Map(
-    existingRows
-      .map((row) => {
-        const mapped = mapSqlitePaperRow(row, paths);
-        const id = String(mapped?.id || '').trim();
-        if (!id) return null;
-        return [
-          id,
-          {
-            row,
-            mapped,
-            comparable: buildPaperStorageComparable(mapped)
-          }
-        ];
-      })
-      .filter(Boolean)
-  );
-  const existingIds = db.prepare('SELECT id FROM papers').all().map((row) => String(row.id || '').trim());
-  const nextIds = new Set(normalizedPapers.map((item) => String(item.paper?.id || '').trim()).filter(Boolean));
-  const removedPaperIds = existingIds.filter((id) => id && !nextIds.has(id));
-
-  const upsertPaper = db.prepare(`
-    INSERT INTO papers (
-      id, sort_order, title, author, date, added_date, uploaded_at, folder_id, previous_folder_id,
-      version, summary, abstract, content, keywords_json, publisher, doi, references_json,
-      reference_stats_json, file_path, updated_at
-    ) VALUES (
-      @id, @sort_order, @title, @author, @date, @added_date, @uploaded_at, @folder_id, @previous_folder_id,
-      @version,
-      @summary, @abstract, @content, @keywords_json, @publisher, @doi, @references_json,
-      @reference_stats_json, @file_path, @updated_at
-    )
-    ON CONFLICT(id) DO UPDATE SET
-      sort_order = excluded.sort_order,
-      title = excluded.title,
-      author = excluded.author,
-      date = excluded.date,
-      added_date = excluded.added_date,
-      uploaded_at = excluded.uploaded_at,
-      folder_id = excluded.folder_id,
-      previous_folder_id = excluded.previous_folder_id,
-      version = excluded.version,
-      summary = excluded.summary,
-      abstract = excluded.abstract,
-      content = excluded.content,
-      keywords_json = excluded.keywords_json,
-      publisher = excluded.publisher,
-      doi = excluded.doi,
-      references_json = excluded.references_json,
-      reference_stats_json = excluded.reference_stats_json,
-      file_path = excluded.file_path,
-      updated_at = excluded.updated_at
-  `);
-
-  const writeTransaction = db.transaction((items) => {
-    items.forEach(({ order, paper }) => {
-      const existing = existingById.get(String(paper?.id || '').trim());
-      const nextComparable = buildPaperStorageComparable(paper);
-      const unchanged = existing && existing.comparable === nextComparable;
-      const version = unchanged ? Number(existing.row?.version || existing.mapped?.version || 1) : Number(existing?.row?.version || existing?.mapped?.version || 0) + 1;
-      const updatedAt = unchanged
-        ? Number(existing.row?.updated_at || existing.mapped?.updatedAt || Date.now())
-        : Date.now();
-      upsertPaper.run({
-        id: paper.id,
-        sort_order: order,
-        title: paper.title || '',
-        author: paper.author || '',
-        date: paper.date || '',
-        added_date: paper.addedDate || '',
-        uploaded_at: Number(paper.uploadedAt || 0),
-        folder_id: paper.folderId || '',
-        previous_folder_id: paper.previousFolderId || '',
-        version,
-        summary: paper.summary || '',
-        abstract: paper.abstract || '',
-        content: paper.content || '',
-        keywords_json: JSON.stringify(Array.isArray(paper.keywords) ? paper.keywords : []),
-        publisher: paper.publisher || '',
-        doi: paper.doi || '',
-        references_json: JSON.stringify(Array.isArray(paper.references) ? paper.references : []),
-        reference_stats_json: paper.referenceStats ? JSON.stringify(paper.referenceStats) : null,
-        file_path: paper.filePath || '',
-        updated_at: updatedAt
-      });
-      paper.version = version;
-      paper.updatedAt = updatedAt;
-    });
-    if (!items.length) {
-      db.prepare('DELETE FROM papers').run();
-      db.prepare('DELETE FROM paper_states').run();
-      return;
-    }
-    if (removedPaperIds.length) {
-      deletePaperStatesFromSqlite(removedPaperIds);
-      const placeholders = removedPaperIds.map(() => '?').join(', ');
-      db.prepare(`DELETE FROM papers WHERE id IN (${placeholders})`).run(...removedPaperIds);
-    }
-  });
-
-  writeTransaction(normalizedPapers);
-
-  if (removedPaperIds.length) {
-    await deletePaperVectorPoints(removedPaperIds);
-  }
-
-  const persistedPapers = normalizedPapers.map((item) => item.paper);
-  const vectorReadyPapers = persistedPapers.filter((paper) => {
-    const state = runtimeStateById.get(String(paper?.id || '').trim());
-    return !state?.isParsing && !state?.isBackgroundProcessing;
-  });
-  if (vectorReadyPapers.length) {
-    void enqueueSummaryVectorSync(vectorReadyPapers);
-  }
-  return persistedPapers;
-};
-
-const savePaperStateToSqlite = async (paperId, state) => {
-  const normalizedPaperId = String(paperId || '').trim();
-  if (!normalizedPaperId) return { ok: false, error: '缺少paperId' };
-  const db = getLibraryDb();
-  db.prepare(
-    `
-      INSERT INTO paper_states (paper_id, state_json, updated_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(paper_id) DO UPDATE SET
-        state_json = excluded.state_json,
-        updated_at = excluded.updated_at
-    `
-  ).run(normalizedPaperId, JSON.stringify(state || {}), Date.now());
-  return { ok: true };
-};
-
-const loadPaperStateFromSqlite = async (paperId) => {
-  const normalizedPaperId = String(paperId || '').trim();
-  if (!normalizedPaperId) return null;
-  const db = getLibraryDb();
-  const row = db.prepare('SELECT state_json FROM paper_states WHERE paper_id = ?').get(normalizedPaperId);
-  return row ? safeJsonParse(row.state_json, null) : null;
-};
-
-const loadPaperStatesFromSqlite = async () => {
-  const db = getLibraryDb();
-  return db
-    .prepare('SELECT paper_id, state_json FROM paper_states ORDER BY updated_at ASC, paper_id ASC')
-    .all()
-    .map((row) => ({
-      paperId: String(row?.paper_id || '').trim(),
-      state: safeJsonParse(row?.state_json, {})
-    }))
-    .filter((item) => item.paperId);
-};
-
 const loadPaperStatesFromMeta = async () => {
   const points = await scrollLibraryMetaPoints({
     must: [{ key: 'type', match: { value: 'state' } }]
@@ -2963,36 +1534,45 @@ const migrateExistingLibraryToSqlite = async (paths) => {
   console.log(`[library-sqlite] migrated ${source}: papers=${normalizedPapers.length}`);
 };
 
-const ensureLibraryStoreReady = async () => {
-  if (libraryStoreReadyPromise) return libraryStoreReadyPromise;
-  libraryStoreReadyPromise = (async () => {
-    await ensureLibrary();
-    ensureLibrarySqliteSchema();
-    const paths = getLibraryPaths();
-    await migrateExistingLibraryToSqlite(paths);
-    const db = getLibraryDb();
-    const paperCount = Number(db.prepare('SELECT COUNT(*) AS count FROM papers').get()?.count || 0);
-    const stateCount = Number(db.prepare('SELECT COUNT(*) AS count FROM paper_states').get()?.count || 0);
-    const folders = getLibraryKv('folders', []);
-    const folderCount = Array.isArray(folders) ? folders.length : 0;
-    console.log(
-      `[library-sqlite] ready: path=${paths.sqlitePath}, papers=${paperCount}, states=${stateCount}, folders=${folderCount}`
-    );
-    return true;
-  })().catch((error) => {
-    libraryStoreReadyPromise = null;
-    throw error;
-  });
-  return libraryStoreReadyPromise;
-};
+const sqliteModule = createSqliteModule({
+  path,
+  fs,
+  fsNative,
+  syncPendingKey: LIBRARY_SYNC_PENDING_KEY,
+  getLibraryPaths,
+  loadSettings,
+  sanitizePaperForMeta,
+  normalizePaperForStorage,
+  getPaperArticleId,
+  deletePaperVectorPoints,
+  enqueueSummaryVectorSync,
+  migrateExistingLibraryToSqlite
+});
 
-const ensureLibrary = async () => {
-  await loadSettings();
-  const paths = getLibraryPaths();
-  await fs.mkdir(paths.root, { recursive: true });
-  await fs.mkdir(paths.papersDir, { recursive: true });
-  await fs.mkdir(paths.statesDir, { recursive: true });
-};
+const {
+  getSqliteDriver,
+  closeLibraryDb,
+  resetLibraryStore,
+  getLibraryDb,
+  ensureLibrarySqliteSchema,
+  getLibraryKv,
+  setLibraryKv,
+  getSyncPending,
+  setSyncPending,
+  deletePaperStatesFromSqlite,
+  deletePapersFromSqlite,
+  mapSqlitePaperRow,
+  loadFoldersFromSqlite,
+  loadLibraryDataFromSqliteFile,
+  saveFoldersToSqlite,
+  loadPapersFromSqlite,
+  savePapersToSqlite,
+  savePaperStateToSqlite,
+  loadPaperStateFromSqlite,
+  loadPaperStatesFromSqlite,
+  ensureLibraryStoreReady,
+  ensureLibrary
+} = sqliteModule;
 
 const debugQdrantStartup = async () => {
   const qdrantUrl = getQdrantUrl();
@@ -3580,6 +2160,45 @@ const searchPaperOpenSource = async (title) => {
   return primary;
 };
 
+const webDavSyncModule = createWebDavSyncModule({
+  BrowserWindow,
+  path,
+  fs,
+  fsNative,
+  crypto,
+  formatLogTime,
+  ensureLibrary,
+  ensureLibraryStoreReady,
+  getLibraryDb,
+  getLibraryPaths,
+  getPaperArticleId,
+  normalizeWebDavServer,
+  getWebDavConfigFromSettings,
+  getWebDavCredential,
+  createWebDavClient,
+  ensureWebDavLock,
+  loadFoldersFromSqlite,
+  loadPapersFromSqlite,
+  loadPaperStatesFromSqlite,
+  loadLibraryDataFromSqliteFile,
+  saveFoldersToSqlite,
+  savePapersToSqlite,
+  savePaperStateToSqlite,
+  deletePaperStatesFromSqlite,
+  setSyncPending,
+  getSyncPending,
+  removeFileIfExists,
+  readRemoteJsonFile,
+  writeRemoteJsonFile
+});
+
+const {
+  getWebDavSyncState,
+  syncLibraryToWebDav,
+  syncLibraryFromWebDavToLocal,
+  resolveWebDavConflicts
+} = webDavSyncModule;
+
 ipcMain.handle('settings-get', async () => {
   const settings = await loadSettings();
   const webdav = await getWebDavConfigFromSettings();
@@ -3593,65 +2212,44 @@ ipcMain.handle('settings-set', async (_event, payload = {}) =>
   })
 );
 
-ipcMain.handle('webdav-test', async (_event, payload = {}) => testWebDavConnection(payload));
+registerWebDavIpc({
+  ipcMain,
+  enqueueWrite,
+  testWebDavConnection,
+  saveWebDavConfig,
+  clearWebDavLock,
+  getWebDavSyncState
+});
 
-ipcMain.handle('webdav-save', async (_event, payload = {}) =>
-  enqueueWrite(() => saveWebDavConfig(payload))
-);
+registerWebDavSyncIpc({
+  ipcMain,
+  enqueueWrite,
+  syncLibraryToWebDav,
+  syncLibraryFromWebDavToLocal,
+  resolveWebDavConflicts
+});
 
-ipcMain.handle('webdav-get-sync-status', async () => webdavSyncState);
-
-ipcMain.handle('webdav-clear-lock', async () =>
-  enqueueWrite(async () => {
-    try {
-      return await clearWebDavLock();
-    } catch (error) {
-      return {
-        success: false,
-        message: error?.message || '清除云端锁失败'
-      };
-    }
-  })
-);
-
-ipcMain.handle('webdav-sync-upload', async () =>
-  enqueueWrite(async () => {
-    try {
-      return await syncLibraryToWebDav();
-    } catch (error) {
-      return {
-        success: false,
-        error: error?.message || 'WebDAV 上传失败'
-      };
-    }
-  })
-);
-
-ipcMain.handle('webdav-sync-download', async () =>
-  enqueueWrite(async () => {
-    try {
-      return await syncLibraryFromWebDavToLocal();
-    } catch (error) {
-      return {
-        success: false,
-        error: error?.message || 'WebDAV 下载失败'
-      };
-    }
-  })
-);
-
-ipcMain.handle('webdav-resolve-conflicts', async (_event, payload = {}) =>
-  enqueueWrite(async () => {
-    try {
-      return await resolveWebDavConflicts(payload);
-    } catch (error) {
-      return {
-        success: false,
-        error: error?.message || '处理云端冲突失败'
-      };
-    }
-  })
-);
+registerLibraryIpc({
+  ipcMain,
+  enqueueWrite,
+  ensureLibraryStoreReady: sqliteModule.ensureLibraryStoreReady,
+  getLibraryPaths,
+  loadFoldersFromSqlite: sqliteModule.loadFoldersFromSqlite,
+  saveFoldersToSqlite: sqliteModule.saveFoldersToSqlite,
+  loadPapersFromSqlite: sqliteModule.loadPapersFromSqlite,
+  savePapersToSqlite: sqliteModule.savePapersToSqlite,
+  cleanupOrphanPaperStateFiles,
+  writeJsonFile,
+  getPaperArticleId,
+  fs,
+  fileExists,
+  loadPaperStateFromSqlite: sqliteModule.loadPaperStateFromSqlite,
+  savePaperStateToSqlite: sqliteModule.savePaperStateToSqlite,
+  removeFileIfExists,
+  deletePapersFromSqlite: sqliteModule.deletePapersFromSqlite,
+  deletePaperVectorPoints,
+  setSyncPending: sqliteModule.setSyncPending
+});
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
   const text = String(payload.text || '').trim();
@@ -3814,180 +2412,6 @@ ipcMain.handle('get-embedding', async (_event, payload = {}) => {
   }
 });
 
-ipcMain.handle('library-get-folders', async () => {
-  await ensureLibraryStoreReady();
-  const folders = await loadFoldersFromSqlite();
-  return Array.isArray(folders) ? folders : [];
-});
-
-ipcMain.handle('library-save-folders', async (_event, payload = []) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    await saveFoldersToSqlite(payload);
-    setSyncPending(true);
-    return { ok: true };
-  });
-});
-
-ipcMain.handle('library-get-papers', async () => {
-  await ensureLibraryStoreReady();
-  return loadPapersFromSqlite();
-});
-
-ipcMain.handle('library-save-papers', async (_event, payload = []) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const papers = await savePapersToSqlite(payload, paths);
-    await cleanupOrphanPaperStateFiles(
-      paths,
-      papers.map((paper) => String(paper?.id || '').trim())
-    );
-    setSyncPending(true);
-    return { ok: true };
-  });
-});
-
-ipcMain.handle('library-save-snapshot', async (_event, payload = {}) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const folders = await saveFoldersToSqlite(payload.folders);
-    const papers = await savePapersToSqlite(payload.papers, paths);
-    await cleanupOrphanPaperStateFiles(
-      paths,
-      papers.map((paper) => String(paper?.id || '').trim())
-    );
-    await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-    setSyncPending(true);
-    return { ok: true };
-  });
-});
-
-ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {
-  return enqueueWrite(async () => {
-    const paperId = String(payload.paperId || '').trim();
-    if (!paperId) return { ok: false, error: '缺少paperId' };
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const data = payload.data;
-    if (!data) return { ok: false, error: '缺少PDF数据' };
-    const buffer = Buffer.from(new Uint8Array(data));
-    const paperPointId = getPaperArticleId(paperId);
-    const filePath = path.join(paths.papersDir, `${paperPointId}.pdf`);
-    await fs.writeFile(filePath, buffer);
-    await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-    setSyncPending(true);
-    return { ok: true, filePath };
-  });
-});
-
-ipcMain.handle('library-read-pdf', async (_event, payload = {}) => {
-  await ensureLibraryStoreReady();
-  const paths = getLibraryPaths();
-  const filePath = payload.filePath ? String(payload.filePath) : '';
-  const paperId = payload.paperId ? String(payload.paperId) : '';
-  let resolvedPath = filePath;
-  if (resolvedPath && !(await fileExists(resolvedPath))) {
-    resolvedPath = '';
-  }
-  if (!resolvedPath && paperId) {
-    const expectedPath = path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`);
-    if (await fileExists(expectedPath)) {
-      resolvedPath = expectedPath;
-    } else {
-      const papers = await loadPapersFromSqlite();
-      const entry = Array.isArray(papers) ? papers.find((item) => item.id === paperId) : null;
-      resolvedPath = entry?.filePath || '';
-    }
-  }
-  if (!resolvedPath) {
-    return { ok: false, error: '未找到PDF路径' };
-  }
-  try {
-    const buffer = await fs.readFile(resolvedPath);
-    return { ok: true, data: buffer };
-  } catch (error) {
-    return { ok: false, error: error?.message || '读取PDF失败' };
-  }
-});
-
-ipcMain.handle('library-get-paper-state', async (_event, payload = {}) => {
-  await ensureLibraryStoreReady();
-  const paperId = String(payload.paperId || '').trim();
-  if (!paperId) return null;
-  return loadPaperStateFromSqlite(paperId);
-});
-
-ipcMain.handle('library-save-paper-state', async (_event, payload = {}) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    const paperId = String(payload.paperId || '').trim();
-    if (!paperId) return { ok: false, error: '缺少paperId' };
-    const result = await savePaperStateToSqlite(paperId, payload.state || {});
-    setSyncPending(true);
-    return result;
-  });
-});
-
-ipcMain.handle('library-delete-paper', async (_event, payload = {}) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const paperId = String(payload.paperId || '').trim();
-    if (!paperId) return { ok: false, error: '缺少paperId' };
-    let resolvedPath = payload.filePath ? String(payload.filePath) : '';
-    if (!resolvedPath) {
-      resolvedPath = path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`);
-    }
-    await removeFileIfExists(resolvedPath);
-    await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
-    await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-    deletePapersFromSqlite([paperId]);
-    await deletePaperVectorPoints([paperId]);
-    setSyncPending(true);
-    const papers = await loadPapersFromSqlite();
-    const remainIds = Array.isArray(papers)
-      ? papers
-          .map((paper) => String(paper?.id || '').trim())
-          .filter((id) => id && id !== paperId)
-      : [];
-    await cleanupOrphanPaperStateFiles(paths, remainIds);
-    return { ok: true };
-  });
-});
-
-ipcMain.handle('library-delete-papers', async (_event, payload = {}) => {
-  return enqueueWrite(async () => {
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const items = Array.isArray(payload.items) ? payload.items : [];
-    const ids = items
-      .map((item) => String(item?.id || '').trim())
-      .filter(Boolean);
-    if (!ids.length) return { ok: true };
-    for (const item of items) {
-      const paperId = String(item?.id || '').trim();
-      if (!paperId) continue;
-      let resolvedPath = item?.filePath ? String(item.filePath) : '';
-      await removeFileIfExists(resolvedPath);
-      await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
-      await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
-    }
-    deletePapersFromSqlite(ids);
-    await deletePaperVectorPoints(ids);
-    setSyncPending(true);
-    const papers = await loadPapersFromSqlite();
-    const idSet = new Set(ids);
-    const remainIds = Array.isArray(papers)
-      ? papers
-          .map((paper) => String(paper?.id || '').trim())
-          .filter((id) => id && !idSet.has(id))
-      : [];
-    await cleanupOrphanPaperStateFiles(paths, remainIds);
-    return { ok: true };
-  });
-});
 
 ipcMain.handle('library-match-references', async (_event, payload = {}) => {
   try {
