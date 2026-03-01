@@ -718,7 +718,8 @@ interface LibraryViewProps {
   onDeletePaper: (paperId: string) => void;
   onMovePaperToFolder: (paperId: string, folderId: string) => void;
   onRestorePaper: (paperId: string) => void;
-  onCloudSyncUpload: () => Promise<{ success: boolean; error?: string } | void>;
+  onCloudSyncUpload: () => Promise<{ success: boolean; conflict?: boolean; error?: string } | void>;
+  isCloudSyncing: boolean;
 }
 
 export const LibraryView: React.FC<LibraryViewProps> = ({
@@ -733,7 +734,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onDeletePaper,
   onMovePaperToFolder,
   onRestorePaper,
-  onCloudSyncUpload
+  onCloudSyncUpload,
+  isCloudSyncing
 }) => {
   const MIN_LEFT_WIDTH = 180;
   const MIN_MIDDLE_WIDTH = 240;
@@ -909,12 +911,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       .map((item) => ({ ...item, children: removeFolder(item.children, targetId) }));
 
   const startFolderEdit = (folder: Folder, isNew = false) => {
+    if (isCloudSyncing) return;
     folderEditRef.current = { id: folder.id, originalName: folder.name, isNew };
     setEditingFolderId(folder.id);
     setFolderDraft(folder.name);
   };
 
   const finalizeFolderEdit = (folderId: string | null) => {
+    if (isCloudSyncing) return;
     if (!folderId) return;
     const trimmed = folderDraft.trim();
     const { originalName, isNew } = folderEditRef.current || {};
@@ -936,6 +940,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   };
 
   const handleAddFolder = (parentId: string | null) => {
+    if (isCloudSyncing) return;
     if (parentId === SYSTEM_FOLDER_ALL_ID || parentId === SYSTEM_FOLDER_TRASH_ID) return;
     const nextFolder = createFolder('New Folder', parentId);
     _onFoldersChange(addChildFolder(folders, parentId, nextFolder));
@@ -953,6 +958,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   };
 
   const handleDeleteFolder = (targetId: string) => {
+    if (isCloudSyncing) return;
     if (targetId === SYSTEM_FOLDER_ALL_ID || targetId === SYSTEM_FOLDER_TRASH_ID) return;
     const removed = collectFolderIds(folders, targetId);
     if (removed.size) {
@@ -1402,21 +1408,45 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     return () => window.clearTimeout(timer);
   }, [cloudSyncMessage]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.getSyncStatus) return;
+    let mounted = true;
+    const applyStatus = (payload: any) => {
+      if (!mounted) return;
+      const active = Boolean(payload?.active);
+      setCloudSyncing(active);
+      if (payload?.message) {
+        setCloudSyncMessage(String(payload.message));
+      } else if (!active) {
+        setCloudSyncMessage('');
+      }
+    };
+
+    void window.electronAPI.webdav.getSyncStatus().then(applyStatus).catch(() => null);
+
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      applyStatus(detail);
+    };
+    window.addEventListener('mindpaper-webdav-sync', handler as EventListener);
+    return () => {
+      mounted = false;
+      window.removeEventListener('mindpaper-webdav-sync', handler as EventListener);
+    };
+  }, []);
+
   const handleCloudSync = async () => {
     if (cloudSyncing) return;
-    setCloudSyncing(true);
     setCloudSyncMessage('');
     try {
       const result = await onCloudSyncUpload();
       if (result && result.success === false) {
-        setCloudSyncMessage(result.error || '云同步失败');
+        setCloudSyncMessage(result.conflict ? '检测到本地与云端冲突' : result.error || '云同步失败');
       } else {
         setCloudSyncMessage('云同步完成');
       }
     } catch (error: any) {
       setCloudSyncMessage(error?.message || '云同步失败');
-    } finally {
-      setCloudSyncing(false);
     }
   };
 
@@ -1832,10 +1862,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   }, [selectedPaper?.id, isPanelResizing]);
 
   const handleAddClick = () => {
+    if (isCloudSyncing) return;
     fileInputRef.current?.click();
   };
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (isCloudSyncing) {
+      event.target.value = '';
+      return;
+    }
     const file = event.target.files?.[0];
     if (file) {
       const created = await onAddPdf(file, selectedFolderId);
@@ -1848,6 +1883,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const handleDrop = async (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
+    if (isCloudSyncing) return;
     if (selectedFolderId === SYSTEM_FOLDER_TRASH_ID) return;
     const file = event.dataTransfer.files?.[0];
     if (file) {
@@ -1863,6 +1899,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   };
 
   const handleFolderDragOver = (event: React.DragEvent<HTMLDivElement>, folderId: string) => {
+    if (isCloudSyncing) return;
     if (!draggingPaperId || folderId === SYSTEM_FOLDER_ALL_ID) return;
     event.preventDefault();
     setDragOverFolderId(folderId);
@@ -1874,6 +1911,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
   const handleFolderDrop = (event: React.DragEvent<HTMLDivElement>, folderId: string) => {
     event.preventDefault();
+    if (isCloudSyncing) return;
     const paperIdFromData = event.dataTransfer.getData('application/x-mind-paper-paper-id');
     const paperId = paperIdFromData || draggingPaperId;
     setDragOverFolderId(null);
@@ -1940,7 +1978,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <button
             type="button"
             onClick={() => handleAddFolder(null)}
-            className="w-full flex items-center gap-2 px-2 py-1.5 text-sm text-gray-600 rounded-md hover:bg-gray-200"
+            disabled={isCloudSyncing}
+            className="w-full flex items-center gap-2 px-2 py-1.5 text-sm text-gray-600 rounded-md hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Plus size={14} className="text-gray-400" />
             新建文件夹
@@ -1991,17 +2030,21 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 className="p-1 rounded-md text-gray-500 hover:bg-gray-200 hover:text-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
                 aria-label="云同步"
               >
-                <svg
-                  className="h-[14px] w-[14px]"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.8"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                >
-                  <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
-                </svg>
+                {cloudSyncing ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <svg
+                    className="h-[14px] w-[14px]"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
+                  </svg>
+                )}
               </button>
             </Tooltip>
             {cloudSyncMessage ? (
@@ -2197,21 +2240,23 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             ) : null}
             {selectedFolderId === SYSTEM_FOLDER_TRASH_ID ? (
               <Tooltip label="清空回收站">
-                <button
-                  onClick={onEmptyTrash}
-                  className="p-1 rounded-md hover:bg-gray-200 text-gray-500"
-                >
-                  <Trash2 size={14} />
-                </button>
+              <button
+                onClick={onEmptyTrash}
+                disabled={isCloudSyncing}
+                className="p-1 rounded-md hover:bg-gray-200 text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Trash2 size={14} />
+              </button>
               </Tooltip>
             ) : (
               <Tooltip label="添加文档">
-                <button
-                  onClick={handleAddClick}
-                  className="p-1 rounded-md hover:bg-gray-200 text-gray-500"
-                >
-                  <Plus size={14} />
-                </button>
+              <button
+                onClick={handleAddClick}
+                disabled={isCloudSyncing}
+                className="p-1 rounded-md hover:bg-gray-200 text-gray-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Plus size={14} />
+              </button>
               </Tooltip>
             )}
             </div>
@@ -2224,8 +2269,12 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                  key={paper.id}
                  onClick={() => setSelectedPaperId(paper.id)}
                  onDoubleClick={() => onOpenPaper(paper)}
-                 draggable={selectedFolderId !== SYSTEM_FOLDER_TRASH_ID}
+                 draggable={!isCloudSyncing && selectedFolderId !== SYSTEM_FOLDER_TRASH_ID}
                  onDragStart={(event) => {
+                   if (isCloudSyncing) {
+                     event.preventDefault();
+                     return;
+                   }
                    if (selectedFolderId === SYSTEM_FOLDER_TRASH_ID) {
                      event.preventDefault();
                      return;
@@ -2309,14 +2358,15 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                    </div>
                    {selectedFolderId !== SYSTEM_FOLDER_TRASH_ID ? (
                      <Tooltip label="删除">
-                       <button
-                         type="button"
-                         onClick={(event) => {
-                           event.stopPropagation();
-                           onMovePaperToTrash(paper.id);
-                         }}
-                         className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
-                       >
+                         <button
+                           type="button"
+                           onClick={(event) => {
+                             event.stopPropagation();
+                             onMovePaperToTrash(paper.id);
+                           }}
+                           disabled={isCloudSyncing}
+                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                         >
                          <Trash2 size={14} />
                        </button>
                      </Tooltip>
@@ -2329,7 +2379,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                              event.stopPropagation();
                              onRestorePaper(paper.id);
                            }}
-                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+                           disabled={isCloudSyncing}
+                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600 disabled:opacity-40 disabled:cursor-not-allowed"
                          >
                            <RotateCcw size={14} />
                          </button>
@@ -2341,7 +2392,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                              event.stopPropagation();
                              onDeletePaper(paper.id);
                            }}
-                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+                           disabled={isCloudSyncing}
+                           className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600 disabled:opacity-40 disabled:cursor-not-allowed"
                          >
                            <Trash2 size={14} />
                          </button>

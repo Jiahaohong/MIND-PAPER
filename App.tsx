@@ -3,7 +3,7 @@ import { LibraryView } from './components/LibraryView';
 import { ReaderView } from './components/ReaderView';
 import { Folder, Paper, PaperReference } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
-import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud } from 'lucide-react';
+import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud, FolderOpen } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
   extractPdfFullText,
@@ -12,7 +12,18 @@ import {
 } from './services/pdfMetadataService';
 import { resolvePaperMetadata } from './services/paperMetadataResolver';
 
+type WebDavConflictItem = {
+  paperId: string;
+  title: string;
+  localVersion?: number;
+  remoteVersion?: number;
+  localUpdatedAt?: number;
+  remoteUpdatedAt?: number;
+  localBehindRemote?: boolean;
+};
+
 const App: React.FC = () => {
+  const SAVED_WEBDAV_PASSWORD_MASK = '********';
   const DEFAULT_SETTINGS = {
     translationEngine: 'cnki' as 'cnki' | 'openai',
     apiKey: '',
@@ -39,18 +50,45 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync'>('ai');
+  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync' | 'storage'>('ai');
   const [webdavPassword, setWebdavPassword] = useState('');
+  const [webdavServerInput, setWebdavServerInput] = useState('');
   const [webdavStatus, setWebdavStatus] = useState('');
   const [webdavTesting, setWebdavTesting] = useState(false);
   const [webdavSaving, setWebdavSaving] = useState(false);
+  const [webdavClearingLock, setWebdavClearingLock] = useState(false);
+  const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const [webdavConflict, setWebdavConflict] = useState<{
+    mode: 'upload' | 'download';
+    items: WebDavConflictItem[];
+  } | null>(null);
+  const [webdavConflictDecisions, setWebdavConflictDecisions] = useState<Record<string, 'local' | 'remote'>>({});
+  const [webdavResolvingConflict, setWebdavResolvingConflict] = useState(false);
 
   const getWebDavServerEditablePart = (value: string) =>
     String(value || '')
       .trim()
       .replace(/^https?:\/\//i, '')
-      .replace(/\/mindpaper\/?$/i, '')
-      .replace(/\/+$/, '');
+      .replace(/\/mindpaper\/?$/i, '');
+
+  const normalizeWebDavServerInput = (value: string) =>
+    getWebDavServerEditablePart(value).replace(/\/+$/, '');
+
+  const formatConflictTime = (value?: number) => {
+    const time = Number(value || 0);
+    if (!Number.isFinite(time) || time <= 0) return '-';
+    return new Date(time).toLocaleString('zh-CN', { hour12: false });
+  };
+
+  const commitWebDavServerInput = () => {
+    const normalized = normalizeWebDavServerInput(webdavServerInput);
+    setWebdavServerInput(normalized);
+    setSettingsForm((prev) => ({
+      ...prev,
+      webdavServer: `https://${normalized}`,
+      webdavRemotePath: '/mindpaper'
+    }));
+  };
 
   const activePaper = openPapers.find(p => p.id === activePaperId);
   const MAX_FULL_PDF_CACHE = 20;
@@ -222,6 +260,7 @@ const App: React.FC = () => {
   };
 
   const handleUpdatePaper = (paperId: string, updates: Partial<Paper>) => {
+    if (isCloudSyncing) return;
     setPapers((prev) => prev.map((paper) => (paper.id === paperId ? { ...paper, ...updates } : paper)));
     setOpenPapers((prev) =>
       prev.map((paper) => (paper.id === paperId ? { ...paper, ...updates } : paper))
@@ -253,6 +292,7 @@ const App: React.FC = () => {
   };
 
   const handleAddPdf = async (file: File, folderId: string | null): Promise<Paper | null> => {
+    if (isCloudSyncing) return null;
     if (!file) return null;
     const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
     if (!isPdf) {
@@ -599,6 +639,7 @@ const App: React.FC = () => {
   };
 
   const handleEmptyTrash = () => {
+    if (isCloudSyncing) return;
     const trashIds = papers.filter((paper) => paper.folderId === SYSTEM_FOLDER_TRASH_ID).map((paper) => paper.id);
     if (!trashIds.length) return;
     const trashSet = new Set(trashIds);
@@ -627,6 +668,7 @@ const App: React.FC = () => {
   };
 
   const handleMovePapersToTrash = (folderIds: string[]) => {
+    if (isCloudSyncing) return;
     if (!folderIds.length) return;
     const folderSet = new Set(folderIds);
     setPapers((prev) =>
@@ -639,6 +681,7 @@ const App: React.FC = () => {
   };
 
   const handleMovePaperToTrash = (paperId: string) => {
+    if (isCloudSyncing) return;
     setPapers((prev) =>
       prev.map((paper) =>
         paper.id === paperId
@@ -649,6 +692,7 @@ const App: React.FC = () => {
   };
 
   const handleDeletePaper = (paperId: string) => {
+    if (isCloudSyncing) return;
     const targetPaper = papers.find((paper) => paper.id === paperId);
     if (typeof window !== 'undefined' && window.electronAPI?.library?.deletePaper) {
       window.electronAPI.library
@@ -673,6 +717,7 @@ const App: React.FC = () => {
   };
 
   const handleMovePaperToFolder = (paperId: string, targetFolderId: string) => {
+    if (isCloudSyncing) return;
     if (!paperId || !targetFolderId || targetFolderId === SYSTEM_FOLDER_ALL_ID) return;
     setPapers((prev) =>
       prev.map((paper) => {
@@ -696,6 +741,7 @@ const App: React.FC = () => {
   };
 
   const handleRestorePaper = (paperId: string) => {
+    if (isCloudSyncing) return;
     const findFolderById = (list: Folder[], targetId: string | null): Folder | null => {
       if (!targetId) return null;
       for (const folder of list) {
@@ -832,7 +878,68 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.getSyncStatus) return;
+    let mounted = true;
+    let lastActive = false;
+    let lastDirection = 'idle';
+
+    const applyStatus = (payload: any) => {
+      if (!mounted) return;
+      const nextActive = Boolean(payload?.active);
+      const nextDirection = String(payload?.direction || 'idle');
+      setIsCloudSyncing(nextActive);
+      if (lastActive && !nextActive && lastDirection === 'download') {
+        void loadLibrary();
+      }
+      lastActive = nextActive;
+      lastDirection = nextDirection;
+    };
+
+    void window.electronAPI.webdav.getSyncStatus().then(applyStatus).catch(() => null);
+
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      applyStatus(detail);
+    };
+
+    window.addEventListener('mindpaper-webdav-sync', handler as EventListener);
+    return () => {
+      mounted = false;
+      window.removeEventListener('mindpaper-webdav-sync', handler as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handler = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as {
+        active?: boolean;
+        mode?: 'upload' | 'download';
+        items?: WebDavConflictItem[];
+      };
+      if (!detail?.active) {
+        setWebdavConflict(null);
+        setWebdavConflictDecisions({});
+        return;
+      }
+      const items = Array.isArray(detail.items) ? detail.items : [];
+      setWebdavConflict({
+        mode: detail.mode === 'upload' ? 'upload' : 'download',
+        items
+      });
+      setWebdavConflictDecisions(
+        Object.fromEntries(items.map((item) => [item.paperId, 'local' as const]))
+      );
+    };
+    window.addEventListener('mindpaper-webdav-conflict', handler as EventListener);
+    return () => {
+      window.removeEventListener('mindpaper-webdav-conflict', handler as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!libraryLoaded) return;
+    if (isCloudSyncing) return;
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
     if (window.electronAPI.library.saveSnapshot) {
       window.electronAPI.library.saveSnapshot({ folders, papers });
@@ -840,12 +947,11 @@ const App: React.FC = () => {
     }
     window.electronAPI.library.saveFolders?.(folders);
     window.electronAPI.library.savePapers?.(papers);
-  }, [folders, papers, libraryLoaded]);
+  }, [folders, papers, libraryLoaded, isCloudSyncing]);
 
   const loadSettings = async () => {
     setSettingsError('');
     setWebdavStatus('');
-    setWebdavPassword('');
     if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) {
       setSettingsError('设置仅桌面端可用');
       return;
@@ -854,6 +960,8 @@ const App: React.FC = () => {
     try {
       const data = await window.electronAPI.settingsGet();
       setSettingsForm((prev) => ({ ...prev, ...data }));
+      setWebdavServerInput(getWebDavServerEditablePart(data?.webdavServer || ''));
+      setWebdavPassword(data?.webdavHasPassword ? SAVED_WEBDAV_PASSWORD_MASK : '');
     } catch (error: any) {
       setSettingsError(error?.message || '设置加载失败');
     } finally {
@@ -871,6 +979,7 @@ const App: React.FC = () => {
     try {
       const data = await window.electronAPI.settingsSet(settingsForm);
       setSettingsForm((prev) => ({ ...prev, ...data }));
+      setWebdavServerInput(getWebDavServerEditablePart(data?.webdavServer || settingsForm.webdavServer));
       setSettingsSaved(true);
       window.setTimeout(() => setSettingsSaved(false), 1500);
       setSettingsOpen(false);
@@ -893,7 +1002,10 @@ const App: React.FC = () => {
       const result = await window.electronAPI.webdav.test({
         server: settingsForm.webdavServer,
         username: settingsForm.webdavUsername,
-        password: webdavPassword,
+        password:
+          settingsForm.webdavHasPassword && webdavPassword === SAVED_WEBDAV_PASSWORD_MASK
+            ? ''
+            : webdavPassword,
         remotePath: '/mindpaper'
       });
       if (result?.success) {
@@ -919,7 +1031,10 @@ const App: React.FC = () => {
       const result = await window.electronAPI.webdav.save({
         server: settingsForm.webdavServer,
         username: settingsForm.webdavUsername,
-        password: webdavPassword,
+        password:
+          settingsForm.webdavHasPassword && webdavPassword === SAVED_WEBDAV_PASSWORD_MASK
+            ? ''
+            : webdavPassword,
         remotePath: '/mindpaper'
       });
       setSettingsForm((prev) => ({
@@ -929,8 +1044,21 @@ const App: React.FC = () => {
         webdavRemotePath: '/mindpaper',
         webdavHasPassword: Boolean(result?.webdavHasPassword)
       }));
-      setWebdavPassword('');
+      setWebdavServerInput(
+        getWebDavServerEditablePart(result?.webdavServer || settingsForm.webdavServer)
+      );
+      setWebdavPassword(Boolean(result?.webdavHasPassword) ? SAVED_WEBDAV_PASSWORD_MASK : '');
       setWebdavStatus('WebDAV 配置和凭据已保存');
+      if (window.confirm('WebDAV 已保存，是否立即从云端同步到本地？')) {
+        const downloadResult = await handleCloudSyncDownload();
+        if (downloadResult?.success) {
+          setWebdavStatus('已从云端同步到本地');
+        } else if (downloadResult?.conflict) {
+          setWebdavStatus('检测到本地与云端冲突，请先处理冲突');
+        } else if (!downloadResult?.skipped) {
+          setWebdavStatus(downloadResult?.error || '云端同步失败');
+        }
+      }
     } catch (error: any) {
       setWebdavStatus(error?.message || 'WebDAV 保存失败');
     } finally {
@@ -943,6 +1071,59 @@ const App: React.FC = () => {
       return { success: false, error: '当前环境不支持云同步' };
     }
     return window.electronAPI.webdav.syncUpload();
+  };
+
+  const handleCloudSyncDownload = async () => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.syncDownload) {
+      return { success: false, error: '当前环境不支持云同步' };
+    }
+    return window.electronAPI.webdav.syncDownload();
+  };
+
+  const applyConflictStrategy = (choice: 'local' | 'remote') => {
+    if (!webdavConflict?.items?.length) return;
+    setWebdavConflictDecisions(
+      Object.fromEntries(webdavConflict.items.map((item) => [item.paperId, choice]))
+    );
+  };
+
+  const handleResolveWebDavConflict = async (strategy: 'keep-local' | 'keep-remote' | '') => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.resolveConflicts || !webdavConflict) {
+      return;
+    }
+    setWebdavResolvingConflict(true);
+    try {
+      const result = await window.electronAPI.webdav.resolveConflicts({
+        strategy,
+        decisions: webdavConflictDecisions
+      });
+      if (!result?.success) {
+        window.alert(result?.error || '处理云端冲突失败');
+        return;
+      }
+      setWebdavConflict(null);
+      setWebdavConflictDecisions({});
+      await loadLibrary();
+    } finally {
+      setWebdavResolvingConflict(false);
+    }
+  };
+
+  const handleClearWebDavLock = async () => {
+    setWebdavStatus('');
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.clearLock) {
+      setWebdavStatus('当前环境不支持清除云端锁');
+      return;
+    }
+    setWebdavClearingLock(true);
+    try {
+      const result = await window.electronAPI.webdav.clearLock();
+      setWebdavStatus(result?.message || '已清除云端锁');
+    } catch (error: any) {
+      setWebdavStatus(error?.message || '清除云端锁失败');
+    } finally {
+      setWebdavClearingLock(false);
+    }
   };
 
   useEffect(() => {
@@ -1033,6 +1214,7 @@ const App: React.FC = () => {
             onMovePaperToFolder={handleMovePaperToFolder}
             onRestorePaper={handleRestorePaper}
             onCloudSyncUpload={handleCloudSyncUpload}
+            isCloudSyncing={isCloudSyncing}
           />
         </div>
         <div className={activePaperId === null ? 'hidden' : 'absolute inset-0'}>
@@ -1045,6 +1227,7 @@ const App: React.FC = () => {
                   pdfFile={getCachedPdfFile(paper)}
                   onBack={switchToLibrary}
                   onUpdatePaper={handleUpdatePaper}
+                  isCloudSyncing={isCloudSyncing}
                 />
               </div>
             );
@@ -1094,24 +1277,26 @@ const App: React.FC = () => {
                   <Cloud size={14} />
                 </button>
               </Tooltip>
+              <Tooltip label="存储位置">
+                <button
+                  type="button"
+                  onClick={() => setSettingsSection('storage')}
+                  className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                    settingsSection === 'storage'
+                      ? 'bg-gray-200 text-gray-900'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                  }`}
+                  aria-label="存储位置"
+                >
+                  <FolderOpen size={14} />
+                </button>
+              </Tooltip>
             </div>
 
             <div className="space-y-3">
-              <div className="grid grid-cols-1 gap-2">
-                <label className="text-xs text-gray-500">数据保存路径</label>
-                <input
-                  type="text"
-                  value={settingsForm.libraryPath}
-                  onChange={(e) =>
-                    setSettingsForm((prev) => ({ ...prev, libraryPath: e.target.value }))
-                  }
-                  className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
-                  placeholder="/Users/you/Library/MindPaper"
-                />
-              </div>
-
               {settingsSection === 'ai' ? (
-                <>
+                <div className="rounded-lg border border-gray-200 p-3 space-y-3">
+                  <div className="text-xs font-semibold text-gray-700">AI功能</div>
                   <div className="grid grid-cols-1 gap-2">
                     <label className="text-xs text-gray-500">API KEY</label>
                     <input
@@ -1192,8 +1377,8 @@ const App: React.FC = () => {
                       </button>
                     </div>
                   </div>
-                </>
-              ) : (
+                </div>
+              ) : settingsSection === 'sync' ? (
                 <div className="rounded-lg border border-gray-200 p-3 space-y-3">
                   <div className="flex items-center justify-between">
                     <div className="text-xs font-semibold text-gray-700">WebDAV</div>
@@ -1210,14 +1395,15 @@ const App: React.FC = () => {
                       </span>
                       <input
                         type="text"
-                        value={getWebDavServerEditablePart(settingsForm.webdavServer)}
-                        onChange={(e) =>
-                          setSettingsForm((prev) => ({
-                            ...prev,
-                            webdavServer: `https://${e.target.value.trim().replace(/^https?:\/\//i, '').replace(/\/mindpaper\/?$/i, '').replace(/\/+$/, '')}`,
-                            webdavRemotePath: '/mindpaper'
-                          }))
-                        }
+                        value={webdavServerInput}
+                        onChange={(e) => setWebdavServerInput(e.target.value.replace(/^https?:\/\//i, ''))}
+                        onBlur={commitWebDavServerInput}
+                        onKeyDown={(e) => {
+                          if (e.key !== 'Enter') return;
+                          e.preventDefault();
+                          commitWebDavServerInput();
+                          (e.currentTarget as HTMLInputElement).blur();
+                        }}
                         className="min-w-0 flex-1 px-2 py-1 text-xs focus:outline-none"
                         placeholder="dav.example.com/path"
                       />
@@ -1245,9 +1431,14 @@ const App: React.FC = () => {
                     <input
                       type="password"
                       value={webdavPassword}
+                      onFocus={() => {
+                        if (webdavPassword === SAVED_WEBDAV_PASSWORD_MASK) {
+                          setWebdavPassword('');
+                        }
+                      }}
                       onChange={(e) => setWebdavPassword(e.target.value)}
                       className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
-                      placeholder={settingsForm.webdavHasPassword ? '留空则继续使用已保存密码' : '输入 WebDAV 密码'}
+                      placeholder="输入 WebDAV 密码"
                     />
                   </div>
 
@@ -1268,11 +1459,38 @@ const App: React.FC = () => {
                     >
                       {webdavSaving ? '保存中...' : '保存凭据'}
                     </button>
+                    <button
+                      type="button"
+                      onClick={handleClearWebDavLock}
+                      disabled={webdavClearingLock}
+                      className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      {webdavClearingLock ? '清除中...' : '强制清除云端锁'}
+                    </button>
                   </div>
 
                   {webdavStatus ? (
                     <div className="text-[11px] text-gray-500">{webdavStatus}</div>
                   ) : null}
+                </div>
+              ) : (
+                <div className="rounded-lg border border-gray-200 p-3 space-y-3">
+                  <div className="text-xs font-semibold text-gray-700">文件存储位置</div>
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">数据保存路径</label>
+                    <input
+                      type="text"
+                      value={settingsForm.libraryPath}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({ ...prev, libraryPath: e.target.value }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-gray-50"
+                      placeholder="/Users/you/Library/MindPaper"
+                    />
+                  </div>
+                  <div className="text-[11px] text-gray-400">
+                    修改后会将本地数据库、PDF 文件和向量索引目录迁移到新的位置。
+                  </div>
                 </div>
               )}
             </div>
@@ -1285,7 +1503,9 @@ const App: React.FC = () => {
               <div className="text-[11px] text-gray-400">
                 {settingsSection === 'ai'
                   ? '开启 AI 功能需填写 API KEY / URL / 模型。'
-                  : 'WebDAV 密码使用系统安全存储，需单独保存凭据。'}
+                  : settingsSection === 'sync'
+                    ? 'WebDAV 密码使用系统安全存储，需单独保存凭据。'
+                    : '修改存储位置后，建议等待迁移完成再进行云同步。'}
               </div>
               <button
                 type="button"
@@ -1294,6 +1514,107 @@ const App: React.FC = () => {
                 className="px-3 py-1.5 rounded-md text-xs bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
               >
                 {settingsLoading ? '保存中...' : settingsSaved ? '已保存' : '保存设置'}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {webdavConflict ? (
+        <div className="fixed inset-0 z-[60] bg-black/30 flex items-center justify-center">
+          <div className="w-[680px] max-h-[80vh] overflow-hidden bg-white rounded-xl shadow-xl border border-gray-200 p-4 flex flex-col">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <div className="text-sm font-semibold text-gray-800">云端冲突处理</div>
+                <div className="text-xs text-gray-500 mt-1">
+                  检测到本地与云端存在同一论文的差异。PDF 只能二选一；无冲突论文会自动同时保留。
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 mb-3">
+              <button
+                type="button"
+                onClick={() => applyConflictStrategy('local')}
+                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50"
+              >
+                保留本地
+              </button>
+              <button
+                type="button"
+                onClick={() => applyConflictStrategy('remote')}
+                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50"
+              >
+                保留云端
+              </button>
+              <button
+                type="button"
+                onClick={() => handleResolveWebDavConflict('')}
+                disabled={webdavResolvingConflict}
+                className="px-3 py-1.5 rounded-md text-xs bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
+              >
+                {webdavResolvingConflict ? '处理中...' : '合并二者'}
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto rounded-lg border border-gray-200">
+              {webdavConflict.items.map((item) => {
+                const value = webdavConflictDecisions[item.paperId] || 'local';
+                return (
+                  <div key={item.paperId} className="px-3 py-3 border-b border-gray-100 last:border-b-0">
+                    <div className="text-sm font-medium text-gray-800">{item.title || item.paperId}</div>
+                    <div className="mt-1 text-[11px] text-gray-500">
+                      本地版本 v{item.localVersion || 1} / 云端版本 v{item.remoteVersion || 1}
+                    </div>
+                    <div className="mt-1 text-[11px] text-gray-400">
+                      本地更新时间 {formatConflictTime(item.localUpdatedAt)} / 云端更新时间{' '}
+                      {formatConflictTime(item.remoteUpdatedAt)}
+                    </div>
+                    <div className="mt-2 flex items-center gap-4 text-xs">
+                      <label className="flex items-center gap-1 text-gray-700">
+                        <input
+                          type="radio"
+                          name={`webdav-conflict-${item.paperId}`}
+                          checked={value === 'local'}
+                          onChange={() =>
+                            setWebdavConflictDecisions((prev) => ({ ...prev, [item.paperId]: 'local' }))
+                          }
+                        />
+                        本地版本
+                      </label>
+                      <label className="flex items-center gap-1 text-gray-700">
+                        <input
+                          type="radio"
+                          name={`webdav-conflict-${item.paperId}`}
+                          checked={value === 'remote'}
+                          onChange={() =>
+                            setWebdavConflictDecisions((prev) => ({ ...prev, [item.paperId]: 'remote' }))
+                          }
+                        />
+                        云端版本
+                      </label>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="mt-3 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => handleResolveWebDavConflict('keep-local')}
+                disabled={webdavResolvingConflict}
+                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                应用当前选择
+              </button>
+              <button
+                type="button"
+                onClick={() => handleResolveWebDavConflict('keep-remote')}
+                disabled={webdavResolvingConflict}
+                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                全部保留云端
               </button>
             </div>
           </div>

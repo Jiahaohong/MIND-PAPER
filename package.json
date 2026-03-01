@@ -9,10 +9,13 @@
     "rebuild:native": "electron-builder install-app-deps",
     "dev": "concurrently -k \"vite\" \"wait-on http://localhost:3001 && electron .\"",
     "electron": "electron .",
+    "clean:build": "node -e \"const fs=require('fs'); for (const dir of ['dist','release']) { fs.rmSync(dir,{recursive:true,force:true}); }\"",
     "build": "vite build",
     "preview": "vite preview",
     "pack:mac": "npm run build && electron-builder --mac",
-    "pack:win": "npm run build && electron-builder --win"
+    "pack:win": "npm run build && electron-builder --win",
+    "pack:clean:mac": "npm run clean:build && npm run pack:mac",
+    "pack:clean:win": "npm run clean:build && npm run pack:win"
   },
   "build": {
     "appId": "com.mindpaper.app",
@@ -23,16 +26,11 @@
     "files": [
       "dist/**",
       "electron/**",
-      "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "resources/qdrant",
-        "to": "qdrant",
-        "filter": [
-          "**/*"
-        ]
-      }
+      "package.json",
+      "!**/.DS_Store",
+      "!**/Thumbs.db",
+      "!**/*.log",
+      "!**/*.tmp"
     ],
     "mac": {
       "icon": "assets/mind-paper-v2.icns",
@@ -40,13 +38,25 @@
         "dmg",
         "zip"
       ],
-      "identity": null
+      "identity": null,
+      "extraResources": [
+        {
+          "from": "resources/qdrant/qdrant-macos",
+          "to": "qdrant/qdrant-macos"
+        }
+      ]
     },
     "win": {
       "icon": "assets/mind-paper-v2.ico",
       "target": [
         "nsis",
         "zip"
+      ],
+      "extraResources": [
+        {
+          "from": "resources/qdrant/qdrant-win.exe",
+          "to": "qdrant/qdrant-win.exe"
+        }
       ]
     }
   },

@@ -307,9 +307,16 @@ interface ReaderViewProps {
   pdfFile: { data: ArrayBuffer } | string | null;
   onBack: () => void;
   onUpdatePaper: (paperId: string, updates: Partial<Paper>) => void;
+  isCloudSyncing?: boolean;
 }
 
-export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, onUpdatePaper }) => {
+export const ReaderView: React.FC<ReaderViewProps> = ({
+  paper,
+  pdfFile,
+  onBack,
+  onUpdatePaper,
+  isCloudSyncing = false
+}) => {
   const MIN_SIDE_WIDTH = 120;
   const MIN_CENTER_WIDTH = 120;
   const RESIZE_HANDLE_WIDTH = 4;
@@ -4148,6 +4155,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
     if (!paper?.id) return;
     if (!paperStateLoadedRef.current) return;
+    if (isCloudSyncing) return;
     if (saveStateTimerRef.current) {
       window.clearTimeout(saveStateTimerRef.current);
     }
@@ -4167,7 +4175,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ paper, pdfFile, onBack, 
         window.clearTimeout(saveStateTimerRef.current);
       }
     };
-  }, [paper?.id, highlights, customChapters, mindmapStateV2ForSave, questions, chatThreads, activeChatId]);
+  }, [paper?.id, highlights, customChapters, mindmapStateV2ForSave, questions, chatThreads, activeChatId, isCloudSyncing]);
 
   const buildMindmapRoot = useCallback((): MindMapNode | null => {
     if (!outlineDisplay.length) return null;

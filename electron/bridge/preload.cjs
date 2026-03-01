@@ -8,6 +8,22 @@ ipcRenderer.on('progress-event', (_event, payload) => {
   }
 });
 
+ipcRenderer.on('webdav-sync-event', (_event, payload) => {
+  try {
+    window.dispatchEvent(new CustomEvent('mindpaper-webdav-sync', { detail: payload || {} }));
+  } catch {
+    // ignore bridge event dispatch errors
+  }
+});
+
+ipcRenderer.on('webdav-conflict-event', (_event, payload) => {
+  try {
+    window.dispatchEvent(new CustomEvent('mindpaper-webdav-conflict', { detail: payload || {} }));
+  } catch {
+    // ignore bridge event dispatch errors
+  }
+});
+
 contextBridge.exposeInMainWorld('electron', {
   platform: process.platform,
 });
@@ -25,7 +41,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
   webdav: {
     test: (payload) => ipcRenderer.invoke('webdav-test', payload),
     save: (payload) => ipcRenderer.invoke('webdav-save', payload),
-    syncUpload: () => ipcRenderer.invoke('webdav-sync-upload')
+    getSyncStatus: () => ipcRenderer.invoke('webdav-get-sync-status'),
+    clearLock: () => ipcRenderer.invoke('webdav-clear-lock'),
+    syncUpload: () => ipcRenderer.invoke('webdav-sync-upload'),
+    syncDownload: () => ipcRenderer.invoke('webdav-sync-download'),
+    resolveConflicts: (payload) => ipcRenderer.invoke('webdav-resolve-conflicts', payload)
   },
   vector: {
     status: () => ipcRenderer.invoke('vector-get-status'),

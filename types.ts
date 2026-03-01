@@ -21,6 +21,8 @@ export interface Paper {
   keywords: string[];
   publisher?: string;
   doi?: string;
+  version?: number;
+  updatedAt?: number;
   references?: PaperReference[];
   referenceStats?: {
     totalOpenAlex: number;
