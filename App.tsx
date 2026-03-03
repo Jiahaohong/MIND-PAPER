@@ -21,6 +21,16 @@ type WebDavConflictItem = {
   localUpdatedAt?: number;
   remoteUpdatedAt?: number;
   localBehindRemote?: boolean;
+  stateConflicts?: Array<'questions' | 'mindmapStateV2' | 'aiConversations'>;
+};
+
+type ConflictSection = 'paperMeta' | 'questions' | 'mindmapStateV2' | 'aiConversations';
+
+const CONFLICT_SECTION_LABELS: Record<ConflictSection, string> = {
+  paperMeta: '论文元数据',
+  questions: '问题列表',
+  mindmapStateV2: '导图',
+  aiConversations: '聊天记录'
 };
 
 const App: React.FC = () => {
@@ -79,6 +89,26 @@ const App: React.FC = () => {
     const time = Number(value || 0);
     if (!Number.isFinite(time) || time <= 0) return '-';
     return new Date(time).toLocaleString('zh-CN', { hour12: false });
+  };
+
+  const getConflictSections = (item: WebDavConflictItem): ConflictSection[] => {
+    const sections: ConflictSection[] = [];
+    const baseVersion = Math.max(0, Number(item.localBaseVersion || 0) || 0);
+    const localVersion = Math.max(0, Number(item.localVersion || 0) || 0);
+    const remoteVersion = Math.max(0, Number(item.remoteVersion || 0) || 0);
+    if (localVersion > baseVersion && remoteVersion > baseVersion) {
+      sections.push('paperMeta');
+    }
+    const stateSections = Array.isArray(item.stateConflicts) ? item.stateConflicts : [];
+    stateSections.forEach((section) => {
+      if (
+        (section === 'questions' || section === 'mindmapStateV2' || section === 'aiConversations') &&
+        !sections.includes(section)
+      ) {
+        sections.push(section);
+      }
+    });
+    return sections;
   };
 
   const commitWebDavServerInput = () => {
@@ -1528,7 +1558,7 @@ const App: React.FC = () => {
               <div>
                 <div className="text-sm font-semibold text-gray-800">云端冲突处理</div>
                 <div className="text-xs text-gray-500 mt-1">
-                  检测到本地与云端存在同一论文的差异。PDF 只能二选一；无冲突论文会自动同时保留。
+                  检测到本地与云端存在同一论文的差异。下方会标明冲突发生在论文元数据、问题列表、导图或聊天记录。PDF 仍然只能二选一；无冲突论文会自动同时保留。
                 </div>
               </div>
             </div>
@@ -1561,6 +1591,7 @@ const App: React.FC = () => {
             <div className="flex-1 overflow-auto rounded-lg border border-gray-200">
               {webdavConflict.items.map((item) => {
                 const value = webdavConflictDecisions[item.paperId] || 'local';
+                const conflictSections = getConflictSections(item);
                 return (
                   <div key={item.paperId} className="px-3 py-3 border-b border-gray-100 last:border-b-0">
                     <div className="text-sm font-medium text-gray-800">{item.title || item.paperId}</div>
@@ -1571,6 +1602,16 @@ const App: React.FC = () => {
                     <div className="mt-1 text-[11px] text-gray-400">
                       本地更新时间 {formatConflictTime(item.localUpdatedAt)} / 云端更新时间{' '}
                       {formatConflictTime(item.remoteUpdatedAt)}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {conflictSections.map((section) => (
+                        <span
+                          key={`${item.paperId}-${section}`}
+                          className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 ring-1 ring-inset ring-amber-200"
+                        >
+                          {CONFLICT_SECTION_LABELS[section]}
+                        </span>
+                      ))}
                     </div>
                     <div className="mt-2 flex items-center gap-4 text-xs">
                       <label className="flex items-center gap-1 text-gray-700">

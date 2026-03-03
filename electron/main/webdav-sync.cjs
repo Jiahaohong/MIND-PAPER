@@ -1,4 +1,7 @@
 const WEBDAV_PDF_MANIFEST_FILE = 'papers-manifest.json';
+const WEBDAV_LOCK_FILE = 'lock.json';
+const REMOTE_LOCK_WAIT_TIMEOUT_MS = 15000;
+const REMOTE_LOCK_WAIT_POLL_MS = 1000;
 
 const registerWebDavSyncIpc = ({
   ipcMain,
@@ -64,6 +67,7 @@ const createWebDavSyncModule = (deps = {}) => {
     getWebDavConfigFromSettings,
     getWebDavCredential,
     createWebDavClient,
+    webdavLockOwner,
     ensureWebDavLock,
     releaseWebDavLock,
     loadFoldersFromSqlite,
@@ -74,6 +78,7 @@ const createWebDavSyncModule = (deps = {}) => {
     savePapersToSqlite,
     markAllPapersBaseVersionCurrent,
     savePaperStateToSqlite,
+    markPaperStateAnnotationsBaseVersionCurrent,
     deletePaperStatesFromSqlite,
     setSyncPending,
     getSyncPending,
@@ -194,7 +199,66 @@ const createWebDavSyncModule = (deps = {}) => {
     };
   };
 
+  const shouldDownloadPdfFromRemote = (fileName, localManifest, remoteManifest) => {
+    const localFiles =
+      localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
+    const remoteFiles =
+      remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
+    const localMeta = localFiles[fileName];
+    const remoteMeta = remoteFiles[fileName];
+    if (!remoteMeta) return false;
+    if (!localMeta) return true;
+
+    const localSha1 = String(localMeta?.sha1 || '').trim();
+    const remoteSha1 = String(remoteMeta?.sha1 || '').trim();
+    if (localSha1 && remoteSha1) {
+      return localSha1 !== remoteSha1;
+    }
+    return Number(localMeta?.size || 0) !== Number(remoteMeta?.size || 0);
+  };
+
   const getRemotePdfManifestPath = (remotePath) => `${remotePath}/${WEBDAV_PDF_MANIFEST_FILE}`;
+  const getRemoteLockPath = (remotePath) => `${remotePath}/${WEBDAV_LOCK_FILE}`;
+
+  const isRemoteLockAlive = (lock) =>
+    Boolean(lock && Number(lock.expiresAt || 0) > Date.now() && String(lock.sessionId || '').trim());
+
+  const isRemoteLockOwnedBySelf = (lock) =>
+    String(lock?.sessionId || '').trim() === String(webdavLockOwner?.sessionId || '').trim();
+
+  const formatRemoteLockOwner = (lock) => {
+    const device = String(lock?.device || '').trim();
+    if (device) return device;
+    const sessionId = String(lock?.sessionId || '').trim();
+    return sessionId ? `session ${sessionId.slice(0, 8)}` : 'unknown';
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const waitForRemoteLockRelease = async (
+    client,
+    remotePath,
+    { timeoutMs = REMOTE_LOCK_WAIT_TIMEOUT_MS, pollMs = REMOTE_LOCK_WAIT_POLL_MS } = {}
+  ) => {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0));
+    const lockPath = getRemoteLockPath(remotePath);
+    while (true) {
+      const lock = await readRemoteJsonFile(client, lockPath).catch(() => null);
+      if (!isRemoteLockAlive(lock) || isRemoteLockOwnedBySelf(lock)) {
+        return { ok: true, lock: lock || null };
+      }
+      if (Date.now() >= deadline) {
+        return { ok: false, lock };
+      }
+      emitWebDavSyncState({
+        active: true,
+        direction: 'download',
+        message: `云端正在同步中，等待 ${formatRemoteLockOwner(lock)} 释放锁`
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(pollMs);
+    }
+  };
 
   const getChangedPdfFilesForUpload = (localManifest, remoteManifest) => {
     const localFiles =
@@ -231,6 +295,440 @@ const createWebDavSyncModule = (deps = {}) => {
     references: Array.isArray(paper.references) ? paper.references : [],
     referenceStats: paper.referenceStats || null
   });
+
+  const normalizeHighlightRect = (rect = {}) => ({
+    pageIndex: Number(rect?.pageIndex || 0),
+    x: Number(rect?.x || 0),
+    y: Number(rect?.y || 0),
+    w: Number(rect?.w || 0),
+    h: Number(rect?.h || 0)
+  });
+
+  const buildAnnotationComparable = (item = {}) =>
+    JSON.stringify({
+      text: String(item?.text || '').trim(),
+      color: String(item?.color || '').trim(),
+      pageIndex: Number(item?.pageIndex || 0),
+      topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0),
+      rects: Array.isArray(item?.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+      chapterId: String(item?.chapterId || '').trim(),
+      parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+      isChapterTitle: Boolean(item?.isChapterTitle),
+      chapterNodeId: item?.chapterNodeId == null ? null : String(item.chapterNodeId),
+      translation: String(item?.translation || '').trim(),
+      questionIds: Array.isArray(item?.questionIds) ? item.questionIds.map(String).filter(Boolean) : [],
+      source: item?.source === 'manual' ? 'manual' : 'pdf',
+      order: typeof item?.order === 'number' ? item.order : undefined
+    });
+
+  const normalizeAnnotation = (item = {}) => {
+    const id = String(item?.id || '').trim();
+    if (!id) return null;
+    return {
+      id,
+      text: String(item?.text || '').trim(),
+      color: String(item?.color || '').trim(),
+      pageIndex: Number(item?.pageIndex || 0),
+      topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0),
+      rects: Array.isArray(item?.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+      chapterId: String(item?.chapterId || '').trim(),
+      parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+      isChapterTitle: Boolean(item?.isChapterTitle),
+      chapterNodeId: item?.chapterNodeId == null ? null : String(item.chapterNodeId),
+      translation: String(item?.translation || '').trim(),
+      questionIds: Array.isArray(item?.questionIds)
+        ? item.questionIds.map((value) => String(value || '').trim()).filter(Boolean)
+        : [],
+      source: item?.source === 'manual' ? 'manual' : 'pdf',
+      order: typeof item?.order === 'number' ? item.order : undefined,
+      version: Math.max(1, Number(item?.version || 1) || 1),
+      baseVersion: Math.max(0, Number(item?.baseVersion ?? 0) || 0),
+      updatedAt: Number(item?.updatedAt || 0) || Date.now(),
+      isDeleted: Boolean(item?.isDeleted)
+    };
+  };
+
+  const getAnnotationsFromState = (state = {}) => {
+    const source = Array.isArray(state?.annotations) ? state.annotations : [];
+    const annotations = source.map((item) => normalizeAnnotation(item)).filter(Boolean);
+    const legacyHighlights = Array.isArray(state?.highlights) ? state.highlights : [];
+    legacyHighlights.forEach((item) => {
+      const migrated = normalizeAnnotation(item);
+      if (!migrated) return;
+      annotations.push(migrated);
+    });
+    const chapterLookup = new Map();
+    annotations.forEach((item) => {
+      if (!item?.isChapterTitle) return;
+      const key = String(item.chapterNodeId || item.chapterId || item.id).trim();
+      if (!key) return;
+      chapterLookup.set(key, item);
+    });
+    const legacyCustomChapters = Array.isArray(state?.customChapters) ? state.customChapters : [];
+    legacyCustomChapters.forEach((chapter, index) => {
+      const chapterId = String(chapter?.id || '').trim();
+      if (!chapterId || chapterLookup.has(chapterId)) return;
+      const migrated = normalizeAnnotation({
+        id: `chapter-${chapterId}`,
+        text: String(chapter?.title || '').trim(),
+        color: 'rgba(107, 114, 128, 0.35)',
+        pageIndex: Number(chapter?.pageIndex || 0),
+        topRatio: chapter?.topRatio == null ? null : Number(chapter.topRatio || 0),
+        rects: [],
+        chapterId,
+        parentId: chapter?.parentId == null ? null : String(chapter.parentId || '').trim(),
+        isChapterTitle: true,
+        chapterNodeId: chapterId,
+        translation: '',
+        questionIds: [],
+        source: 'manual',
+        order: typeof chapter?.order === 'number' ? chapter.order : index,
+        updatedAt: Number(chapter?.createdAt || Date.now()) || Date.now()
+      });
+      if (!migrated) return;
+      annotations.push(migrated);
+      chapterLookup.set(chapterId, migrated);
+    });
+    return annotations;
+  };
+
+  const getVisibleAnnotations = (annotations = []) =>
+    (Array.isArray(annotations) ? annotations : []).filter((item) => item && !item.isDeleted);
+
+  const cloneJsonValue = (value, fallback = null) => {
+    try {
+      return JSON.parse(JSON.stringify(value == null ? fallback : value));
+    } catch {
+      return fallback;
+    }
+  };
+
+  const buildStateComparable = (value) => JSON.stringify(value ?? null);
+
+  const normalizeReaderQuestion = (item = {}) => {
+    const id = String(item?.id || '').trim();
+    if (!id) return null;
+    return {
+      id,
+      text: String(item?.text || '').trim()
+    };
+  };
+
+  const normalizeQuestionsPayload = (value) =>
+    (Array.isArray(value) ? value : []).map((item) => normalizeReaderQuestion(item)).filter(Boolean);
+
+  const normalizeChatMessage = (item = {}) => {
+    if (!item || (item.role !== 'user' && item.role !== 'model')) return null;
+    return {
+      role: item.role,
+      text: String(item.text || '')
+    };
+  };
+
+  const normalizeChatThread = (item = {}) => {
+    const id = String(item?.id || '').trim();
+    if (!id) return null;
+    return {
+      id,
+      title: String(item?.title || '新对话'),
+      messages: (Array.isArray(item?.messages) ? item.messages : [])
+        .map((message) => normalizeChatMessage(message))
+        .filter(Boolean),
+      createdAt: Number(item?.createdAt || Date.now()) || Date.now(),
+      updatedAt: Number(item?.updatedAt || Date.now()) || Date.now()
+    };
+  };
+
+  const normalizeAiConversationPayload = (value = {}) => {
+    const threads = (Array.isArray(value?.threads) ? value.threads : [])
+      .map((item) => normalizeChatThread(item))
+      .filter(Boolean);
+    const activeChatId = String(value?.activeChatId || '').trim();
+    return {
+      threads,
+      activeChatId: activeChatId && threads.some((thread) => thread.id === activeChatId) ? activeChatId : null
+    };
+  };
+
+  const normalizeMindmapStatePayload = (value) => cloneJsonValue(value, null);
+
+  const normalizeVersionedStateEnvelope = (value, normalizePayload) => {
+    if (!value || typeof value !== 'object' || !Object.prototype.hasOwnProperty.call(value, 'value')) {
+      return null;
+    }
+    return {
+      version: Math.max(1, Number(value?.version || 1) || 1),
+      baseVersion: Math.max(0, Number(value?.baseVersion ?? 0) || 0),
+      updatedAt: Number(value?.updatedAt || Date.now()) || Date.now(),
+      value: normalizePayload(value?.value)
+    };
+  };
+
+  const buildLegacyVersionedStateEnvelope = (value, normalizePayload, updatedAt) => ({
+    version: 1,
+    baseVersion: 0,
+    updatedAt: Number(updatedAt || Date.now()) || Date.now(),
+    value: normalizePayload(value)
+  });
+
+  const getQuestionsStateEntry = (state = {}) => {
+    const versioned = normalizeVersionedStateEnvelope(state?.questionsState, normalizeQuestionsPayload);
+    if (versioned) return versioned;
+    if (Array.isArray(state?.questions)) {
+      return buildLegacyVersionedStateEnvelope(state.questions, normalizeQuestionsPayload, state?.updatedAt);
+    }
+    return null;
+  };
+
+  const getMindmapStateEntry = (state = {}) => {
+    const versioned = normalizeVersionedStateEnvelope(state?.mindmapStateV2State, normalizeMindmapStatePayload);
+    if (versioned) return versioned;
+    if (Object.prototype.hasOwnProperty.call(state || {}, 'mindmapStateV2')) {
+      return buildLegacyVersionedStateEnvelope(
+        state?.mindmapStateV2,
+        normalizeMindmapStatePayload,
+        state?.updatedAt
+      );
+    }
+    return null;
+  };
+
+  const getAiConversationsStateEntry = (state = {}) => {
+    const versioned = normalizeVersionedStateEnvelope(state?.aiConversationsState, normalizeAiConversationPayload);
+    if (versioned) return versioned;
+    if (
+      Array.isArray(state?.aiConversations) ||
+      Object.prototype.hasOwnProperty.call(state || {}, 'activeChatId')
+    ) {
+      return buildLegacyVersionedStateEnvelope(
+        {
+          threads: state?.aiConversations,
+          activeChatId: state?.activeChatId
+        },
+        normalizeAiConversationPayload,
+        state?.updatedAt
+      );
+    }
+    return null;
+  };
+
+  const buildSyncedVersionedState = (entry) =>
+    entry
+      ? {
+          ...entry,
+          version: Math.max(1, Number(entry.version || 1) || 1),
+          baseVersion: Math.max(1, Number(entry.version || 1) || 1)
+        }
+      : null;
+
+  const chooseNewerVersionedState = (localEntry, remoteEntry) => {
+    if (Number(remoteEntry?.version || 0) > Number(localEntry?.version || 0)) return remoteEntry;
+    if (Number(localEntry?.version || 0) > Number(remoteEntry?.version || 0)) return localEntry;
+    return Number(remoteEntry?.updatedAt || 0) >= Number(localEntry?.updatedAt || 0) ? remoteEntry : localEntry;
+  };
+
+  const mergeVersionedState = (localEntry, remoteEntry, preferredSource = 'local') => {
+    if (!localEntry && !remoteEntry) return null;
+    if (!localEntry) return buildSyncedVersionedState(remoteEntry);
+    if (!remoteEntry) return {
+      ...localEntry,
+      value: cloneJsonValue(localEntry.value, null)
+    };
+
+    const localComparable = buildStateComparable(localEntry.value);
+    const remoteComparable = buildStateComparable(remoteEntry.value);
+    if (localComparable === remoteComparable) {
+      const preferred = chooseNewerVersionedState(localEntry, remoteEntry);
+      const syncedVersion = Math.max(
+        Math.max(1, Number(localEntry.version || 1) || 1),
+        Math.max(1, Number(remoteEntry.version || 1) || 1)
+      );
+      return {
+        ...preferred,
+        version: syncedVersion,
+        baseVersion: syncedVersion,
+        updatedAt: Math.max(
+          Number(localEntry.updatedAt || 0) || 0,
+          Number(remoteEntry.updatedAt || 0) || 0,
+          Number(preferred.updatedAt || 0) || 0
+        ),
+        value: cloneJsonValue(preferred.value, null)
+      };
+    }
+
+    if (Number(localEntry.version || 0) === Number(remoteEntry.baseVersion || 0)) {
+      return buildSyncedVersionedState(remoteEntry);
+    }
+    if (Number(remoteEntry.version || 0) === Number(localEntry.baseVersion || 0)) {
+      return {
+        ...localEntry,
+        value: cloneJsonValue(localEntry.value, null)
+      };
+    }
+
+    const localChanged = Number(localEntry.version || 0) > Number(localEntry.baseVersion || 0);
+    const remoteChanged = Number(remoteEntry.version || 0) > Number(remoteEntry.baseVersion || 0);
+    if (!localChanged && remoteChanged) {
+      return buildSyncedVersionedState(remoteEntry);
+    }
+    if (localChanged && !remoteChanged) {
+      return {
+        ...localEntry,
+        value: cloneJsonValue(localEntry.value, null)
+      };
+    }
+
+    if (preferredSource === 'remote') {
+      return buildSyncedVersionedState(remoteEntry);
+    }
+    return {
+      ...localEntry,
+      value: cloneJsonValue(localEntry.value, null)
+    };
+  };
+
+  const hasVersionedStateConflict = (localEntry, remoteEntry) => {
+    if (!localEntry || !remoteEntry) return false;
+    if (buildStateComparable(localEntry.value) === buildStateComparable(remoteEntry.value)) return false;
+    if (Number(localEntry.version || 0) === Number(remoteEntry.baseVersion || 0)) return false;
+    if (Number(remoteEntry.version || 0) === Number(localEntry.baseVersion || 0)) return false;
+    const localChanged = Number(localEntry.version || 0) > Number(localEntry.baseVersion || 0);
+    const remoteChanged = Number(remoteEntry.version || 0) > Number(remoteEntry.baseVersion || 0);
+    return localChanged && remoteChanged;
+  };
+
+  const collectConflictingStateSections = (localState = {}, remoteState = {}) => {
+    const conflicts = [];
+    if (hasVersionedStateConflict(getQuestionsStateEntry(localState), getQuestionsStateEntry(remoteState))) {
+      conflicts.push('questions');
+    }
+    if (hasVersionedStateConflict(getMindmapStateEntry(localState), getMindmapStateEntry(remoteState))) {
+      conflicts.push('mindmapStateV2');
+    }
+    if (
+      hasVersionedStateConflict(
+        getAiConversationsStateEntry(localState),
+        getAiConversationsStateEntry(remoteState)
+      )
+    ) {
+      conflicts.push('aiConversations');
+    }
+    return conflicts;
+  };
+
+  const mergeAnnotations = (localState = {}, remoteState = {}) => {
+    const localMap = new Map(getAnnotationsFromState(localState).map((item) => [String(item.id), item]));
+    const remoteMap = new Map(getAnnotationsFromState(remoteState).map((item) => [String(item.id), item]));
+    const merged = new Map();
+    const allIds = new Set([...localMap.keys(), ...remoteMap.keys()]);
+
+    Array.from(allIds).forEach((id) => {
+      const local = localMap.get(id) || null;
+      const remote = remoteMap.get(id) || null;
+      if (!local && remote) {
+        merged.set(id, remote);
+        return;
+      }
+      if (local && !remote) {
+        merged.set(id, local);
+        return;
+      }
+      if (!local || !remote) return;
+
+      if (
+        buildAnnotationComparable(local) === buildAnnotationComparable(remote) &&
+        Boolean(local.isDeleted) === Boolean(remote.isDeleted)
+      ) {
+        merged.set(
+          id,
+          Number(remote.version || 0) > Number(local.version || 0)
+            ? remote
+            : Number(local.version || 0) > Number(remote.version || 0)
+            ? local
+            : Number(remote.updatedAt || 0) >= Number(local.updatedAt || 0)
+            ? remote
+            : local
+        );
+        return;
+      }
+
+      if (Number(local.version || 0) === Number(remote.baseVersion || 0)) {
+        merged.set(id, remote);
+        return;
+      }
+      if (Number(remote.version || 0) === Number(local.baseVersion || 0)) {
+        merged.set(id, local);
+        return;
+      }
+
+      const localChanged = Number(local.version || 0) > Number(local.baseVersion || 0);
+      const remoteChanged = Number(remote.version || 0) > Number(remote.baseVersion || 0);
+      if (!localChanged && remoteChanged) {
+        merged.set(id, remote);
+        return;
+      }
+      if (localChanged && !remoteChanged) {
+        merged.set(id, local);
+        return;
+      }
+
+      merged.set(id, Number(remote.updatedAt || 0) >= Number(local.updatedAt || 0) ? remote : local);
+    });
+
+    return Array.from(merged.values()).sort((a, b) => {
+      const deletedA = a.isDeleted ? 1 : 0;
+      const deletedB = b.isDeleted ? 1 : 0;
+      if (deletedA !== deletedB) return deletedA - deletedB;
+      const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+      const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+      if (orderA !== orderB) return orderA - orderB;
+      return Number(a.updatedAt || 0) - Number(b.updatedAt || 0);
+    });
+  };
+
+  const mergePaperState = (localState = {}, remoteState = {}, preferredSource = 'local') => {
+    const preferred = preferredSource === 'remote' ? remoteState || {} : localState || {};
+    const {
+      docNodes: _docNodes,
+      highlights: _highlights,
+      customChapters: _customChapters,
+      questions: _questions,
+      questionsState: _questionsState,
+      mindmapStateV2: _mindmapStateV2,
+      mindmapStateV2State: _mindmapStateV2State,
+      aiConversations: _aiConversations,
+      activeChatId: _activeChatId,
+      aiConversationsState: _aiConversationsState,
+      ...preferredWithoutCache
+    } = preferred;
+    const annotations = mergeAnnotations(localState || {}, remoteState || {});
+    const questionsState = mergeVersionedState(
+      getQuestionsStateEntry(localState || {}),
+      getQuestionsStateEntry(remoteState || {}),
+      preferredSource
+    );
+    const mindmapStateV2State = mergeVersionedState(
+      getMindmapStateEntry(localState || {}),
+      getMindmapStateEntry(remoteState || {}),
+      preferredSource
+    );
+    const aiConversationsState = mergeVersionedState(
+      getAiConversationsStateEntry(localState || {}),
+      getAiConversationsStateEntry(remoteState || {}),
+      preferredSource
+    );
+    return {
+      ...preferredWithoutCache,
+      annotations,
+      questions: questionsState?.value || [],
+      questionsState,
+      mindmapStateV2: mindmapStateV2State?.value ?? null,
+      mindmapStateV2State,
+      aiConversations: aiConversationsState?.value?.threads || [],
+      activeChatId: aiConversationsState?.value?.activeChatId ?? null,
+      aiConversationsState
+    };
+  };
 
   const getPaperVersionInfo = (paper = {}) => {
     const normalized = normalizePaperForConflictCompare(paper);
@@ -272,6 +770,8 @@ const createWebDavSyncModule = (deps = {}) => {
     const remotePapers = Array.isArray(remoteData?.papers) ? remoteData.papers : [];
     const localPaperMap = buildPaperMap(localPapers);
     const remotePaperMap = buildPaperMap(remotePapers);
+    const localStateMap = buildStateMap(localData?.states);
+    const remoteStateMap = buildStateMap(remoteData?.states);
     const localFiles =
       localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
     const remoteFiles =
@@ -290,12 +790,15 @@ const createWebDavSyncModule = (deps = {}) => {
         const pdfFile = `${getPaperArticleId(paperId)}.pdf`;
         const localPdf = localFiles[pdfFile] || null;
         const remotePdf = remoteFiles[pdfFile] || null;
+        const localState = localStateMap.get(paperId) || {};
+        const remoteState = remoteStateMap.get(paperId) || {};
         const localVersion = Math.max(1, Number(localNormalized.version || 1) || 1);
         const remoteVersion = Math.max(1, Number(remoteNormalized.version || 1) || 1);
         const localBaseVersion = Math.max(0, Number(localNormalized.baseVersion || 0) || 0);
         const localChanged = localVersion > localBaseVersion;
         const remoteChanged = remoteVersion > localBaseVersion;
-        if (!(localChanged && remoteChanged)) return;
+        const stateConflicts = collectConflictingStateSections(localState, remoteState);
+        if (!(localChanged && remoteChanged) && !stateConflicts.length) return;
         conflicts.push({
           paperId,
           title: String(localPaper.title || remotePaper.title || paperId),
@@ -312,7 +815,8 @@ const createWebDavSyncModule = (deps = {}) => {
           localBaseVersion,
           localUpdatedAt: Number(localNormalized.updatedAt || 0),
           remoteUpdatedAt: Number(remoteNormalized.updatedAt || 0),
-          localBehindRemote: true
+          localBehindRemote: true,
+          stateConflicts
         });
       });
 
@@ -415,11 +919,17 @@ const createWebDavSyncModule = (deps = {}) => {
         const remoteChanged = remoteVersion > localBaseVersion;
         if (!localChanged && remoteChanged) {
           finalPaperMap.set(paperId, buildSyncedRemotePaper(remotePaper));
-          finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
+          finalStateMap.set(
+            paperId,
+            mergePaperState(localStateMap.get(paperId) || {}, remoteStateMap.get(paperId) || {}, 'remote')
+          );
           pdfSources.set(paperId, 'remote');
         } else if (localChanged && !remoteChanged) {
           finalPaperMap.set(paperId, localPaper);
-          finalStateMap.set(paperId, localStateMap.get(paperId) || {});
+          finalStateMap.set(
+            paperId,
+            mergePaperState(localStateMap.get(paperId) || {}, remoteStateMap.get(paperId) || {}, 'local')
+          );
           pdfSources.set(paperId, 'local');
           hasLocalAheadChanges = true;
         } else if (!localChanged && !remoteChanged) {
@@ -427,12 +937,19 @@ const createWebDavSyncModule = (deps = {}) => {
           finalPaperMap.set(paperId, resolvedPaper);
           finalStateMap.set(
             paperId,
-            remoteVersion >= localVersion ? remoteStateMap.get(paperId) || {} : localStateMap.get(paperId) || {}
+            mergePaperState(
+              localStateMap.get(paperId) || {},
+              remoteStateMap.get(paperId) || {},
+              remoteVersion >= localVersion ? 'remote' : 'local'
+            )
           );
           pdfSources.set(paperId, remoteVersion >= localVersion ? 'remote' : 'local');
         } else {
           finalPaperMap.set(paperId, localPaper);
-          finalStateMap.set(paperId, localStateMap.get(paperId) || {});
+          finalStateMap.set(
+            paperId,
+            mergePaperState(localStateMap.get(paperId) || {}, remoteStateMap.get(paperId) || {}, 'local')
+          );
           pdfSources.set(paperId, 'local');
           hasLocalAheadChanges = true;
         }
@@ -440,14 +957,14 @@ const createWebDavSyncModule = (deps = {}) => {
       }
       if (localPaper) {
         finalPaperMap.set(paperId, localPaper);
-        finalStateMap.set(paperId, localStateMap.get(paperId) || {});
+        finalStateMap.set(paperId, mergePaperState(localStateMap.get(paperId) || {}, {}, 'local'));
         pdfSources.set(paperId, 'local');
         hasLocalAheadChanges = true;
         return;
       }
       if (remotePaper) {
         finalPaperMap.set(paperId, buildSyncedRemotePaper(remotePaper));
-        finalStateMap.set(paperId, remoteStateMap.get(paperId) || {});
+        finalStateMap.set(paperId, mergePaperState({}, remoteStateMap.get(paperId) || {}, 'remote'));
         pdfSources.set(paperId, 'remote');
       }
     });
@@ -508,7 +1025,11 @@ const createWebDavSyncModule = (deps = {}) => {
       finalPaperMap.set(paperId, paper);
       finalStateMap.set(
         paperId,
-        source === 'local' ? localStateMap.get(paperId) || {} : remoteStateMap.get(paperId) || {}
+        mergePaperState(
+          localStateMap.get(paperId) || {},
+          remoteStateMap.get(paperId) || {},
+          source
+        )
       );
       pdfSources.set(paperId, source);
     });
@@ -563,10 +1084,17 @@ const createWebDavSyncModule = (deps = {}) => {
       const targetPath = path.join(paths.papersDir, fileName);
       const source = pdfSources.get(paperId) || 'local';
       if (source === 'remote') {
-        if (pendingWebDavConflict.remoteManifest?.files?.[fileName]) {
+        if (
+          pendingWebDavConflict.remoteManifest?.files?.[fileName] &&
+          shouldDownloadPdfFromRemote(
+            fileName,
+            pendingWebDavConflict.localManifest,
+            pendingWebDavConflict.remoteManifest
+          )
+        ) {
           // eslint-disable-next-line no-await-in-loop
           await downloadFileFromWebDav(client, `${remotePapersPath}/${fileName}`, targetPath);
-        } else {
+        } else if (!pendingWebDavConflict.remoteManifest?.files?.[fileName]) {
           // eslint-disable-next-line no-await-in-loop
           await removeFileIfExists(targetPath);
         }
@@ -633,6 +1161,26 @@ const createWebDavSyncModule = (deps = {}) => {
         return { success: false, skipped: true, reason: 'remote sqlite not found' };
       }
 
+      const lockWaitResult = await waitForRemoteLockRelease(client, remotePath);
+      if (!lockWaitResult.ok) {
+        const owner = formatRemoteLockOwner(lockWaitResult.lock);
+        const message = `云端正在由 ${owner} 同步，请稍后重试`;
+        console.log(`[webdav-sync] startup download skipped: remote lock still active (${owner})`);
+        emitWebDavSyncState({
+          active: false,
+          direction: 'download',
+          message
+        });
+        return {
+          success: false,
+          skipped: true,
+          locked: true,
+          reason: 'remote lock active',
+          owner,
+          message
+        };
+      }
+
       const conflict = await prepareWebDavConflictIfNeeded(client, remotePath, remoteSqlitePath);
       if (conflict) {
         emitWebDavSyncState({
@@ -680,6 +1228,15 @@ const createWebDavSyncModule = (deps = {}) => {
         expectedPdfFiles.add(fileName);
         if (merged.pdfSources.get(paperId) !== 'remote') continue;
         if (pendingWebDavConflict?.remoteManifest?.files?.[fileName]) {
+          if (
+            !shouldDownloadPdfFromRemote(
+              fileName,
+              pendingWebDavConflict.localManifest,
+              pendingWebDavConflict.remoteManifest
+            )
+          ) {
+            continue;
+          }
           const localPdfPath = path.join(paths.papersDir, fileName);
           // eslint-disable-next-line no-await-in-loop
           downloadedPdfBytes += await downloadFileFromWebDav(
@@ -809,6 +1366,15 @@ const createWebDavSyncModule = (deps = {}) => {
             if (merged.pdfSources.get(paperId) !== 'remote') continue;
             const fileName = `${getPaperArticleId(paperId)}.pdf`;
             if (!pendingWebDavConflict.remoteManifest?.files?.[fileName]) continue;
+            if (
+              !shouldDownloadPdfFromRemote(
+                fileName,
+                pendingWebDavConflict.localManifest,
+                pendingWebDavConflict.remoteManifest
+              )
+            ) {
+              continue;
+            }
             // eslint-disable-next-line no-await-in-loop
             await downloadFileFromWebDav(
               client,
@@ -871,6 +1437,7 @@ const createWebDavSyncModule = (deps = {}) => {
         `[webdav-sync] upload complete: sqlite=${sqliteBytes}B, pdfs=${uploadedPdfCount}, pdfBytes=${uploadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
       );
       markAllPapersBaseVersionCurrent();
+      await markPaperStateAnnotationsBaseVersionCurrent();
       setSyncPending(false);
       await clearPendingWebDavConflict();
       emitWebDavSyncState({

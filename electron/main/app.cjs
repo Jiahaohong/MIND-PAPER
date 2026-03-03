@@ -46,6 +46,8 @@ const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
 const DEFAULT_WEBDAV_REMOTE_PATH = '/mindpaper';
 const WEBDAV_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
+const WEBDAV_IDLE_SYNC_DELAY_MS = 90 * 1000;
+const WEBDAV_FALLBACK_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 
 let settingsLoaded = false;
 let writeChain = Promise.resolve();
@@ -69,6 +71,9 @@ let qdrantProcess = null;
 let qdrantStartedByApp = false;
 let summaryVectorSyncChain = Promise.resolve();
 let startupWebDavSyncPromise = null;
+let webdavIdleSyncTimer = null;
+let webdavFallbackSyncTimer = null;
+let webdavAutoSyncInFlight = false;
 const PROGRESS_STAGES = new Set([
   '开始解析基本信息',
   '完成解析基本信息',
@@ -153,6 +158,18 @@ const enqueueWrite = (task) => {
 };
 
 const flushWrites = () => writeChain;
+
+const clearWebDavIdleSyncTimer = () => {
+  if (!webdavIdleSyncTimer) return;
+  clearTimeout(webdavIdleSyncTimer);
+  webdavIdleSyncTimer = null;
+};
+
+const clearWebDavFallbackSyncTimer = () => {
+  if (!webdavFallbackSyncTimer) return;
+  clearInterval(webdavFallbackSyncTimer);
+  webdavFallbackSyncTimer = null;
+};
 
 const resolveLibraryPath = (value) => {
   const raw = String(value || '').trim();
@@ -256,7 +273,8 @@ const {
   releaseWebDavLock,
   clearWebDavLock,
   readRemoteJsonFile,
-  writeRemoteJsonFile
+  writeRemoteJsonFile,
+  webdavLockOwner
 } = webDavModule;
 
 const buildOpenAIUrl = (baseUrl) => {
@@ -1562,7 +1580,7 @@ const {
   getLibraryKv,
   setLibraryKv,
   getSyncPending,
-  setSyncPending,
+  setSyncPending: setRawSyncPending,
   deletePaperStatesFromSqlite,
   deletePapersFromSqlite,
   mapSqlitePaperRow,
@@ -1575,6 +1593,7 @@ const {
   savePaperStateToSqlite,
   loadPaperStateFromSqlite,
   loadPaperStatesFromSqlite,
+  markPaperStateAnnotationsBaseVersionCurrent,
   ensureLibraryStoreReady,
   ensureLibrary
 } = sqliteModule;
@@ -2181,6 +2200,7 @@ const webDavSyncModule = createWebDavSyncModule({
   getWebDavConfigFromSettings,
   getWebDavCredential,
   createWebDavClient,
+  webdavLockOwner,
   ensureWebDavLock,
   releaseWebDavLock,
   loadFoldersFromSqlite,
@@ -2191,6 +2211,7 @@ const webDavSyncModule = createWebDavSyncModule({
   savePapersToSqlite,
   markAllPapersBaseVersionCurrent,
   savePaperStateToSqlite,
+  markPaperStateAnnotationsBaseVersionCurrent,
   deletePaperStatesFromSqlite,
   setSyncPending,
   getSyncPending,
@@ -2236,6 +2257,70 @@ registerWebDavSyncIpc({
   resolveWebDavConflicts
 });
 
+async function runBackgroundWebDavSync() {
+  if (isForceQuitting) return { success: false, skipped: true, reason: 'quitting' };
+  if (startupWebDavSyncPromise) return { success: false, skipped: true, reason: 'startup sync running' };
+  if (webdavAutoSyncInFlight) return { success: false, skipped: true, reason: 'auto sync already running' };
+  if (getWebDavSyncState()?.active) return { success: false, skipped: true, reason: 'sync already active' };
+  if (pendingWrites > 0) return { success: false, skipped: true, reason: 'pending local writes' };
+  if (!getSyncPending()) return { success: false, skipped: true, reason: 'nothing pending' };
+
+  webdavAutoSyncInFlight = true;
+  try {
+    await ensureLibraryStoreReady();
+    await flushWrites();
+    if (!getSyncPending()) {
+      return { success: false, skipped: true, reason: 'nothing pending after flush' };
+    }
+    console.log('[webdav-sync] background auto-sync start');
+    const result = await syncLibraryToWebDav();
+    console.log(
+      `[webdav-sync] background auto-sync done: success=${Boolean(result?.success)} skipped=${Boolean(
+        result?.skipped
+      )}`
+    );
+    return result;
+  } catch (error) {
+    console.warn('[webdav-sync] background auto-sync failed:', error?.message || error);
+    return {
+      success: false,
+      error: error?.message || 'background auto-sync failed'
+    };
+  } finally {
+    webdavAutoSyncInFlight = false;
+  }
+}
+
+function scheduleIdleBackgroundWebDavSync(delayMs = WEBDAV_IDLE_SYNC_DELAY_MS) {
+  if (isForceQuitting) return;
+  clearWebDavIdleSyncTimer();
+  webdavIdleSyncTimer = setTimeout(() => {
+    void runBackgroundWebDavSync();
+  }, Math.max(0, Number(delayMs || 0)));
+  if (typeof webdavIdleSyncTimer?.unref === 'function') {
+    webdavIdleSyncTimer.unref();
+  }
+}
+
+function ensureFallbackBackgroundWebDavSync() {
+  if (isForceQuitting || webdavFallbackSyncTimer) return;
+  webdavFallbackSyncTimer = setInterval(() => {
+    void runBackgroundWebDavSync();
+  }, WEBDAV_FALLBACK_SYNC_INTERVAL_MS);
+  if (typeof webdavFallbackSyncTimer?.unref === 'function') {
+    webdavFallbackSyncTimer.unref();
+  }
+}
+
+function setSyncPending(value) {
+  setRawSyncPending(value);
+  if (Boolean(value)) {
+    scheduleIdleBackgroundWebDavSync(WEBDAV_IDLE_SYNC_DELAY_MS);
+    return;
+  }
+  clearWebDavIdleSyncTimer();
+}
+
 registerLibraryIpc({
   ipcMain,
   enqueueWrite,
@@ -2255,7 +2340,7 @@ registerLibraryIpc({
   removeFileIfExists,
   deletePapersFromSqlite: sqliteModule.deletePapersFromSqlite,
   deletePaperVectorPoints,
-  setSyncPending: sqliteModule.setSyncPending
+  setSyncPending
 });
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
@@ -2596,8 +2681,13 @@ app.whenReady().then(() => {
       console.warn('[webdav-sync] startup download failed:', error?.message || error);
     } finally {
       startupWebDavSyncPromise = null;
+      if (getSyncPending()) {
+        scheduleIdleBackgroundWebDavSync(WEBDAV_IDLE_SYNC_DELAY_MS);
+      }
     }
   })();
+
+  ensureFallbackBackgroundWebDavSync();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -2610,15 +2700,10 @@ app.on('before-quit', (event) => {
   if (isForceQuitting) return;
   event.preventDefault();
   isForceQuitting = true;
-  Promise.allSettled([flushWrites().then(() => summaryVectorSyncChain)])
+  clearWebDavIdleSyncTimer();
+  clearWebDavFallbackSyncTimer();
+  Promise.resolve()
     .then(async () => {
-      if (getSyncPending()) {
-        try {
-          await syncLibraryToWebDav();
-        } catch (error) {
-          console.warn('[webdav-sync] quit upload skipped:', error?.message || error);
-        }
-      }
       await releaseWebDavLock();
       try {
         await stopManagedQdrant();

@@ -19,7 +19,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
-import { Paper, PaperReference, TOCItem, ReaderMode, AssistantTab, Message } from '../types';
+import { Paper, PaperReference, TOCItem, ReaderMode, AssistantTab, Message, DocNode } from '../types';
 import { MOCK_TOC } from '../constants';
 import type { MindMapLayout, MindMapNode } from './MindMap';
 import { Tooltip } from './Tooltip';
@@ -33,6 +33,7 @@ import {
   buildMindmapStateV2FromOutline,
   deriveLegacyMindmapDataFromV2,
   mergeLegacyParentOverridesIntoCustomChapters,
+  type MindmapStateV2,
   normalizeLegacyParentOverrides,
   parseMindmapStateV2
 } from '../utils/mindmapStateV2';
@@ -178,14 +179,20 @@ type HighlightItem = {
   text: string;
   color: string;
   pageIndex: number;
+  topRatio?: number | null;
   rects: HighlightRect[];
   chapterId: string;
+  parentId?: string | null;
   isChapterTitle: boolean;
   chapterNodeId?: string | null;
   translation?: string;
   questionIds?: string[];
   source?: 'pdf' | 'manual';
   order?: number;
+  version?: number;
+  baseVersion?: number;
+  updatedAt?: number;
+  isDeleted?: boolean;
 };
 
 type ChatThread = {
@@ -194,6 +201,23 @@ type ChatThread = {
   messages: Message[];
   createdAt: number;
   updatedAt: number;
+};
+
+type ReaderQuestion = {
+  id: string;
+  text: string;
+};
+
+type VersionedStateEnvelope<T> = {
+  version: number;
+  baseVersion: number;
+  updatedAt: number;
+  value: T;
+};
+
+type AiConversationSyncPayload = {
+  threads: ChatThread[];
+  activeChatId: string | null;
 };
 
 type MindmapDropPosition = 'before' | 'after' | 'inside';
@@ -217,6 +241,716 @@ const HIGHLIGHT_COLORS = [
   { id: 'rose', swatch: '#f87171', fill: 'rgba(248, 113, 113, 0.35)' }
 ];
 const SHOW_MINDMAP_DROP_DEBUG = false;
+
+const normalizeReaderQuestion = (item: any): ReaderQuestion | null => {
+  const id = String(item?.id || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    text: String(item?.text || '').trim()
+  };
+};
+
+const normalizeQuestionsPayload = (value: unknown): ReaderQuestion[] =>
+  (Array.isArray(value) ? value : [])
+    .map((item) => normalizeReaderQuestion(item))
+    .filter(Boolean) as ReaderQuestion[];
+
+const normalizeChatMessage = (item: any): Message | null => {
+  if (!item || (item.role !== 'user' && item.role !== 'model')) return null;
+  return {
+    role: item.role,
+    text: String(item.text || '')
+  };
+};
+
+const normalizeChatThread = (item: any): ChatThread | null => {
+  const id = String(item?.id || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    title: String(item?.title || '新对话'),
+    messages: (Array.isArray(item?.messages) ? item.messages : [])
+      .map((msg) => normalizeChatMessage(msg))
+      .filter(Boolean) as Message[],
+    createdAt: Number(item?.createdAt || Date.now()) || Date.now(),
+    updatedAt: Number(item?.updatedAt || Date.now()) || Date.now()
+  };
+};
+
+const normalizeAiConversationPayload = (
+  threads: unknown,
+  activeChatId?: unknown
+): AiConversationSyncPayload => {
+  const normalizedThreads = (Array.isArray(threads) ? threads : [])
+    .map((item) => normalizeChatThread(item))
+    .filter(Boolean) as ChatThread[];
+  const nextActiveChatId = String(activeChatId || '').trim();
+  return {
+    threads: normalizedThreads,
+    activeChatId:
+      nextActiveChatId && normalizedThreads.some((thread) => thread.id === nextActiveChatId)
+        ? nextActiveChatId
+        : null
+  };
+};
+
+const normalizeMindmapStateForSync = (value: unknown): MindmapStateV2 | null =>
+  value == null ? null : parseMindmapStateV2(value);
+
+const normalizeVersionedStateEnvelope = <T,>(
+  value: unknown,
+  normalizePayload: (payload: unknown) => T
+): VersionedStateEnvelope<T> | null => {
+  if (!value || typeof value !== 'object' || !('value' in (value as Record<string, unknown>))) {
+    return null;
+  }
+  const envelope = value as Record<string, unknown>;
+  return {
+    version: Math.max(1, Number(envelope.version || 1) || 1),
+    baseVersion: Math.max(0, Number(envelope.baseVersion ?? 0) || 0),
+    updatedAt: Number(envelope.updatedAt || Date.now()) || Date.now(),
+    value: normalizePayload(envelope.value)
+  };
+};
+
+const buildStateComparable = (value: unknown) => JSON.stringify(value ?? null);
+
+const buildNextVersionedState = <T,>(
+  previous: VersionedStateEnvelope<T> | null,
+  value: T
+): VersionedStateEnvelope<T> => {
+  const now = Date.now();
+  if (!previous) {
+    return {
+      version: 1,
+      baseVersion: 0,
+      updatedAt: now,
+      value
+    };
+  }
+  if (buildStateComparable(previous.value) === buildStateComparable(value)) {
+    return {
+      ...previous,
+      value
+    };
+  }
+  return {
+    version: Math.max(1, Number(previous.version || 1) || 1) + 1,
+    baseVersion: Math.max(0, Number(previous.baseVersion ?? 0) || 0),
+    updatedAt: now,
+    value
+  };
+};
+
+const getSavedQuestionsState = (saved: any): VersionedStateEnvelope<ReaderQuestion[]> | null => {
+  const versioned = normalizeVersionedStateEnvelope(saved?.questionsState, normalizeQuestionsPayload);
+  if (versioned) return versioned;
+  if (Array.isArray(saved?.questions)) {
+    return {
+      version: 1,
+      baseVersion: 0,
+      updatedAt: Number(saved?.updatedAt || Date.now()) || Date.now(),
+      value: normalizeQuestionsPayload(saved.questions)
+    };
+  }
+  return null;
+};
+
+const getSavedMindmapState = (saved: any): VersionedStateEnvelope<MindmapStateV2 | null> | null => {
+  const versioned = normalizeVersionedStateEnvelope(
+    saved?.mindmapStateV2State,
+    normalizeMindmapStateForSync
+  );
+  if (versioned) return versioned;
+  if (Object.prototype.hasOwnProperty.call(saved || {}, 'mindmapStateV2')) {
+    return {
+      version: 1,
+      baseVersion: 0,
+      updatedAt: Number(saved?.updatedAt || Date.now()) || Date.now(),
+      value: normalizeMindmapStateForSync(saved?.mindmapStateV2)
+    };
+  }
+  return null;
+};
+
+const getSavedAiConversationState = (
+  saved: any
+): VersionedStateEnvelope<AiConversationSyncPayload> | null => {
+  const versioned = normalizeVersionedStateEnvelope(saved?.aiConversationsState, (payload: any) =>
+    normalizeAiConversationPayload(payload?.threads, payload?.activeChatId)
+  );
+  if (versioned) return versioned;
+  if (
+    Array.isArray(saved?.aiConversations) ||
+    Object.prototype.hasOwnProperty.call(saved || {}, 'activeChatId')
+  ) {
+    return {
+      version: 1,
+      baseVersion: 0,
+      updatedAt: Number(saved?.updatedAt || Date.now()) || Date.now(),
+      value: normalizeAiConversationPayload(saved?.aiConversations, saved?.activeChatId)
+    };
+  }
+  return null;
+};
+
+const normalizeHighlightRect = (rect: any): HighlightRect => ({
+  pageIndex: Number(rect?.pageIndex || 0),
+  x: Number(rect?.x || 0),
+  y: Number(rect?.y || 0),
+  w: Number(rect?.w || 0),
+  h: Number(rect?.h || 0)
+});
+
+const buildHighlightComparable = (item: Partial<HighlightItem>) =>
+  JSON.stringify({
+    text: String(item?.text || '').trim(),
+    color: String(item?.color || '').trim(),
+    pageIndex: Number(item?.pageIndex || 0),
+    topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0),
+    rects: Array.isArray(item?.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+    chapterId: String(item?.chapterId || '').trim(),
+    parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+    isChapterTitle: Boolean(item?.isChapterTitle),
+    chapterNodeId: item?.chapterNodeId == null ? null : String(item.chapterNodeId),
+    translation: String(item?.translation || '').trim(),
+    questionIds: Array.isArray(item?.questionIds) ? item.questionIds.filter(Boolean) : [],
+    source: item?.source === 'manual' ? 'manual' : 'pdf',
+    order: typeof item?.order === 'number' ? item.order : undefined
+  });
+
+const normalizeSyncedHighlight = (item: any): HighlightItem | null => {
+  const id = String(item?.id || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    text: String(item?.text || '').trim(),
+    color: String(item?.color || '').trim(),
+    pageIndex: Number(item?.pageIndex || 0),
+    topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0),
+    rects: Array.isArray(item?.rects) ? item.rects.map((rect: any) => normalizeHighlightRect(rect)) : [],
+    chapterId: String(item?.chapterId || '').trim(),
+    parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+    isChapterTitle: Boolean(item?.isChapterTitle),
+    chapterNodeId: item?.chapterNodeId == null ? null : String(item.chapterNodeId),
+    translation: String(item?.translation || '').trim(),
+    questionIds: Array.isArray(item?.questionIds)
+      ? item.questionIds.map((value: any) => String(value || '').trim()).filter(Boolean)
+      : [],
+    source: item?.source === 'manual' ? 'manual' : 'pdf',
+    order: typeof item?.order === 'number' ? item.order : undefined,
+    version: Math.max(1, Number(item?.version || 1) || 1),
+    baseVersion: Math.max(0, Number(item?.baseVersion ?? 0) || 0),
+    updatedAt: Number(item?.updatedAt || 0) || Date.now(),
+    isDeleted: Boolean(item?.isDeleted)
+  };
+};
+
+const getLegacyHighlightAnnotations = (saved: any) => {
+  const source = Array.isArray(saved?.highlights) ? saved.highlights : [];
+  return source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[];
+};
+
+const getAnnotationsFromSavedState = (saved: any): HighlightItem[] => {
+  const source = Array.isArray(saved?.annotations) ? saved.annotations : [];
+  return source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[];
+};
+
+const getVisibleHighlights = (annotations: HighlightItem[]) =>
+  annotations.filter((item) => !item.isDeleted);
+
+const buildAnnotationsForSave = (
+  currentHighlights: HighlightItem[],
+  previousAnnotations: HighlightItem[]
+): HighlightItem[] => {
+  const now = Date.now();
+  const previousMap = new Map(
+    (Array.isArray(previousAnnotations) ? previousAnnotations : [])
+      .map((item) => normalizeSyncedHighlight(item))
+      .filter(Boolean)
+      .map((item) => [String(item!.id), item!])
+  );
+  const currentMap = new Map(
+    (Array.isArray(currentHighlights) ? currentHighlights : [])
+      .map((item) => normalizeSyncedHighlight(item))
+      .filter(Boolean)
+      .map((item) => [String(item!.id), item!])
+  );
+  const merged = new Map<string, HighlightItem>();
+  const allIds = new Set([...previousMap.keys(), ...currentMap.keys()]);
+
+  Array.from(allIds).forEach((id) => {
+    const previous = previousMap.get(id) || null;
+    const current = currentMap.get(id) || null;
+
+    if (!previous && current) {
+      merged.set(id, {
+        ...current,
+        version: Math.max(1, Number(current.version || 1) || 1),
+        baseVersion: Math.max(0, Number(current.baseVersion ?? 0) || 0),
+        updatedAt: Number(current.updatedAt || now) || now,
+        isDeleted: false
+      });
+      return;
+    }
+
+    if (previous && !current) {
+      if (previous.isDeleted) {
+        merged.set(id, previous);
+        return;
+      }
+      merged.set(id, {
+        ...previous,
+        isDeleted: true,
+        version: Math.max(1, Number(previous.version || 1) || 1) + 1,
+        baseVersion: Math.max(0, Number(previous.baseVersion ?? 0) || 0),
+        updatedAt: now
+      });
+      return;
+    }
+
+    if (previous && current) {
+      const same = buildHighlightComparable(previous) === buildHighlightComparable(current);
+      if (same && previous.isDeleted === current.isDeleted) {
+        merged.set(id, {
+          ...current,
+          version: Math.max(1, Number(previous.version || current.version || 1) || 1),
+          baseVersion: Math.max(0, Number(previous.baseVersion ?? current.baseVersion ?? 0) || 0),
+          updatedAt: Number(previous.updatedAt || current.updatedAt || now) || now,
+          isDeleted: Boolean(previous.isDeleted)
+        });
+        return;
+      }
+      merged.set(id, {
+        ...current,
+        version: Math.max(1, Number(previous.version || 1) || 1) + 1,
+        baseVersion: Math.max(0, Number(previous.baseVersion ?? 0) || 0),
+        updatedAt: now,
+        isDeleted: false
+      });
+    }
+  });
+
+  return Array.from(merged.values()).sort((a, b) => {
+    const deletedA = a.isDeleted ? 1 : 0;
+    const deletedB = b.isDeleted ? 1 : 0;
+    if (deletedA !== deletedB) return deletedA - deletedB;
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return Number(a.updatedAt || 0) - Number(b.updatedAt || 0);
+  });
+};
+
+const dedupeChapterAnnotations = (annotations: HighlightItem[]) => {
+  const noteItems: HighlightItem[] = [];
+  const chapterGroups = new Map<string, HighlightItem[]>();
+  (Array.isArray(annotations) ? annotations : []).forEach((item) => {
+    if (!item?.isChapterTitle) {
+      noteItems.push(item);
+      return;
+    }
+    const key = String(item.chapterNodeId || item.chapterId || item.id).trim();
+    const list = chapterGroups.get(key) || [];
+    list.push(item);
+    chapterGroups.set(key, list);
+  });
+  const chapterItems = Array.from(chapterGroups.entries()).map(([, items]) => {
+    const sorted = items
+      .slice()
+      .sort((a, b) => {
+        const pdfA = a.source === 'pdf' ? 1 : 0;
+        const pdfB = b.source === 'pdf' ? 1 : 0;
+        if (pdfA !== pdfB) return pdfB - pdfA;
+        return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+      });
+    const preferred = sorted[0];
+    const withFallback = sorted.find((item) => item.parentId || typeof item.topRatio === 'number');
+    return {
+      ...preferred,
+      parentId: preferred.parentId ?? withFallback?.parentId ?? null,
+      topRatio:
+        preferred.topRatio ??
+        (typeof withFallback?.topRatio === 'number' ? withFallback.topRatio : null),
+      order:
+        typeof preferred.order === 'number'
+          ? preferred.order
+          : typeof withFallback?.order === 'number'
+            ? withFallback.order
+            : undefined
+    };
+  });
+  return sortHighlightItems([...noteItems, ...chapterItems]);
+};
+
+const buildDocNodesFromCurrentState = (
+  paperId: string,
+  baseOutline: OutlineNode[],
+  annotations: HighlightItem[]
+): DocNode[] => {
+  const nodes: DocNode[] = [];
+  const root = Array.isArray(baseOutline) ? baseOutline[0] : null;
+  if (!root) return nodes;
+
+  const walkNative = (items: OutlineNode[], parentId: string | null) => {
+    items.forEach((node, index) => {
+      const isRoot = Boolean(node.isRoot);
+      nodes.push({
+        id: node.id,
+        paperId,
+        kind: isRoot ? 'root' : 'native_chapter',
+        parentId,
+        order: typeof node.order === 'number' ? node.order : index,
+        text: String(node.title || '').trim(),
+        pageIndex: node.pageIndex,
+        topRatio: node.topRatio,
+        sourceId: node.id
+      });
+      if (Array.isArray(node.items) && node.items.length) {
+        walkNative(node.items, node.id);
+      }
+    });
+  };
+
+  walkNative(baseOutline, null);
+
+  const chapterMap = new Map<string, DocNode>();
+  annotations.forEach((item, index) => {
+    const manual = item.source === 'manual' || !Array.isArray(item.rects) || !item.rects.length;
+    if (item.isChapterTitle) {
+      const chapterId = String(item.chapterNodeId || item.chapterId || `chapter-${item.id}`).trim();
+      const existing = chapterMap.get(chapterId);
+      chapterMap.set(chapterId, {
+        id: chapterId,
+        paperId,
+        kind: manual ? 'normal_chapter' : 'highlight_chapter',
+        parentId:
+          existing?.parentId ||
+          (item.parentId || (item.chapterId && item.chapterId !== chapterId ? item.chapterId : root.id)),
+        order:
+          typeof item.order === 'number'
+            ? item.order
+            : typeof existing?.order === 'number'
+              ? existing.order
+              : index,
+        text: String(item.text || existing?.text || '').trim(),
+        pageIndex: item.pageIndex ?? existing?.pageIndex ?? null,
+        topRatio: item.topRatio ?? existing?.topRatio ?? null,
+        color: item.color,
+        translation: item.translation,
+        questionIds: Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [],
+        source: item.source === 'manual' ? 'manual' : 'pdf',
+        sourceId: item.id,
+        chapterNodeId: chapterId,
+        rects: Array.isArray(item.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+        version: Math.max(1, Number(item.version || existing?.version || 1) || 1),
+        baseVersion: Math.max(0, Number(item.baseVersion ?? existing?.baseVersion ?? 0) || 0),
+        updatedAt: Number(item.updatedAt || existing?.updatedAt || Date.now()) || Date.now(),
+        isDeleted: Boolean(item.isDeleted)
+      });
+      return;
+    }
+    nodes.push({
+      id: `highlight-${item.id}`,
+      paperId,
+      kind: manual ? 'normal_note' : 'highlight_note',
+      parentId: item.chapterId || root.id,
+      order: typeof item.order === 'number' ? item.order : index,
+      text: String(item.text || '').trim(),
+      pageIndex: item.pageIndex,
+      topRatio: item.topRatio ?? null,
+      color: item.color,
+      translation: item.translation,
+      questionIds: Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [],
+      source: item.source === 'manual' ? 'manual' : 'pdf',
+      sourceId: item.id,
+      chapterNodeId: item.chapterNodeId ?? null,
+      rects: Array.isArray(item.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+      version: Math.max(1, Number(item.version || 1) || 1),
+      baseVersion: Math.max(0, Number(item.baseVersion ?? 0) || 0),
+      updatedAt: Number(item.updatedAt || Date.now()) || Date.now(),
+      isDeleted: Boolean(item.isDeleted)
+    });
+  });
+
+  nodes.push(...chapterMap.values());
+  return nodes;
+};
+
+const sortHighlightItems = (items: HighlightItem[]) =>
+  items.slice().sort((a, b) => {
+    const deletedA = a.isDeleted ? 1 : 0;
+    const deletedB = b.isDeleted ? 1 : 0;
+    if (deletedA !== deletedB) return deletedA - deletedB;
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    return Number(a.updatedAt || 0) - Number(b.updatedAt || 0);
+  });
+
+const buildCustomChaptersFromDocNodes = (docNodes: DocNode[]): OutlineNode[] =>
+  (Array.isArray(docNodes) ? docNodes : [])
+    .filter((item) => item && !item.isDeleted && (item.kind === 'normal_chapter' || item.kind === 'highlight_chapter'))
+    .map((item) => ({
+      id: item.id,
+      title: item.text,
+      pageIndex: item.pageIndex ?? null,
+      topRatio: item.topRatio ?? null,
+      items: [],
+      isCustom: true,
+      parentId: item.parentId ?? null,
+      createdAt: Number(item.updatedAt || Date.now()),
+      order: typeof item.order === 'number' ? item.order : undefined
+    }));
+
+const buildAnnotationsFromDocNodes = (docNodes: DocNode[]): HighlightItem[] => {
+  const items: HighlightItem[] = [];
+  (Array.isArray(docNodes) ? docNodes : []).forEach((item) => {
+    if (!item) return;
+    if (item.kind === 'highlight_note' || item.kind === 'normal_note') {
+      items.push({
+        id: String(item.sourceId || item.id.replace(/^highlight-/, '')).trim(),
+        text: item.text,
+        color: item.color || HIGHLIGHT_COLORS[0].fill,
+        pageIndex: Number(item.pageIndex || 0),
+        topRatio: item.topRatio ?? null,
+        rects: Array.isArray(item.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+        chapterId: String(item.parentId || '').trim(),
+        parentId: null,
+        isChapterTitle: false,
+        chapterNodeId: item.chapterNodeId ?? null,
+        translation: item.translation || '',
+        questionIds: Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [],
+        source: item.source === 'manual' ? 'manual' : 'pdf',
+        order: typeof item.order === 'number' ? item.order : undefined,
+        version: item.version,
+        baseVersion: item.baseVersion,
+        updatedAt: item.updatedAt,
+        isDeleted: Boolean(item.isDeleted)
+      });
+      return;
+    }
+    if ((item.kind === 'highlight_chapter' || item.kind === 'normal_chapter') && item.sourceId) {
+      items.push({
+        id: String(item.sourceId || `chapter-${item.id}`).trim(),
+        text: item.text,
+        color: item.color || 'rgba(107, 114, 128, 0.35)',
+        pageIndex: Number(item.pageIndex || 0),
+        topRatio: item.topRatio ?? null,
+        rects: Array.isArray(item.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+        chapterId: item.id,
+        parentId: item.parentId ?? null,
+        isChapterTitle: true,
+        chapterNodeId: item.id,
+        translation: item.translation || '',
+        questionIds: Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [],
+        source: item.source === 'manual' ? 'manual' : 'pdf',
+        order: typeof item.order === 'number' ? item.order : undefined,
+        version: item.version,
+        baseVersion: item.baseVersion,
+        updatedAt: item.updatedAt,
+        isDeleted: Boolean(item.isDeleted)
+      });
+    }
+  });
+  return dedupeChapterAnnotations(items);
+};
+
+const buildChapterAnnotationsFromOutlineNodes = (
+  customChapters: OutlineNode[],
+  previousAnnotations: HighlightItem[]
+) => {
+  const chapterLookup = new Map<string, HighlightItem>();
+  previousAnnotations.forEach((item) => {
+    if (!item?.isChapterTitle) return;
+    const key = String(item.chapterNodeId || item.chapterId || item.id).trim();
+    if (!key) return;
+    chapterLookup.set(key, item);
+  });
+  return dedupeChapterAnnotations(
+    customChapters.map((chapter, index) => {
+      const key = String(chapter.id || '').trim();
+      const previous = chapterLookup.get(key);
+      const annotationId = String(previous?.id || `chapter-${key}`).trim();
+      return normalizeSyncedHighlight({
+        ...(previous || {}),
+        id: annotationId,
+        text: chapter.title,
+        color: previous?.color || 'rgba(107, 114, 128, 0.35)',
+        pageIndex: Number(chapter.pageIndex || 0),
+        topRatio: chapter.topRatio ?? null,
+        rects: Array.isArray(previous?.rects) ? previous.rects : [],
+        chapterId: key,
+        parentId: chapter.parentId ?? null,
+        isChapterTitle: true,
+        chapterNodeId: key,
+        translation: previous?.translation || '',
+        questionIds: Array.isArray(previous?.questionIds) ? previous.questionIds : [],
+        source: previous?.source === 'pdf' ? 'pdf' : 'manual',
+        order:
+          typeof chapter.order === 'number'
+            ? chapter.order
+            : typeof previous?.order === 'number'
+              ? previous.order
+              : index,
+        version: previous?.version,
+        baseVersion: previous?.baseVersion,
+        updatedAt: previous?.updatedAt ?? chapter.createdAt ?? Date.now(),
+        isDeleted: false
+      }) as HighlightItem;
+    })
+  );
+};
+
+const getLegacyCustomChaptersFromSavedState = (saved: any, paperId: string) => {
+  const parsedMindmapStateV2 = parseMindmapStateV2(
+    (saved as any)?.mindmapStateV2State?.value ?? (saved as any)?.mindmapStateV2
+  );
+  if (parsedMindmapStateV2) {
+    const legacy = deriveLegacyMindmapDataFromV2(parsedMindmapStateV2, {
+      rootIdAlias: `outline-root-${paperId}`
+    });
+    return Array.isArray(legacy.customChapters) ? (legacy.customChapters as OutlineNode[]) : [];
+  }
+  const savedCustomChapters = Array.isArray(saved?.customChapters)
+    ? (saved.customChapters as OutlineNode[])
+    : [];
+  const legacyOverrides = normalizeLegacyParentOverrides((saved as any)?.chapterParentOverrides);
+  return mergeLegacyParentOverridesIntoCustomChapters(savedCustomChapters, legacyOverrides);
+};
+
+const migrateLegacyStateAnnotations = (saved: any, paperId: string, normalizedAnnotations: HighlightItem[]) => {
+  const legacyCustomChapters = getLegacyCustomChaptersFromSavedState(saved, paperId);
+  const legacyHighlights = getLegacyHighlightAnnotations(saved);
+  const mergedBase = dedupeChapterAnnotations([...normalizedAnnotations, ...legacyHighlights]);
+  if (!legacyCustomChapters.length) return mergedBase;
+  return dedupeChapterAnnotations([
+    ...mergedBase,
+    ...buildChapterAnnotationsFromOutlineNodes(legacyCustomChapters, mergedBase)
+  ]);
+};
+
+const sortOutlineTreeNodes = (nodes: OutlineNode[]) => {
+  const sorted = [...(nodes || [])].sort((a, b) => {
+    const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+    const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+    if (orderA !== orderB) return orderA - orderB;
+    if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+    if ((a.topRatio ?? 0) !== (b.topRatio ?? 0)) return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+    return String(a.title || '').localeCompare(String(b.title || ''), undefined, { sensitivity: 'base' });
+  });
+  return sorted.map((node) => ({
+    ...node,
+    items: sortOutlineTreeNodes(node.items || [])
+  }));
+};
+
+const buildOutlineFromDocNodes = (
+  paperId: string,
+  docNodes: DocNode[],
+  fallbackRoot?: { id?: string; title?: string; pageIndex?: number | null; topRatio?: number | null }
+): OutlineNode[] => {
+  const chapterKinds = new Set<DocNode['kind']>(['root', 'native_chapter', 'highlight_chapter', 'normal_chapter']);
+  const chapterNodes = (Array.isArray(docNodes) ? docNodes : []).filter(
+    (item) => item && !item.isDeleted && chapterKinds.has(item.kind)
+  );
+  const rootDoc =
+    chapterNodes.find((item) => item.kind === 'root') ||
+    ({
+      id: fallbackRoot?.id || `outline-root-${paperId}`,
+      paperId,
+      kind: 'root',
+      parentId: null,
+      order: 0,
+      text: fallbackRoot?.title || 'Document',
+      pageIndex: fallbackRoot?.pageIndex ?? 0,
+      topRatio: fallbackRoot?.topRatio ?? 0
+    } satisfies DocNode);
+
+  const outlineMap = new Map<string, OutlineNode>();
+  chapterNodes.forEach((item) => {
+    outlineMap.set(item.id, {
+      id: item.id,
+      title: item.text,
+      pageIndex: item.pageIndex ?? null,
+      topRatio: item.topRatio ?? null,
+      items: [],
+      isRoot: item.kind === 'root',
+      isCustom: item.kind === 'highlight_chapter' || item.kind === 'normal_chapter',
+      parentId: item.parentId ?? null,
+      createdAt: Number(item.updatedAt || Date.now()),
+      order: typeof item.order === 'number' ? item.order : undefined
+    });
+  });
+  if (!outlineMap.has(rootDoc.id)) {
+    outlineMap.set(rootDoc.id, {
+      id: rootDoc.id,
+      title: rootDoc.text,
+      pageIndex: rootDoc.pageIndex ?? null,
+      topRatio: rootDoc.topRatio ?? null,
+      items: [],
+      isRoot: true,
+      parentId: null,
+      createdAt: Number(rootDoc.updatedAt || Date.now()),
+      order: typeof rootDoc.order === 'number' ? rootDoc.order : 0
+    });
+  }
+  const rootId = rootDoc.id;
+  outlineMap.forEach((node, id) => {
+    if (id === rootId) return;
+    const parentId = node.parentId && outlineMap.has(node.parentId) ? node.parentId : rootId;
+    const parent = outlineMap.get(parentId);
+    if (!parent) return;
+    parent.items = [...(parent.items || []), node];
+  });
+  const root = outlineMap.get(rootId);
+  if (!root) return [];
+  return [sortOutlineTreeNodes([root])[0]];
+};
+
+const buildHighlightsByChapterFromDocNodes = (docNodes: DocNode[]): Map<string, HighlightItem[]> => {
+  const map = new Map<string, HighlightItem[]>();
+  (Array.isArray(docNodes) ? docNodes : [])
+    .filter((item) => item && !item.isDeleted && (item.kind === 'highlight_note' || item.kind === 'normal_note'))
+    .forEach((item) => {
+      const parentId = String(item.parentId || '').trim();
+      if (!parentId) return;
+      const note: HighlightItem = {
+        id: String(item.sourceId || item.id.replace(/^highlight-/, '')).trim(),
+        text: item.text,
+        color: item.color || HIGHLIGHT_COLORS[0].fill,
+        pageIndex: Number(item.pageIndex || 0),
+        rects: Array.isArray(item.rects) ? item.rects.map((rect) => normalizeHighlightRect(rect)) : [],
+        chapterId: parentId,
+        isChapterTitle: false,
+        chapterNodeId: item.chapterNodeId ?? null,
+        translation: item.translation || '',
+        questionIds: Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [],
+        source: item.source === 'manual' ? 'manual' : 'pdf',
+        order: typeof item.order === 'number' ? item.order : undefined,
+        version: item.version,
+        baseVersion: item.baseVersion,
+        updatedAt: item.updatedAt,
+        isDeleted: Boolean(item.isDeleted)
+      };
+      const list = map.get(parentId) || [];
+      list.push(note);
+      map.set(parentId, list);
+    });
+  map.forEach((items, key) => {
+    map.set(
+      key,
+      items.slice().sort((a, b) => {
+        const orderA = typeof a.order === 'number' ? a.order : Number.MAX_SAFE_INTEGER;
+        const orderB = typeof b.order === 'number' ? b.order : Number.MAX_SAFE_INTEGER;
+        if (orderA !== orderB) return orderA - orderB;
+        return Number(a.updatedAt || 0) - Number(b.updatedAt || 0);
+      })
+    );
+  });
+  return map;
+};
 
 const toSolidColor = (fill: string) => {
   const match = fill.match(/rgba?\(([^)]+)\)/);
@@ -334,12 +1068,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const [rightWidth, setRightWidth] = useState(200);
   const [numPages, setNumPages] = useState<number>(0);
   const [outlineNodes, setOutlineNodes] = useState<OutlineNode[]>([]);
-  const [customChapters, setCustomChapters] = useState<OutlineNode[]>([]);
   const [selectionText, setSelectionText] = useState('');
   const [selectionRect, setSelectionRect] = useState<{ left: number; right: number; top: number; bottom: number } | null>(null);
   const [selectionInfo, setSelectionInfo] = useState<{ pageIndex: number; rects: HighlightRect[]; text: string } | null>(null);
   const [suppressTranslation, setSuppressTranslation] = useState(false);
-  const [highlights, setHighlights] = useState<HighlightItem[]>([]);
+  const [docNodes, setDocNodes] = useState<DocNode[]>([]);
   const [activeHighlightId, setActiveHighlightId] = useState<string | null>(null);
   const [activeHighlightColor, setActiveHighlightColor] = useState<string | null>(null);
   const [translationResult, setTranslationResult] = useState('');
@@ -440,6 +1173,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const pendingTranslationTextRef = useRef<string | null>(null);
   const saveStateTimerRef = useRef<number | null>(null);
   const paperStateLoadedRef = useRef(false);
+  const questionsStateRef = useRef<VersionedStateEnvelope<ReaderQuestion[]> | null>(null);
+  const mindmapStateV2StateRef = useRef<VersionedStateEnvelope<MindmapStateV2 | null> | null>(null);
+  const aiConversationsStateRef = useRef<VersionedStateEnvelope<AiConversationSyncPayload> | null>(null);
   const pdfScrollTopRef = useRef(0);
   const mindmapLayoutRef = useRef<MindMapLayout | null>(null);
   const mindmapAnchorRef = useRef<{ id: string; x: number; y: number } | null>(null);
@@ -1206,7 +1942,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
 
     if (activeHighlightId) {
-      const activeNote = highlights.find((item) => item.id === activeHighlightId);
+      const activeNote = activeHighlightId ? annotationById.get(activeHighlightId) || null : null;
       if (activeNote && !activeNote.isChapterTitle) {
         const noteText = normalizeTranslationText(activeNote.text);
         if (noteText && noteText === source && activeNote.translation) {
@@ -1267,7 +2003,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
 
     run();
-  }, [selectionText, selectionInfo?.pageIndex, suppressTranslation, activeHighlightId, highlights]);
+  }, [selectionText, selectionInfo?.pageIndex, suppressTranslation, activeHighlightId, annotations]);
 
   const findChapterForPosition = (
     pageIndex: number,
@@ -1439,7 +2175,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const resolveParentForChapter = (chapterId: string) => {
-    const custom = customChapters.find((item) => item.id === chapterId);
+    const custom = customChapterNodeMap.get(chapterId);
     if (custom?.parentId) return custom.parentId;
     const parentNode = findParentNode(outlineDisplay, chapterId, null);
     return parentNode?.id || outlineRootId;
@@ -1489,7 +2225,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const addHighlight = (color: string) => {
     clearNativeSelection();
     if (activeHighlightId) {
-      const activeHighlight = highlights.find((item) => item.id === activeHighlightId);
+      const activeHighlight = annotationById.get(activeHighlightId) || null;
       if (!activeHighlight) return;
       if (activeHighlight.isChapterTitle) {
         const chapterId = activeHighlight.chapterNodeId || activeHighlight.chapterId;
@@ -1661,7 +2397,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     clearNativeSelection();
     if (!selectionInfo || !selectionText) return;
     if (activeHighlightId) {
-      const activeHighlight = highlights.find((item) => item.id === activeHighlightId);
+      const activeHighlight = annotationById.get(activeHighlightId) || null;
       if (activeHighlight?.isChapterTitle) {
         clearSelection();
         return;
@@ -1675,9 +2411,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const pageIndex = selectionInfo.pageIndex;
     const parentChapter = findChapterForPosition(pageIndex, topRatio, nativeChapterParentOutline);
     const parentId = parentChapter && !parentChapter.isRoot ? parentChapter.id : outlineRootId;
-    const activeHighlight = activeHighlightId
-      ? highlights.find((item) => item.id === activeHighlightId)
-      : null;
+    const activeHighlight = activeHighlightId ? annotationById.get(activeHighlightId) || null : null;
     const order =
       activeHighlight && !activeHighlight.isChapterTitle
         ? getCombinedEntryOrderValue(parentId, 'note', activeHighlight.id) ??
@@ -1733,7 +2467,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const removeCustomChapter = (chapterId: string, options?: { keepSelection?: boolean }) => {
-    const target = customChapters.find((item) => item.id === chapterId);
+    const target = customChapterNodeMap.get(chapterId);
     if (!target) return;
     detachCustomChapter(chapterId);
     if (!options?.keepSelection) {
@@ -1744,7 +2478,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const clearFormatting = () => {
     clearNativeSelection();
     if (activeHighlightId) {
-      const activeHighlight = highlights.find((item) => item.id === activeHighlightId);
+      const activeHighlight = activeHighlightId ? annotationById.get(activeHighlightId) || null : null;
       if (activeHighlight?.isChapterTitle && activeHighlight.chapterNodeId) {
         removeCustomChapter(activeHighlight.chapterNodeId);
         return;
@@ -1833,7 +2567,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const getHighlightAtPoint = (clientX: number, clientY: number) => {
-    for (const highlight of highlights) {
+    for (const highlight of annotations) {
       for (const rect of highlight.rects) {
         const page = pageRefs.current[rect.pageIndex];
         if (!page) continue;
@@ -1938,7 +2672,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     };
     window.addEventListener('mousedown', handleMouseDown);
     return () => window.removeEventListener('mousedown', handleMouseDown);
-  }, [selectionText, selectionRect, highlights]);
+  }, [selectionText, selectionRect, annotations]);
 
   const toolbarStyle = useMemo(() => {
     if (!selectionRect || typeof window === 'undefined') return null;
@@ -2125,7 +2859,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       return;
     }
     if (mindmapEditing.kind === 'note') {
-      const targetNote = highlights.find((item) => item.id === mindmapEditing.targetId);
+      const targetNote = annotationById.get(mindmapEditing.targetId) || null;
       const isManual = targetNote ? isManualHighlight(targetNote) : false;
       const stableOrder =
         targetNote && typeof targetNote.order === 'number'
@@ -2150,7 +2884,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
     if (mindmapEditing.kind === 'chapter') {
       const parentId = resolveParentForChapter(mindmapEditing.targetId);
-      const targetChapter = customChapters.find((item) => item.id === mindmapEditing.targetId);
+      const targetChapter = customChapterNodeMap.get(mindmapEditing.targetId) || null;
       const stableOrder =
         targetChapter && typeof targetChapter.order === 'number'
           ? targetChapter.order
@@ -2447,9 +3181,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       return;
     }
     if (node.kind === 'chapter' && customChapterIdSet.has(node.id)) {
-      const chapterTitle = highlights.find(
-        (item) => item.isChapterTitle && item.chapterNodeId === node.id
-      );
+      const chapterTitle = chapterAnnotationByNodeId.get(node.id) || null;
       const draftText = getMindmapDraftText(node.id, node.text || '');
       if (chapterTitle) {
         detachCustomChapter(node.id, {
@@ -2738,7 +3470,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     if (target.kind === 'note') {
       const noteId = parseMindmapNoteNodeId(target.id);
       if (!noteId) return null;
-      const note = highlights.find((item) => item.id === noteId && !item.isChapterTitle);
+      const note = noteAnnotations.find((item) => item.id === noteId) || null;
       if (!note) return null;
       return {
         parentId: note.chapterId || null,
@@ -3255,6 +3987,90 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const baseFlatOutline = useMemo(() => getFlatOutlineByPosition(baseOutline), [baseOutline]);
+  const rebuildDocNodes = useCallback(
+    (nextAnnotations: HighlightItem[] = []) =>
+      buildDocNodesFromCurrentState(paper.id, baseOutline, nextAnnotations),
+    [paper.id, baseOutline]
+  );
+  const docNodesForRender = useMemo(
+    () => (Array.isArray(docNodes) && docNodes.length ? docNodes : rebuildDocNodes([])),
+    [docNodes, rebuildDocNodes]
+  );
+  const customChapters = useMemo(
+    () => buildCustomChaptersFromDocNodes(docNodesForRender),
+    [docNodesForRender]
+  );
+  const annotations = useMemo(
+    () => buildAnnotationsFromDocNodes(docNodesForRender),
+    [docNodesForRender]
+  );
+  const visibleHighlights = useMemo(() => getVisibleHighlights(annotations), [annotations]);
+  const annotationById = useMemo(
+    () => new Map(annotations.map((item) => [String(item.id || '').trim(), item])),
+    [annotations]
+  );
+  const noteAnnotations = useMemo(
+    () => annotations.filter((item) => item && !item.isDeleted && !item.isChapterTitle),
+    [annotations]
+  );
+  const customChapterNodeMap = useMemo(
+    () =>
+      new Map(
+        docNodesForRender
+          .filter(
+            (node) =>
+              node &&
+              !node.isDeleted &&
+              (node.kind === 'normal_chapter' || node.kind === 'highlight_chapter')
+          )
+          .map((node) => [node.id, node])
+      ),
+    [docNodesForRender]
+  );
+  const chapterAnnotationByNodeId = useMemo(
+    () =>
+      new Map(
+        annotations
+          .filter((item) => item && !item.isDeleted && item.isChapterTitle)
+          .map((item) => [String(item.chapterNodeId || item.chapterId || item.id).trim(), item])
+      ),
+    [annotations]
+  );
+
+  const setHighlights = useCallback(
+    (updater: React.SetStateAction<HighlightItem[]>) => {
+      setDocNodes((prevDocNodes) => {
+        const prevAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+        const prevHighlights = getVisibleHighlights(prevAnnotations);
+        const nextHighlights =
+          typeof updater === 'function'
+            ? (updater as (prevState: HighlightItem[]) => HighlightItem[])(prevHighlights)
+            : updater;
+        const nextAnnotations = dedupeChapterAnnotations(
+          buildAnnotationsForSave(nextHighlights, prevAnnotations)
+        );
+        return rebuildDocNodes(nextAnnotations);
+      });
+    },
+    [rebuildDocNodes]
+  );
+
+  const setCustomChapters = useCallback(
+    (updater: React.SetStateAction<OutlineNode[]>) => {
+      setDocNodes((prevDocNodes) => {
+        const prevCustomChapters = buildCustomChaptersFromDocNodes(prevDocNodes);
+        const nextCustomChapters =
+          typeof updater === 'function'
+            ? (updater as (prevState: OutlineNode[]) => OutlineNode[])(prevCustomChapters)
+            : updater;
+        const nextAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+        const nextNotes = nextAnnotations.filter((item) => !item.isChapterTitle);
+        const nextChapterAnnotations = buildChapterAnnotationsFromOutlineNodes(nextCustomChapters, nextAnnotations);
+        return rebuildDocNodes(dedupeChapterAnnotations([...nextNotes, ...nextChapterAnnotations]));
+      });
+    },
+    [rebuildDocNodes]
+  );
 
   const getChapterFallbackOrderMap = (nodes: OutlineNode[]) => {
     const map = new Map<string, number>();
@@ -3402,11 +4218,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return rootItems;
   };
 
-  const outlineDisplay = useMemo(() => {
-    const merged = mergeOutlineWithCustom(baseOutline, customChapters, baseFlatOutline, outlineRootId);
-    sortOutlineNodes(merged);
-    return merged;
-  }, [baseOutline, customChapters, baseFlatOutline, outlineRootId]);
+  const outlineDisplay = useMemo(
+    () =>
+      buildOutlineFromDocNodes(paper.id, docNodesForRender, {
+        id: outlineRootId,
+        title: baseOutline[0]?.title || paper.title || 'Document',
+        pageIndex: baseOutline[0]?.pageIndex ?? 0,
+        topRatio: baseOutline[0]?.topRatio ?? 0
+      }),
+    [paper.id, docNodesForRender, outlineRootId, baseOutline, paper.title]
+  );
 
   const findOutlineNodeById = (nodes: OutlineNode[], targetId: string): OutlineNode | null => {
     for (const node of nodes) {
@@ -3559,7 +4380,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         } else {
           const sourceNode =
             findOutlineNodeById(outlineDisplay, patch.chapterId) ||
-            customChapters.find((item) => item.id === patch.chapterId) ||
+            (customChapterNodeMap.has(patch.chapterId)
+              ? {
+                  id: patch.chapterId,
+                  title: customChapterNodeMap.get(patch.chapterId)?.text || '',
+                  pageIndex: customChapterNodeMap.get(patch.chapterId)?.pageIndex ?? null,
+                  topRatio: customChapterNodeMap.get(patch.chapterId)?.topRatio ?? null,
+                  items: [],
+                  isCustom: true,
+                  parentId: customChapterNodeMap.get(patch.chapterId)?.parentId ?? null,
+                  createdAt: Number(customChapterNodeMap.get(patch.chapterId)?.updatedAt || Date.now()),
+                  order: customChapterNodeMap.get(patch.chapterId)?.order
+                }
+              : null) ||
             null;
           if (sourceNode) {
             nodes = [...nodes, { ...sourceNode, order: patch.order }];
@@ -3567,9 +4400,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         }
       }
     }
-    const notes = highlights.filter(
-      (item) => item.chapterId === parentId && !item.isChapterTitle
-    );
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId);
     const entries = sortCombinedEntries(buildCombinedEntries(nodes, notes));
     return formatCombinedOrderEntries(entries);
   };
@@ -3580,9 +4411,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         ? outlineDisplay[0] || null
         : findOutlineNodeById(outlineDisplay, parentId);
     const nodes = parentNode?.items || [];
-    const notes = highlights.filter(
-      (item) => item.chapterId === parentId && !item.isChapterTitle
-    );
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId);
     const entries = buildCombinedEntries(nodes, notes);
     if (!entries.length) return 0;
     const fallbackOrder = getCombinedFallbackOrder(entries);
@@ -3606,9 +4435,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         ? outlineDisplay[0] || null
         : findOutlineNodeById(outlineDisplay, parentId);
     const nodes = parentNode?.items || [];
-    const notes = highlights.filter(
-      (item) => item.chapterId === parentId && !item.isChapterTitle
-    );
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId);
     const entries = buildCombinedEntries(nodes, notes);
     if (!entries.length) return undefined;
     const fallbackOrder = getCombinedFallbackOrder(entries);
@@ -3629,9 +4456,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         ? outlineDisplay[0] || null
         : findOutlineNodeById(outlineDisplay, parentId);
     const nodes = parentNode?.items || [];
-    const notes = highlights.filter(
-      (item) => item.chapterId === parentId && !item.isChapterTitle
-    );
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId);
     const entries = buildCombinedEntries(nodes, notes);
     if (!entries.length) return 0;
     const sorted = sortCombinedEntries(entries);
@@ -3666,9 +4491,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         ? outlineDisplay[0] || null
         : findOutlineNodeById(outlineDisplay, parentId);
     const nodes = parentNode?.items || [];
-    const notes = highlights.filter(
-      (item) => item.chapterId === parentId && !item.isChapterTitle
-    );
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId);
     const entries = buildCombinedEntries(nodes, notes);
     if (!entries.length) return 0;
     const sorted = sortCombinedEntries(entries);
@@ -3745,18 +4568,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return currentOrder - 0.0001;
   };
 
-  const highlightsByChapter = useMemo(() => {
-    const map = new Map<string, HighlightItem[]>();
-    highlights.forEach((item) => {
-      if (!item.chapterId || item.isChapterTitle) return;
-      const list = map.get(item.chapterId) || [];
-      list.push(item);
-      map.set(item.chapterId, list);
-    });
-    return map;
-  }, [highlights]);
+  const highlightsByChapter = useMemo(
+    () => buildHighlightsByChapterFromDocNodes(docNodesForRender),
+    [docNodesForRender]
+  );
 
   const showPdfMarginOutline = false;
+  const docNodeHighlightChapterIdSet = useMemo(
+    () =>
+      new Set(
+        docNodesForRender
+          .filter((item) => item.kind === 'highlight_chapter' && !item.isDeleted)
+          .map((item) => item.id)
+      ),
+    [docNodesForRender]
+  );
   const pdfMarginChildrenByPage = useMemo(() => {
     const map = new Map<
       number,
@@ -3779,14 +4605,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }>
     >();
     if (!showPdfMarginOutline || viewMode !== ReaderMode.PDF || !outlineDisplay.length) return map;
-
-    const highlightChapterNodeIdSet = new Set<string>();
-    highlights.forEach((item) => {
-      if (!item.isChapterTitle) return;
-      if (isManualHighlight(item)) return;
-      const nodeId = item.chapterNodeId || item.chapterId;
-      if (nodeId) highlightChapterNodeIdSet.add(nodeId);
-    });
 
     const clampTopRatio = (value: number) => Math.max(0, Math.min(0.99, value));
 
@@ -3834,7 +4652,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       const siblings = parent.items || [];
       let prevNode: OutlineNode | null = null;
       siblings.forEach((child, index) => {
-        const isNormalChapter = child.isCustom && !highlightChapterNodeIdSet.has(child.id);
+        const isNormalChapter = child.isCustom && !docNodeHighlightChapterIdSet.has(child.id);
         const depth = nodeDepthMap.get(child.id) ?? 0;
         const indentPx = depth * 12;
         let pageIndex: number;
@@ -3961,7 +4779,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         }
         const child = nodeMap.get(entry.id);
         if (!child) return;
-        const isNormalChapter = child.isCustom && !highlightChapterNodeIdSet.has(child.id);
+        const isNormalChapter = child.isCustom && !docNodeHighlightChapterIdSet.has(child.id);
         if (isNormalChapter) {
           const placement = normalChapterPlacement.get(child.id);
           if (placement) {
@@ -4068,7 +4886,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
       nodes.forEach((child) => {
         if (!childrenVisible) return;
-        if (!child || !child.isCustom || highlightChapterNodeIdSet.has(child.id)) return;
+        if (!child || !child.isCustom || docNodeHighlightChapterIdSet.has(child.id)) return;
         const placement = normalChapterPlacement.get(child.id);
         if (!placement) return;
         addToGroup(
@@ -4130,11 +4948,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       map.set(pageIndex, list);
     });
     return map;
-  }, [outlineDisplay, highlightsByChapter, highlights, viewMode, expandedTOC, expandedHighlightIds]);
+  }, [outlineDisplay, highlightsByChapter, viewMode, expandedTOC, expandedHighlightIds, docNodeHighlightChapterIdSet]);
 
   const highlightsByQuestion = useMemo(() => {
     const map = new Map<string, HighlightItem[]>();
-    highlights.forEach((item) => {
+    noteAnnotations.forEach((item) => {
       const ids = Array.isArray(item.questionIds) ? item.questionIds : [];
       ids.forEach((id) => {
         if (!id) return;
@@ -4144,7 +4962,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       });
     });
     return map;
-  }, [highlights]);
+  }, [noteAnnotations]);
 
   const mindmapStateV2ForSave = useMemo(
     () => buildMindmapStateV2FromOutline(outlineDisplay[0] || null),
@@ -4160,13 +4978,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       window.clearTimeout(saveStateTimerRef.current);
     }
     saveStateTimerRef.current = window.setTimeout(() => {
+      const nextQuestionsState = buildNextVersionedState(
+        questionsStateRef.current,
+        normalizeQuestionsPayload(questions)
+      );
+      const nextMindmapState = buildNextVersionedState(
+        mindmapStateV2StateRef.current,
+        normalizeMindmapStateForSync(mindmapStateV2ForSave)
+      );
+      const nextAiConversationsState = buildNextVersionedState(
+        aiConversationsStateRef.current,
+        normalizeAiConversationPayload(chatThreads, activeChatId)
+      );
+      questionsStateRef.current = nextQuestionsState;
+      mindmapStateV2StateRef.current = nextMindmapState;
+      aiConversationsStateRef.current = nextAiConversationsState;
       window.electronAPI?.library?.savePaperState?.(paper.id, {
-        highlights,
-        customChapters,
-        mindmapStateV2: mindmapStateV2ForSave,
-        questions,
-        aiConversations: chatThreads,
-        activeChatId,
+        annotations,
+        mindmapStateV2: nextMindmapState.value,
+        mindmapStateV2State: nextMindmapState,
+        questions: nextQuestionsState.value,
+        questionsState: nextQuestionsState,
+        aiConversations: nextAiConversationsState.value.threads,
+        activeChatId: nextAiConversationsState.value.activeChatId,
+        aiConversationsState: nextAiConversationsState,
         updatedAt: Date.now()
       });
     }, 400);
@@ -4175,18 +5010,19 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         window.clearTimeout(saveStateTimerRef.current);
       }
     };
-  }, [paper?.id, highlights, customChapters, mindmapStateV2ForSave, questions, chatThreads, activeChatId, isCloudSyncing]);
+  }, [
+    paper?.id,
+    annotations,
+    mindmapStateV2ForSave,
+    questions,
+    chatThreads,
+    activeChatId,
+    isCloudSyncing
+  ]);
 
   const buildMindmapRoot = useCallback((): MindMapNode | null => {
     if (!outlineDisplay.length) return null;
     const rootNode = outlineDisplay[0];
-    const highlightChapterNodeIdSet = new Set<string>();
-    highlights.forEach((item) => {
-      if (!item.isChapterTitle) return;
-      if (isManualHighlight(item)) return;
-      const nodeId = item.chapterNodeId || item.chapterId;
-      if (nodeId) highlightChapterNodeIdSet.add(nodeId);
-    });
 
     const buildNode = (node: OutlineNode): MindMapNode => {
       const childItems = node.items || [];
@@ -4217,7 +5053,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         id: node.id,
         text: node.title,
         kind: node.isRoot ? 'root' : 'chapter',
-        isNormalChapter: Boolean(node.isCustom && !highlightChapterNodeIdSet.has(node.id)),
+        isNormalChapter: Boolean(node.isCustom && !docNodeHighlightChapterIdSet.has(node.id)),
         pageIndex: node.pageIndex,
         topRatio: node.topRatio,
         children: combined
@@ -4257,7 +5093,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       kind: 'root',
       children: combinedRoot
     };
-  }, [outlineDisplay, highlightsByChapter]);
+  }, [outlineDisplay, highlightsByChapter, docNodeHighlightChapterIdSet]);
 
   const mindmapRoot = useMemo(() => buildMindmapRoot(), [buildMindmapRoot]);
 
@@ -4297,19 +5133,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   }, [mindmapParentMap]);
 
   const customChapterIdSet = useMemo(() => {
-    return new Set(customChapters.map((item) => item.id));
-  }, [customChapters]);
+    return new Set(
+      docNodesForRender
+        .filter(
+          (node) =>
+            (node.kind === 'normal_chapter' || node.kind === 'highlight_chapter') &&
+            !node.isDeleted
+        )
+        .map((node) => node.id)
+    );
+  }, [docNodesForRender]);
 
-  const highlightChapterIdSet = useMemo(() => {
-    const set = new Set<string>();
-    highlights.forEach((item) => {
-      if (!item.isChapterTitle) return;
-      if (isManualHighlight(item)) return;
-      const nodeId = item.chapterNodeId || item.chapterId;
-      if (nodeId) set.add(nodeId);
-    });
-    return set;
-  }, [highlights]);
+  const highlightChapterIdSet = useMemo(() => new Set(docNodeHighlightChapterIdSet), [docNodeHighlightChapterIdSet]);
 
   const highlightParentOutline = useMemo(() => {
     const list = getFlatOutlineByPosition(outlineDisplay);
@@ -4330,13 +5165,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   useEffect(() => {
     if (!outlineDisplay.length) return;
     const notesByParent = new Map<string, HighlightItem[]>();
-    highlights.forEach((item) => {
+    noteAnnotations.forEach((item) => {
       if (!item.chapterId || item.isChapterTitle) return;
       const list = notesByParent.get(item.chapterId) || [];
       list.push(item);
       notesByParent.set(item.chapterId, list);
     });
-    const customIdSet = new Set(customChapters.map((item) => item.id));
+    const customIdSet = customChapterIdSet;
     const missingHighlightOrders = new Map<string, number>();
     const missingCustomOrders = new Map<string, number>();
 
@@ -4394,7 +5229,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         })
       );
     }
-  }, [outlineDisplay, highlights, customChapters]);
+  }, [outlineDisplay, noteAnnotations, customChapterIdSet]);
 
   useEffect(() => {
     if (viewMode !== ReaderMode.MIND_MAP) return;
@@ -4436,7 +5271,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           target.position !== 'inside' &&
           draggedParentId === targetEntry.parentId &&
           !(targetEntry.kind === 'node' && targetEntry.id === dragInfo.id);
-        const draggedIsCustom = customChapters.some((item) => item.id === dragInfo.id);
+        const draggedIsCustom = customChapterIdSet.has(dragInfo.id);
 
         if (isSameParent && draggedIsCustom && targetEntry.parentId) {
           const nextOrder =
@@ -4525,7 +5360,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
     };
-  }, [draggingChapterId, mindmapParentMap, customChapters, viewMode]);
+  }, [draggingChapterId, mindmapParentMap, customChapterIdSet, customChapterNodeMap, viewMode]);
 
   useEffect(() => {
     if (questionPicker.open && (!selectionRect || !selectionText)) {
@@ -4565,7 +5400,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   const highlightRectsByPage = useMemo(() => {
     const map = new Map<number, { rect: HighlightRect; color: string; id: string }[]>();
-    highlights.forEach((highlight) => {
+    annotations.forEach((highlight) => {
       highlight.rects.forEach((rect) => {
         const list = map.get(rect.pageIndex) || [];
         list.push({ rect, color: highlight.color, id: highlight.id });
@@ -4573,7 +5408,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       });
     });
     return map;
-  }, [highlights]);
+  }, [annotations]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4581,8 +5416,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     setOutlineNodes([]);
     setExpandedTOC(new Set());
     setNumPages(0);
-    setHighlights([]);
-    setCustomChapters([]);
+    setDocNodes([]);
     setSelectionText('');
     setSelectionRect(null);
     setSelectionInfo(null);
@@ -4639,85 +5473,65 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     mindmapAnchorRef.current = null;
     mindmapPanRef.current = null;
     mindmapStateRef.current = null;
+    questionsStateRef.current = null;
+    mindmapStateV2StateRef.current = null;
+    aiConversationsStateRef.current = null;
     const loadState = async () => {
       if (typeof window === 'undefined' || !window.electronAPI?.library) {
         setQuestions([]);
+        questionsStateRef.current = null;
+        mindmapStateV2StateRef.current = null;
+        aiConversationsStateRef.current = null;
         paperStateLoadedRef.current = true;
         return;
       }
       const saved = await window.electronAPI.library.getPaperState?.(paper.id);
       if (cancelled) return;
       if (saved && typeof saved === 'object') {
-        const normalizedHighlights = Array.isArray(saved.highlights)
-          ? saved.highlights.map((item: any) => {
-              const ids = Array.isArray(item.questionIds)
-                ? item.questionIds.filter(Boolean)
-                : [];
-              const legacyId = item.questionId;
-              if (legacyId && !ids.includes(legacyId)) {
-                ids.push(legacyId);
-              }
-              const next = { ...item, questionIds: ids };
-              if (isManualHighlight(next) && !next.isChapterTitle && !next.translation) {
-                const text = String(next.text || '').trim();
-                if (text) {
-                  next.translation = text;
-                }
-              }
-              delete (next as any).questionId;
-              delete (next as any).questionText;
-              return next;
-            })
+        const normalizedAnnotations = dedupeChapterAnnotations(getAnnotationsFromSavedState(saved).map((item) => {
+          const ids = Array.isArray(item.questionIds) ? item.questionIds.filter(Boolean) : [];
+          const legacyId = (item as any).questionId;
+          if (legacyId && !ids.includes(legacyId)) {
+            ids.push(legacyId);
+          }
+          const next = { ...item, questionIds: ids };
+          if (isManualHighlight(next) && !next.isChapterTitle && !next.translation) {
+            const text = String(next.text || '').trim();
+            if (text) {
+              next.translation = text;
+            }
+          }
+          delete (next as any).questionId;
+          delete (next as any).questionText;
+          return next;
+        }));
+        const migratedAnnotations = migrateLegacyStateAnnotations(saved, paper.id, normalizedAnnotations);
+        const savedDocNodes = Array.isArray((saved as any).docNodes)
+          ? ((saved as any).docNodes as DocNode[])
           : [];
-        setHighlights(normalizedHighlights);
-        const parsedMindmapStateV2 = parseMindmapStateV2((saved as any).mindmapStateV2);
-        if (parsedMindmapStateV2) {
-          const legacy = deriveLegacyMindmapDataFromV2(parsedMindmapStateV2, {
-            rootIdAlias: `outline-root-${paper.id}`
-          });
-          setCustomChapters(Array.isArray(legacy.customChapters) ? (legacy.customChapters as OutlineNode[]) : []);
-        } else {
-          const savedCustomChapters = Array.isArray(saved.customChapters)
-            ? (saved.customChapters as OutlineNode[])
-            : [];
-          const legacyOverrides = normalizeLegacyParentOverrides((saved as any).chapterParentOverrides);
-          setCustomChapters(
-            mergeLegacyParentOverridesIntoCustomChapters(savedCustomChapters, legacyOverrides)
-          );
-        }
-        const savedQuestions = Array.isArray(saved.questions) ? saved.questions : [];
-        setQuestions(savedQuestions);
-        const savedChats = Array.isArray(saved.aiConversations)
-          ? saved.aiConversations
-              .map((item: any) => ({
-                id: String(item?.id || ''),
-                title: String(item?.title || '新对话'),
-                messages: Array.isArray(item?.messages)
-                  ? item.messages
-                      .filter((msg: any) => msg && (msg.role === 'user' || msg.role === 'model'))
-                      .map((msg: any) => ({
-                        role: msg.role,
-                        text: String(msg.text || '')
-                      }))
-                  : [],
-                createdAt: Number(item?.createdAt || Date.now()),
-                updatedAt: Number(item?.updatedAt || Date.now())
-              }))
-              .filter((item: ChatThread) => item.id)
-          : [];
-        setChatThreads(savedChats);
-        const savedActiveId =
-          typeof saved.activeChatId === 'string' &&
-          savedChats.some((item: ChatThread) => item.id === saved.activeChatId)
-            ? saved.activeChatId
-            : null;
-        setActiveChatId(savedActiveId);
+        setDocNodes(
+          !migratedAnnotations.length && savedDocNodes.length
+            ? savedDocNodes
+            : buildDocNodesFromCurrentState(paper.id, baseOutline, migratedAnnotations)
+        );
+        const savedQuestionsState = getSavedQuestionsState(saved);
+        const savedMindmapState = getSavedMindmapState(saved);
+        const savedAiConversationsState = getSavedAiConversationState(saved);
+        questionsStateRef.current = savedQuestionsState;
+        mindmapStateV2StateRef.current = savedMindmapState;
+        aiConversationsStateRef.current = savedAiConversationsState;
+        setQuestions(savedQuestionsState?.value || []);
+        setChatThreads(savedAiConversationsState?.value?.threads || []);
+        setActiveChatId(savedAiConversationsState?.value?.activeChatId || null);
         paperStateLoadedRef.current = true;
         return;
       }
       setQuestions([]);
       setChatThreads([]);
       setActiveChatId(null);
+      questionsStateRef.current = null;
+      mindmapStateV2StateRef.current = null;
+      aiConversationsStateRef.current = null;
       paperStateLoadedRef.current = true;
     };
     loadState();

@@ -486,6 +486,296 @@ module.exports = function createSqliteModule(deps = {}) {
       .filter((item) => item.paperId);
   };
 
+  const markPaperStateAnnotationsBaseVersionCurrent = async (paperIds = null) => {
+    const db = getLibraryDb();
+    const ids = Array.isArray(paperIds)
+      ? paperIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : null;
+    if (ids && !ids.length) return 0;
+    const rows = ids
+      ? db
+          .prepare(
+            `SELECT paper_id, state_json FROM paper_states WHERE paper_id IN (${ids
+              .map(() => '?')
+              .join(', ')})`
+          )
+          .all(...ids)
+      : db.prepare('SELECT paper_id, state_json FROM paper_states').all();
+    const update = db.prepare(
+      `
+        UPDATE paper_states
+        SET state_json = ?, updated_at = ?
+        WHERE paper_id = ?
+      `
+    );
+    const cloneJsonValue = (value, fallback = null) => {
+      try {
+        return JSON.parse(JSON.stringify(value == null ? fallback : value));
+      } catch {
+        return fallback;
+      }
+    };
+    const buildStateComparable = (value) => JSON.stringify(value ?? null);
+    const normalizeReaderQuestion = (item = {}) => {
+      const id = String(item?.id || '').trim();
+      if (!id) return null;
+      return {
+        id,
+        text: String(item?.text || '').trim()
+      };
+    };
+    const normalizeQuestionsPayload = (value) =>
+      (Array.isArray(value) ? value : []).map((item) => normalizeReaderQuestion(item)).filter(Boolean);
+    const normalizeChatMessage = (item = {}) => {
+      if (!item || (item.role !== 'user' && item.role !== 'model')) return null;
+      return {
+        role: item.role,
+        text: String(item.text || '')
+      };
+    };
+    const normalizeChatThread = (item = {}) => {
+      const id = String(item?.id || '').trim();
+      if (!id) return null;
+      return {
+        id,
+        title: String(item?.title || '新对话'),
+        messages: (Array.isArray(item?.messages) ? item.messages : [])
+          .map((message) => normalizeChatMessage(message))
+          .filter(Boolean),
+        createdAt: Number(item?.createdAt || Date.now()) || Date.now(),
+        updatedAt: Number(item?.updatedAt || Date.now()) || Date.now()
+      };
+    };
+    const normalizeAiConversationPayload = (value = {}) => {
+      const threads = (Array.isArray(value?.threads) ? value.threads : [])
+        .map((item) => normalizeChatThread(item))
+        .filter(Boolean);
+      const activeChatId = String(value?.activeChatId || '').trim();
+      return {
+        threads,
+        activeChatId: activeChatId && threads.some((thread) => thread.id === activeChatId) ? activeChatId : null
+      };
+    };
+    const normalizeVersionedStateEnvelope = (value, normalizePayload) => {
+      if (!value || typeof value !== 'object' || !Object.prototype.hasOwnProperty.call(value, 'value')) {
+        return null;
+      }
+      return {
+        version: Math.max(1, Number(value?.version || 1) || 1),
+        baseVersion: Math.max(0, Number(value?.baseVersion ?? 0) || 0),
+        updatedAt: Number(value?.updatedAt || Date.now()) || Date.now(),
+        value: normalizePayload(value?.value)
+      };
+    };
+    const buildSyncedVersionedState = (value, normalizePayload, updatedAt, fallbackVersion = 1) => {
+      const normalizedValue = normalizePayload(value);
+      const version = Math.max(1, Number(fallbackVersion || 1) || 1);
+      return {
+        version,
+        baseVersion: version,
+        updatedAt: Number(updatedAt || Date.now()) || Date.now(),
+        value: cloneJsonValue(normalizedValue, null)
+      };
+    };
+    let changed = 0;
+    rows.forEach((row) => {
+      const state = safeJsonParse(row?.state_json, {});
+      const source = Array.isArray(state?.annotations) ? state.annotations : [];
+      const legacyHighlights = Array.isArray(state?.highlights) ? state.highlights : [];
+      const legacyCustomChapters = Array.isArray(state?.customChapters) ? state.customChapters : [];
+      if (!source.length && !legacyHighlights.length && !legacyCustomChapters.length) return;
+      let touched = false;
+      const annotations = source
+        .map((item) => {
+          const id = String(item?.id || '').trim();
+          if (!id) return null;
+          const version = Math.max(1, Number(item?.version || 1) || 1);
+          const baseVersion = Math.max(0, Number(item?.baseVersion ?? 0) || 0);
+          if (baseVersion !== version) touched = true;
+          return {
+            ...item,
+            id,
+            version,
+            baseVersion: version,
+            parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+            topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0)
+          };
+        })
+        .filter(Boolean);
+      legacyHighlights.forEach((item) => {
+        const id = String(item?.id || '').trim();
+        if (!id) return;
+        touched = true;
+        annotations.push({
+          ...item,
+          id,
+          version: Math.max(1, Number(item?.version || 1) || 1),
+          baseVersion: Math.max(1, Number(item?.version || 1) || 1),
+          parentId: item?.parentId == null ? null : String(item.parentId || '').trim(),
+          topRatio: item?.topRatio == null ? null : Number(item.topRatio || 0)
+        });
+      });
+      const chapterLookup = new Set(
+        annotations
+          .filter((item) => item?.isChapterTitle)
+          .map((item) => String(item.chapterNodeId || item.chapterId || item.id).trim())
+          .filter(Boolean)
+      );
+      legacyCustomChapters.forEach((chapter, index) => {
+        const chapterId = String(chapter?.id || '').trim();
+        if (!chapterId || chapterLookup.has(chapterId)) return;
+        touched = true;
+        annotations.push({
+          id: `chapter-${chapterId}`,
+          text: String(chapter?.title || '').trim(),
+          color: 'rgba(107, 114, 128, 0.35)',
+          pageIndex: Number(chapter?.pageIndex || 0),
+          topRatio: chapter?.topRatio == null ? null : Number(chapter.topRatio || 0),
+          rects: [],
+          chapterId,
+          parentId: chapter?.parentId == null ? null : String(chapter.parentId || '').trim(),
+          isChapterTitle: true,
+          chapterNodeId: chapterId,
+          translation: '',
+          questionIds: [],
+          source: 'manual',
+          order: typeof chapter?.order === 'number' ? chapter.order : index,
+          version: 1,
+          baseVersion: 1,
+          updatedAt: Number(chapter?.createdAt || Date.now()) || Date.now(),
+          isDeleted: false
+        });
+      });
+      const questionsEnvelope = (() => {
+        const existing = normalizeVersionedStateEnvelope(state?.questionsState, normalizeQuestionsPayload);
+        const hasLegacy = Array.isArray(state?.questions);
+        if (!existing && !hasLegacy) return null;
+        const next = existing
+          ? buildSyncedVersionedState(
+              existing.value,
+              normalizeQuestionsPayload,
+              existing.updatedAt,
+              existing.version
+            )
+          : buildSyncedVersionedState(
+              state?.questions,
+              normalizeQuestionsPayload,
+              state?.updatedAt,
+              1
+            );
+        if (
+          !existing ||
+          existing.baseVersion !== existing.version ||
+          buildStateComparable(existing.value) !== buildStateComparable(next.value) ||
+          buildStateComparable(state?.questions) !== buildStateComparable(next.value)
+        ) {
+          touched = true;
+        }
+        return next;
+      })();
+      const mindmapStateV2Envelope = (() => {
+        const existing = normalizeVersionedStateEnvelope(
+          state?.mindmapStateV2State,
+          (value) => cloneJsonValue(value, null)
+        );
+        const hasLegacy = Object.prototype.hasOwnProperty.call(state || {}, 'mindmapStateV2');
+        if (!existing && !hasLegacy) return null;
+        const next = existing
+          ? buildSyncedVersionedState(
+              existing.value,
+              (value) => cloneJsonValue(value, null),
+              existing.updatedAt,
+              existing.version
+            )
+          : buildSyncedVersionedState(
+              state?.mindmapStateV2,
+              (value) => cloneJsonValue(value, null),
+              state?.updatedAt,
+              1
+            );
+        if (
+          !existing ||
+          existing.baseVersion !== existing.version ||
+          buildStateComparable(existing.value) !== buildStateComparable(next.value) ||
+          buildStateComparable(state?.mindmapStateV2) !== buildStateComparable(next.value)
+        ) {
+          touched = true;
+        }
+        return next;
+      })();
+      const aiConversationsEnvelope = (() => {
+        const existing = normalizeVersionedStateEnvelope(
+          state?.aiConversationsState,
+          normalizeAiConversationPayload
+        );
+        const hasLegacy =
+          Array.isArray(state?.aiConversations) ||
+          Object.prototype.hasOwnProperty.call(state || {}, 'activeChatId');
+        if (!existing && !hasLegacy) return null;
+        const next = existing
+          ? buildSyncedVersionedState(
+              existing.value,
+              normalizeAiConversationPayload,
+              existing.updatedAt,
+              existing.version
+            )
+          : buildSyncedVersionedState(
+              {
+                threads: state?.aiConversations,
+                activeChatId: state?.activeChatId
+              },
+              normalizeAiConversationPayload,
+              state?.updatedAt,
+              1
+            );
+        const legacyPayloadComparable = buildStateComparable(
+          normalizeAiConversationPayload({
+            threads: state?.aiConversations,
+            activeChatId: state?.activeChatId
+          })
+        );
+        if (
+          !existing ||
+          existing.baseVersion !== existing.version ||
+          buildStateComparable(existing.value) !== buildStateComparable(next.value) ||
+          legacyPayloadComparable !== buildStateComparable(next.value)
+        ) {
+          touched = true;
+        }
+        return next;
+      })();
+      if (!touched) return;
+      const nextState = {
+        ...(state || {}),
+        annotations,
+        highlights: undefined,
+        customChapters: undefined,
+        ...(questionsEnvelope
+          ? {
+              questions: questionsEnvelope.value,
+              questionsState: questionsEnvelope
+            }
+          : {}),
+        ...(mindmapStateV2Envelope
+          ? {
+              mindmapStateV2: mindmapStateV2Envelope.value,
+              mindmapStateV2State: mindmapStateV2Envelope
+            }
+          : {}),
+        ...(aiConversationsEnvelope
+          ? {
+              aiConversations: aiConversationsEnvelope.value.threads,
+              activeChatId: aiConversationsEnvelope.value.activeChatId,
+              aiConversationsState: aiConversationsEnvelope
+            }
+          : {})
+      };
+      update.run(JSON.stringify(nextState), Date.now(), String(row?.paper_id || '').trim());
+      changed += 1;
+    });
+    return changed;
+  };
+
   const ensureLibrary = async () => {
     await loadSettings();
     const paths = getLibraryPaths();
@@ -539,6 +829,7 @@ module.exports = function createSqliteModule(deps = {}) {
     savePaperStateToSqlite,
     loadPaperStateFromSqlite,
     loadPaperStatesFromSqlite,
+    markPaperStateAnnotationsBaseVersionCurrent,
     ensureLibraryStoreReady,
     ensureLibrary
   };

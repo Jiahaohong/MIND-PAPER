@@ -61,6 +61,44 @@ export interface PaperReference {
   matchScore?: number;
 }
 
+export type DocNodeKind =
+  | 'root'
+  | 'native_chapter'
+  | 'highlight_chapter'
+  | 'highlight_note'
+  | 'normal_chapter'
+  | 'normal_note';
+
+export interface DocNodeRect {
+  pageIndex: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface DocNode {
+  id: string;
+  paperId: string;
+  kind: DocNodeKind;
+  parentId: string | null;
+  order: number;
+  text: string;
+  pageIndex?: number | null;
+  topRatio?: number | null;
+  color?: string;
+  translation?: string;
+  questionIds?: string[];
+  source?: 'pdf' | 'manual';
+  sourceId?: string;
+  chapterNodeId?: string | null;
+  rects?: DocNodeRect[];
+  version?: number;
+  baseVersion?: number;
+  updatedAt?: number;
+  isDeleted?: boolean;
+}
+
 export enum ReaderMode {
   PDF = 'PDF',
   MIND_MAP = 'MIND_MAP',
