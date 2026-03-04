@@ -46,8 +46,8 @@ const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
 const DEFAULT_WEBDAV_REMOTE_PATH = '/mindpaper';
 const WEBDAV_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
-const WEBDAV_IDLE_UPLOAD_DELAY_MS = 20 * 1000;
 const WEBDAV_REMOTE_POLL_INTERVAL_MS = 30 * 1000;
+const WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS = 1000;
 
 let settingsLoaded = false;
 let writeChain = Promise.resolve();
@@ -71,7 +71,7 @@ let qdrantProcess = null;
 let qdrantStartedByApp = false;
 let summaryVectorSyncChain = Promise.resolve();
 let startupWebDavSyncPromise = null;
-let webdavIdleUploadTimer = null;
+let webdavLocalUploadTimer = null;
 let webdavRemotePollTimer = null;
 let webdavBackgroundSyncInFlight = false;
 let lastObservedRemoteWebDavFingerprint = '';
@@ -221,10 +221,10 @@ const refreshRemoteWebDavFingerprint = async () => {
   }
 };
 
-const clearWebDavIdleUploadTimer = () => {
-  if (!webdavIdleUploadTimer) return;
-  clearTimeout(webdavIdleUploadTimer);
-  webdavIdleUploadTimer = null;
+const clearWebDavLocalUploadTimer = () => {
+  if (!webdavLocalUploadTimer) return;
+  clearTimeout(webdavLocalUploadTimer);
+  webdavLocalUploadTimer = null;
 };
 
 const clearWebDavRemotePollTimer = () => {
@@ -2321,12 +2321,28 @@ registerWebDavSyncIpc({
 
 async function runBackgroundWebDavUpload() {
   if (isForceQuitting) return { success: false, skipped: true, reason: 'quitting' };
-  if (startupWebDavSyncPromise) return { success: false, skipped: true, reason: 'startup sync running' };
+  if (startupWebDavSyncPromise) {
+    if (getSyncPending()) {
+      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
+    }
+    return { success: false, skipped: true, reason: 'startup sync running' };
+  }
   if (webdavBackgroundSyncInFlight) {
+    if (getSyncPending()) {
+      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
+    }
     return { success: false, skipped: true, reason: 'background sync already running' };
   }
-  if (getWebDavSyncState()?.active) return { success: false, skipped: true, reason: 'sync already active' };
-  if (pendingWrites > 0) return { success: false, skipped: true, reason: 'pending local writes' };
+  if (getWebDavSyncState()?.active) {
+    if (getSyncPending()) {
+      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
+    }
+    return { success: false, skipped: true, reason: 'sync already active' };
+  }
+  if (pendingWrites > 0) {
+    queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
+    return { success: false, skipped: true, reason: 'pending local writes' };
+  }
   if (!getSyncPending()) return { success: false, skipped: true, reason: 'nothing pending' };
 
   webdavBackgroundSyncInFlight = true;
@@ -2336,25 +2352,28 @@ async function runBackgroundWebDavUpload() {
     if (!getSyncPending()) {
       return { success: false, skipped: true, reason: 'nothing pending after flush' };
     }
-    console.log('[webdav-sync] background idle-upload start');
-    const result = await syncLibraryToWebDav();
+    console.log('[webdav-sync] local-change upload start');
+    const result = await syncLibraryToWebDav({ overwriteRemote: true });
     if (result?.success) {
       await refreshRemoteWebDavFingerprint();
     }
     console.log(
-      `[webdav-sync] background idle-upload done: success=${Boolean(result?.success)} skipped=${Boolean(
+      `[webdav-sync] local-change upload done: success=${Boolean(result?.success)} skipped=${Boolean(
         result?.skipped
       )}`
     );
     return result;
   } catch (error) {
-    console.warn('[webdav-sync] background idle-upload failed:', error?.message || error);
+    console.warn('[webdav-sync] local-change upload failed:', error?.message || error);
     return {
       success: false,
-      error: error?.message || 'background idle-upload failed'
+      error: error?.message || 'local-change upload failed'
     };
   } finally {
     webdavBackgroundSyncInFlight = false;
+    if (getSyncPending() && !isForceQuitting) {
+      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
+    }
   }
 }
 
@@ -2390,7 +2409,7 @@ async function runBackgroundWebDavDownload() {
       return { success: false, skipped: true, reason: 'remote unchanged' };
     }
     console.log('[webdav-sync] background remote-poll start');
-    const result = await syncLibraryFromWebDavToLocal();
+    const result = await syncLibraryFromWebDavToLocal({ overwriteLocal: true });
     if (remoteFingerprint.fingerprint) {
       lastObservedRemoteWebDavFingerprint = remoteFingerprint.fingerprint;
     }
@@ -2411,14 +2430,15 @@ async function runBackgroundWebDavDownload() {
   }
 }
 
-function scheduleIdleBackgroundWebDavUpload(delayMs = WEBDAV_IDLE_UPLOAD_DELAY_MS) {
+function queueImmediateWebDavUpload(delayMs = 0) {
   if (isForceQuitting) return;
-  clearWebDavIdleUploadTimer();
-  webdavIdleUploadTimer = setTimeout(() => {
+  clearWebDavLocalUploadTimer();
+  webdavLocalUploadTimer = setTimeout(() => {
+    webdavLocalUploadTimer = null;
     void runBackgroundWebDavUpload();
   }, Math.max(0, Number(delayMs || 0)));
-  if (typeof webdavIdleUploadTimer?.unref === 'function') {
-    webdavIdleUploadTimer.unref();
+  if (typeof webdavLocalUploadTimer?.unref === 'function') {
+    webdavLocalUploadTimer.unref();
   }
 }
 
@@ -2435,10 +2455,10 @@ function ensureBackgroundWebDavRemotePoll() {
 function setSyncPending(value) {
   setRawSyncPending(value);
   if (Boolean(value)) {
-    scheduleIdleBackgroundWebDavUpload(WEBDAV_IDLE_UPLOAD_DELAY_MS);
+    queueImmediateWebDavUpload();
     return;
   }
-  clearWebDavIdleUploadTimer();
+  clearWebDavLocalUploadTimer();
 }
 
 registerLibraryIpc({
@@ -2803,7 +2823,7 @@ app.whenReady().then(() => {
       startupWebDavSyncPromise = null;
       await refreshRemoteWebDavFingerprint();
       if (getSyncPending()) {
-        scheduleIdleBackgroundWebDavUpload(WEBDAV_IDLE_UPLOAD_DELAY_MS);
+        queueImmediateWebDavUpload();
       }
     }
   })();
@@ -2821,7 +2841,7 @@ app.on('before-quit', (event) => {
   if (isForceQuitting) return;
   event.preventDefault();
   isForceQuitting = true;
-  clearWebDavIdleUploadTimer();
+  clearWebDavLocalUploadTimer();
   clearWebDavRemotePollTimer();
   Promise.resolve()
     .then(async () => {

@@ -1183,7 +1183,8 @@ const createWebDavSyncModule = (deps = {}) => {
     };
   };
 
-  const syncLibraryFromWebDavToLocal = async () => {
+  const syncLibraryFromWebDavToLocal = async (options = {}) => {
+    const overwriteLocal = Boolean(options?.overwriteLocal);
     const config = await getWebDavConfigFromSettings();
     const server = config.webdavServer;
     const username = config.webdavUsername;
@@ -1246,7 +1247,7 @@ const createWebDavSyncModule = (deps = {}) => {
       }
 
       const conflict = await prepareWebDavConflictIfNeeded(client, remotePath, remoteSqlitePath);
-      if (conflict) {
+      if (conflict && !overwriteLocal) {
         emitWebDavSyncState({
           active: false,
           direction: 'download',
@@ -1260,10 +1261,42 @@ const createWebDavSyncModule = (deps = {}) => {
       const paths = getLibraryPaths();
       let downloadedPdfCount = 0;
       let downloadedPdfBytes = 0;
-      const merged = buildMergedLibraryState({
-        localData: pendingWebDavConflict?.localData || { folders: [], papers: [], states: [] },
-        remoteData: pendingWebDavConflict?.remoteData || { folders: [], papers: [], states: [] }
-      });
+      const merged = overwriteLocal
+        ? {
+            folders: Array.isArray(pendingWebDavConflict?.remoteData?.folders)
+              ? pendingWebDavConflict.remoteData.folders
+              : [],
+            papers: (Array.isArray(pendingWebDavConflict?.remoteData?.papers)
+              ? pendingWebDavConflict.remoteData.papers
+              : []
+            )
+              .map((paper) => buildSyncedRemotePaper(paper))
+              .sort((a, b) => {
+                const aTime = Number(a?.uploadedAt || 0);
+                const bTime = Number(b?.uploadedAt || 0);
+                if (aTime !== bTime) return bTime - aTime;
+                return String(a?.title || '').localeCompare(String(b?.title || ''), 'zh-Hans-CN');
+              }),
+            stateMap: new Map(
+              Array.from(buildStateMap(pendingWebDavConflict?.remoteData?.states).entries()).map(
+                ([paperId, state]) => [paperId, mergePaperState({}, state || {}, 'remote')]
+              )
+            ),
+            pdfSources: new Map(
+              (Array.isArray(pendingWebDavConflict?.remoteData?.papers)
+                ? pendingWebDavConflict.remoteData.papers
+                : []
+              )
+                .map((paper) => String(paper?.id || '').trim())
+                .filter(Boolean)
+                .map((paperId) => [paperId, 'remote'])
+            ),
+            hasLocalAheadChanges: false
+          }
+        : buildMergedLibraryState({
+            localData: pendingWebDavConflict?.localData || { folders: [], papers: [], states: [] },
+            remoteData: pendingWebDavConflict?.remoteData || { folders: [], papers: [], states: [] }
+          });
       const sqliteStat = await fs.stat(pendingWebDavConflict?.remoteTempSqlitePath).catch(() => null);
       const sqliteBytes = Number(sqliteStat?.size || 0);
       await ensureLibraryStoreReady();
@@ -1347,7 +1380,8 @@ const createWebDavSyncModule = (deps = {}) => {
     }
   };
 
-  const syncLibraryToWebDav = async () => {
+  const syncLibraryToWebDav = async (options = {}) => {
+    const overwriteRemote = Boolean(options?.overwriteRemote);
     const config = await getWebDavConfigFromSettings();
     const server = config.webdavServer;
     const username = config.webdavUsername;
@@ -1386,7 +1420,7 @@ const createWebDavSyncModule = (deps = {}) => {
 
       const paths = getLibraryPaths();
       const remoteSqlitePath = `${remotePath}/library.sqlite`;
-      if (await client.exists(remoteSqlitePath)) {
+      if (await client.exists(remoteSqlitePath) && !overwriteRemote) {
         console.log('[webdav-sync] upload step start: detect conflict');
         const conflict = await prepareWebDavConflictIfNeeded(client, remotePath, remoteSqlitePath);
         if (conflict) {
@@ -1448,6 +1482,9 @@ const createWebDavSyncModule = (deps = {}) => {
           }
           console.log('[webdav-sync] upload step done: merge remote changes into local cache');
         }
+      } else if (await client.exists(remoteSqlitePath) && overwriteRemote) {
+        console.log('[webdav-sync] upload step skip: overwrite remote with local snapshot');
+        await clearPendingWebDavConflict();
       }
       console.log('[webdav-sync] upload step start: create sqlite snapshot');
       const snapshot = await createSqliteSyncSnapshot();
