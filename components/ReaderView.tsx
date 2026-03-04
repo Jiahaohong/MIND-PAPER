@@ -1267,6 +1267,143 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     [chatThreads]
   );
 
+  const fallbackOutline = useMemo<OutlineNode[]>(() => {
+    const convert = (items: TOCItem[], parentId = 'mock') =>
+      items.map((item, index) => {
+        const id = `${parentId}${parentId ? '.' : ''}${index}`;
+        return {
+          id,
+          title: item.title,
+          pageIndex: Number.isFinite(item.page) ? Math.max(0, item.page - 1) : null,
+          topRatio: null,
+          items: item.children ? convert(item.children, id) : []
+        };
+      });
+    const rootId = `outline-root-${paper.id}`;
+    return [
+      {
+        id: rootId,
+        title: paper.title || 'Document',
+        pageIndex: 0,
+        topRatio: 0,
+        items: convert(MOCK_TOC, 'mock'),
+        isRoot: true
+      }
+    ];
+  }, [paper.id, paper.title]);
+
+  const baseOutline = useMemo(
+    () => (outlineNodes.length ? outlineNodes : fallbackOutline),
+    [outlineNodes, fallbackOutline]
+  );
+
+  const outlineRootId = baseOutline[0]?.id || `outline-root-${paper.id}`;
+
+  const getFlatOutlineByPosition = (nodes: OutlineNode[]) => {
+    const list: OutlineNode[] = [];
+    const walk = (items: OutlineNode[]) => {
+      items.forEach((node) => {
+        list.push(node);
+        if (node.items?.length) walk(node.items);
+      });
+    };
+    walk(nodes);
+    return list
+      .filter((node) => typeof node.pageIndex === 'number')
+      .sort((a, b) => {
+        if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
+          return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+        }
+        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
+      });
+  };
+
+  const baseFlatOutline = useMemo(() => getFlatOutlineByPosition(baseOutline), [baseOutline]);
+  const rebuildDocNodes = useCallback(
+    (nextAnnotations: HighlightItem[] = []) =>
+      buildDocNodesFromCurrentState(paper.id, baseOutline, nextAnnotations),
+    [paper.id, baseOutline]
+  );
+  const docNodesForRender = useMemo(
+    () => (Array.isArray(docNodes) && docNodes.length ? docNodes : rebuildDocNodes([])),
+    [docNodes, rebuildDocNodes]
+  );
+  const customChapters = useMemo(
+    () => buildCustomChaptersFromDocNodes(docNodesForRender),
+    [docNodesForRender]
+  );
+  const annotations = useMemo(
+    () => buildAnnotationsFromDocNodes(docNodesForRender),
+    [docNodesForRender]
+  );
+  const visibleHighlights = useMemo(() => getVisibleHighlights(annotations), [annotations]);
+  const annotationById = useMemo(
+    () => new Map(annotations.map((item) => [String(item.id || '').trim(), item])),
+    [annotations]
+  );
+  const noteAnnotations = useMemo(
+    () => annotations.filter((item) => item && !item.isDeleted && !item.isChapterTitle),
+    [annotations]
+  );
+  const customChapterNodeMap = useMemo(
+    () =>
+      new Map(
+        docNodesForRender
+          .filter(
+            (node) =>
+              node &&
+              !node.isDeleted &&
+              (node.kind === 'normal_chapter' || node.kind === 'highlight_chapter')
+          )
+          .map((node) => [node.id, node])
+      ),
+    [docNodesForRender]
+  );
+  const chapterAnnotationByNodeId = useMemo(
+    () =>
+      new Map(
+        annotations
+          .filter((item) => item && !item.isDeleted && item.isChapterTitle)
+          .map((item) => [String(item.chapterNodeId || item.chapterId || item.id).trim(), item])
+      ),
+    [annotations]
+  );
+
+  const setHighlights = useCallback(
+    (updater: React.SetStateAction<HighlightItem[]>) => {
+      setDocNodes((prevDocNodes) => {
+        const prevAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+        const prevHighlights = getVisibleHighlights(prevAnnotations);
+        const nextHighlights =
+          typeof updater === 'function'
+            ? (updater as (prevState: HighlightItem[]) => HighlightItem[])(prevHighlights)
+            : updater;
+        const nextAnnotations = dedupeChapterAnnotations(
+          buildAnnotationsForSave(nextHighlights, prevAnnotations)
+        );
+        return rebuildDocNodes(nextAnnotations);
+      });
+    },
+    [rebuildDocNodes]
+  );
+
+  const setCustomChapters = useCallback(
+    (updater: React.SetStateAction<OutlineNode[]>) => {
+      setDocNodes((prevDocNodes) => {
+        const prevCustomChapters = buildCustomChaptersFromDocNodes(prevDocNodes);
+        const nextCustomChapters =
+          typeof updater === 'function'
+            ? (updater as (prevState: OutlineNode[]) => OutlineNode[])(prevCustomChapters)
+            : updater;
+        const nextAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+        const nextNotes = nextAnnotations.filter((item) => !item.isChapterTitle);
+        const nextChapterAnnotations = buildChapterAnnotationsFromOutlineNodes(nextCustomChapters, nextAnnotations);
+        return rebuildDocNodes(dedupeChapterAnnotations([...nextNotes, ...nextChapterAnnotations]));
+      });
+    },
+    [rebuildDocNodes]
+  );
+
   const clonePdfBuffer = useCallback((value: unknown): ArrayBuffer | null => {
     if (value instanceof ArrayBuffer) {
       try {
@@ -3934,143 +4071,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     window.addEventListener('mouseup', handleUp);
     return () => window.removeEventListener('mouseup', handleUp);
   }, [draggingTocNoteId, draggingTocChapterId]);
-
-  const fallbackOutline = useMemo<OutlineNode[]>(() => {
-    const convert = (items: TOCItem[], parentId = 'mock') =>
-      items.map((item, index) => {
-        const id = `${parentId}${parentId ? '.' : ''}${index}`;
-        return {
-          id,
-          title: item.title,
-          pageIndex: Number.isFinite(item.page) ? Math.max(0, item.page - 1) : null,
-          topRatio: null,
-          items: item.children ? convert(item.children, id) : []
-        };
-      });
-    const rootId = `outline-root-${paper.id}`;
-    return [
-      {
-        id: rootId,
-        title: paper.title || 'Document',
-        pageIndex: 0,
-        topRatio: 0,
-        items: convert(MOCK_TOC, 'mock'),
-        isRoot: true
-      }
-    ];
-  }, [paper.id, paper.title]);
-
-  const baseOutline = useMemo(
-    () => (outlineNodes.length ? outlineNodes : fallbackOutline),
-    [outlineNodes, fallbackOutline]
-  );
-
-  const outlineRootId = baseOutline[0]?.id || `outline-root-${paper.id}`;
-
-  const getFlatOutlineByPosition = (nodes: OutlineNode[]) => {
-    const list: OutlineNode[] = [];
-    const walk = (items: OutlineNode[]) => {
-      items.forEach((node) => {
-        list.push(node);
-        if (node.items?.length) walk(node.items);
-      });
-    };
-    walk(nodes);
-    return list
-      .filter((node) => typeof node.pageIndex === 'number')
-      .sort((a, b) => {
-        if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) {
-          return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
-        }
-        return (a.topRatio ?? 0) - (b.topRatio ?? 0);
-      });
-  };
-
-  const baseFlatOutline = useMemo(() => getFlatOutlineByPosition(baseOutline), [baseOutline]);
-  const rebuildDocNodes = useCallback(
-    (nextAnnotations: HighlightItem[] = []) =>
-      buildDocNodesFromCurrentState(paper.id, baseOutline, nextAnnotations),
-    [paper.id, baseOutline]
-  );
-  const docNodesForRender = useMemo(
-    () => (Array.isArray(docNodes) && docNodes.length ? docNodes : rebuildDocNodes([])),
-    [docNodes, rebuildDocNodes]
-  );
-  const customChapters = useMemo(
-    () => buildCustomChaptersFromDocNodes(docNodesForRender),
-    [docNodesForRender]
-  );
-  const annotations = useMemo(
-    () => buildAnnotationsFromDocNodes(docNodesForRender),
-    [docNodesForRender]
-  );
-  const visibleHighlights = useMemo(() => getVisibleHighlights(annotations), [annotations]);
-  const annotationById = useMemo(
-    () => new Map(annotations.map((item) => [String(item.id || '').trim(), item])),
-    [annotations]
-  );
-  const noteAnnotations = useMemo(
-    () => annotations.filter((item) => item && !item.isDeleted && !item.isChapterTitle),
-    [annotations]
-  );
-  const customChapterNodeMap = useMemo(
-    () =>
-      new Map(
-        docNodesForRender
-          .filter(
-            (node) =>
-              node &&
-              !node.isDeleted &&
-              (node.kind === 'normal_chapter' || node.kind === 'highlight_chapter')
-          )
-          .map((node) => [node.id, node])
-      ),
-    [docNodesForRender]
-  );
-  const chapterAnnotationByNodeId = useMemo(
-    () =>
-      new Map(
-        annotations
-          .filter((item) => item && !item.isDeleted && item.isChapterTitle)
-          .map((item) => [String(item.chapterNodeId || item.chapterId || item.id).trim(), item])
-      ),
-    [annotations]
-  );
-
-  const setHighlights = useCallback(
-    (updater: React.SetStateAction<HighlightItem[]>) => {
-      setDocNodes((prevDocNodes) => {
-        const prevAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
-        const prevHighlights = getVisibleHighlights(prevAnnotations);
-        const nextHighlights =
-          typeof updater === 'function'
-            ? (updater as (prevState: HighlightItem[]) => HighlightItem[])(prevHighlights)
-            : updater;
-        const nextAnnotations = dedupeChapterAnnotations(
-          buildAnnotationsForSave(nextHighlights, prevAnnotations)
-        );
-        return rebuildDocNodes(nextAnnotations);
-      });
-    },
-    [rebuildDocNodes]
-  );
-
-  const setCustomChapters = useCallback(
-    (updater: React.SetStateAction<OutlineNode[]>) => {
-      setDocNodes((prevDocNodes) => {
-        const prevCustomChapters = buildCustomChaptersFromDocNodes(prevDocNodes);
-        const nextCustomChapters =
-          typeof updater === 'function'
-            ? (updater as (prevState: OutlineNode[]) => OutlineNode[])(prevCustomChapters)
-            : updater;
-        const nextAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
-        const nextNotes = nextAnnotations.filter((item) => !item.isChapterTitle);
-        const nextChapterAnnotations = buildChapterAnnotationsFromOutlineNodes(nextCustomChapters, nextAnnotations);
-        return rebuildDocNodes(dedupeChapterAnnotations([...nextNotes, ...nextChapterAnnotations]));
-      });
-    },
-    [rebuildDocNodes]
-  );
 
   const getChapterFallbackOrderMap = (nodes: OutlineNode[]) => {
     const map = new Map<string, number>();
