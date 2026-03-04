@@ -1041,6 +1041,7 @@ interface ReaderViewProps {
   pdfFile: { data: ArrayBuffer } | string | null;
   onBack: () => void;
   onUpdatePaper: (paperId: string, updates: Partial<Paper>) => void;
+  cloudRefreshToken?: number;
   isCloudSyncing?: boolean;
 }
 
@@ -1049,6 +1050,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   pdfFile,
   onBack,
   onUpdatePaper,
+  cloudRefreshToken = 0,
   isCloudSyncing = false
 }) => {
   const MIN_SIDE_WIDTH = 120;
@@ -2031,7 +2033,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   useEffect(() => {
     pdfDocRef.current = null;
-  }, [paper.id]);
+  }, [paper.id, cloudRefreshToken]);
 
   const clearSelection = () => {
     setSelectionText('');

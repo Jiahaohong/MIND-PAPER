@@ -56,6 +56,7 @@ const App: React.FC = () => {
   const pdfFileCacheRef = useRef<Map<string, { data: ArrayBuffer } | string>>(new Map());
   const pdfLoadPendingRef = useRef<Set<string>>(new Set());
   const [pdfFileMap, setPdfFileMap] = useState<Record<string, { data: ArrayBuffer } | string>>({});
+  const [cloudRefreshToken, setCloudRefreshToken] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState(DEFAULT_SETTINGS);
   const [settingsLoading, setSettingsLoading] = useState(false);
@@ -847,6 +848,33 @@ const App: React.FC = () => {
     setLibraryLoaded(true);
   };
 
+  const invalidateOpenPaperCaches = (paperIds?: string[]) => {
+    const targets = Array.isArray(paperIds) && paperIds.length ? new Set(paperIds) : null;
+    if (!targets) {
+      pdfFileCacheRef.current.clear();
+      pdfLoadPendingRef.current.clear();
+      setPdfFileMap({});
+      return;
+    }
+    targets.forEach((paperId) => {
+      pdfFileCacheRef.current.delete(paperId);
+      pdfLoadPendingRef.current.delete(paperId);
+    });
+    setPdfFileMap((prev) => {
+      const next = { ...prev };
+      targets.forEach((paperId) => {
+        delete next[paperId];
+      });
+      return next;
+    });
+  };
+
+  const refreshLibraryFromCloud = async (paperIds?: string[]) => {
+    invalidateOpenPaperCaches(paperIds);
+    await loadLibrary();
+    setCloudRefreshToken((prev) => prev + 1);
+  };
+
   useEffect(() => {
     loadLibrary();
   }, []);
@@ -920,7 +948,7 @@ const App: React.FC = () => {
       const nextDirection = String(payload?.direction || 'idle');
       setIsCloudSyncing(nextActive);
       if (lastActive && !nextActive && lastDirection === 'download') {
-        void loadLibrary();
+        void refreshLibraryFromCloud();
       }
       lastActive = nextActive;
       lastDirection = nextDirection;
@@ -1134,7 +1162,7 @@ const App: React.FC = () => {
       }
       setWebdavConflict(null);
       setWebdavConflictDecisions({});
-      await loadLibrary();
+      await refreshLibraryFromCloud();
     } finally {
       setWebdavResolvingConflict(false);
     }
@@ -1258,6 +1286,7 @@ const App: React.FC = () => {
                   pdfFile={getCachedPdfFile(paper)}
                   onBack={switchToLibrary}
                   onUpdatePaper={handleUpdatePaper}
+                  cloudRefreshToken={cloudRefreshToken}
                   isCloudSyncing={isCloudSyncing}
                 />
               </div>
