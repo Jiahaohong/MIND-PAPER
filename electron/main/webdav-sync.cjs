@@ -304,6 +304,31 @@ const createWebDavSyncModule = (deps = {}) => {
     h: Number(rect?.h || 0)
   });
 
+  const buildNormalizedRectKey = (rects = []) =>
+    (Array.isArray(rects) ? rects : [])
+      .map((rect) =>
+        [
+          Number(rect?.pageIndex || 0),
+          Number(rect?.x || 0).toFixed(4),
+          Number(rect?.y || 0).toFixed(4),
+          Number(rect?.w || 0).toFixed(4),
+          Number(rect?.h || 0).toFixed(4)
+        ].join(':')
+      )
+      .join('|');
+
+  const buildAnnotationIdentityKey = (item = {}) => {
+    const chapterNodeId = String(item?.chapterNodeId || item?.chapterId || '').trim();
+    if (item?.isChapterTitle && chapterNodeId) {
+      return `chapter:${chapterNodeId}`;
+    }
+    const rectKey = buildNormalizedRectKey(Array.isArray(item?.rects) ? item.rects : []);
+    if (rectKey) {
+      return `highlight:${Number(item?.pageIndex || 0)}:${rectKey}`;
+    }
+    return '';
+  };
+
   const buildAnnotationComparable = (item = {}) =>
     JSON.stringify({
       text: String(item?.text || '').trim(),
@@ -348,6 +373,35 @@ const createWebDavSyncModule = (deps = {}) => {
     };
   };
 
+  const choosePreferredAnnotationVariant = (left = null, right = null) => {
+    if (!left) return right;
+    if (!right) return left;
+    if (
+      buildAnnotationComparable(left) === buildAnnotationComparable(right) &&
+      Boolean(left.isDeleted) === Boolean(right.isDeleted)
+    ) {
+      if (Number(right.version || 0) > Number(left.version || 0)) return right;
+      if (Number(left.version || 0) > Number(right.version || 0)) return left;
+      return Number(right.updatedAt || 0) >= Number(left.updatedAt || 0) ? right : left;
+    }
+    if (Number(left.version || 0) === Number(right.baseVersion || 0)) return right;
+    if (Number(right.version || 0) === Number(left.baseVersion || 0)) return left;
+    if (Number(right.version || 0) > Number(left.version || 0)) return right;
+    if (Number(left.version || 0) > Number(right.version || 0)) return left;
+    return Number(right.updatedAt || 0) >= Number(left.updatedAt || 0) ? right : left;
+  };
+
+  const dedupeEquivalentAnnotations = (annotations = []) => {
+    const merged = new Map();
+    (Array.isArray(annotations) ? annotations : []).forEach((item) => {
+      if (!item) return;
+      const key = buildAnnotationIdentityKey(item) || `id:${String(item.id || '').trim()}`;
+      if (!key) return;
+      merged.set(key, choosePreferredAnnotationVariant(merged.get(key) || null, item));
+    });
+    return Array.from(merged.values());
+  };
+
   const getAnnotationsFromState = (state = {}) => {
     const source = Array.isArray(state?.annotations) ? state.annotations : [];
     const annotations = source.map((item) => normalizeAnnotation(item)).filter(Boolean);
@@ -389,7 +443,7 @@ const createWebDavSyncModule = (deps = {}) => {
       annotations.push(migrated);
       chapterLookup.set(chapterId, migrated);
     });
-    return annotations;
+    return dedupeEquivalentAnnotations(annotations);
   };
 
   const getVisibleAnnotations = (annotations = []) =>
@@ -617,8 +671,18 @@ const createWebDavSyncModule = (deps = {}) => {
   };
 
   const mergeAnnotations = (localState = {}, remoteState = {}) => {
-    const localMap = new Map(getAnnotationsFromState(localState).map((item) => [String(item.id), item]));
-    const remoteMap = new Map(getAnnotationsFromState(remoteState).map((item) => [String(item.id), item]));
+    const localMap = new Map(
+      getAnnotationsFromState(localState).map((item) => [
+        buildAnnotationIdentityKey(item) || `id:${String(item.id)}`,
+        item
+      ])
+    );
+    const remoteMap = new Map(
+      getAnnotationsFromState(remoteState).map((item) => [
+        buildAnnotationIdentityKey(item) || `id:${String(item.id)}`,
+        item
+      ])
+    );
     const merged = new Map();
     const allIds = new Set([...localMap.keys(), ...remoteMap.keys()]);
 

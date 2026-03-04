@@ -242,6 +242,82 @@ const HIGHLIGHT_COLORS = [
 ];
 const SHOW_MINDMAP_DROP_DEBUG = false;
 
+const hashString = (value: string) => {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash.toString(16);
+};
+
+const buildNormalizedRectKey = (rects: HighlightRect[] = []) =>
+  (Array.isArray(rects) ? rects : [])
+    .map((rect) =>
+      [
+        Number(rect?.pageIndex || 0),
+        Number(rect?.x || 0).toFixed(4),
+        Number(rect?.y || 0).toFixed(4),
+        Number(rect?.w || 0).toFixed(4),
+        Number(rect?.h || 0).toFixed(4)
+      ].join(':')
+    )
+    .join('|');
+
+const buildAnnotationIdentityKey = (item: Partial<HighlightItem> | null | undefined) => {
+  if (!item) return '';
+  const chapterNodeId = String(item.chapterNodeId || item.chapterId || '').trim();
+  if (item.isChapterTitle && chapterNodeId) {
+    return `chapter:${chapterNodeId}`;
+  }
+  const rectKey = buildNormalizedRectKey(Array.isArray(item.rects) ? item.rects : []);
+  if (rectKey) {
+    return `highlight:${Number(item.pageIndex || 0)}:${rectKey}`;
+  }
+  return '';
+};
+
+const choosePreferredAnnotationVariant = (
+  left: HighlightItem | null,
+  right: HighlightItem | null
+): HighlightItem | null => {
+  if (!left) return right;
+  if (!right) return left;
+  if (
+    buildHighlightComparable(left) === buildHighlightComparable(right) &&
+    Boolean(left.isDeleted) === Boolean(right.isDeleted)
+  ) {
+    if (Number(right.version || 0) > Number(left.version || 0)) return right;
+    if (Number(left.version || 0) > Number(right.version || 0)) return left;
+    return Number(right.updatedAt || 0) >= Number(left.updatedAt || 0) ? right : left;
+  }
+  if (Number(left.version || 0) === Number(right.baseVersion || 0)) return right;
+  if (Number(right.version || 0) === Number(left.baseVersion || 0)) return left;
+  if (Number(right.version || 0) > Number(left.version || 0)) return right;
+  if (Number(left.version || 0) > Number(right.version || 0)) return left;
+  return Number(right.updatedAt || 0) >= Number(left.updatedAt || 0) ? right : left;
+};
+
+const dedupeEquivalentAnnotations = (items: HighlightItem[]) => {
+  const merged = new Map<string, HighlightItem>();
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    if (!item) return;
+    const key = buildAnnotationIdentityKey(item) || `id:${String(item.id || '').trim()}`;
+    if (!key) return;
+    merged.set(key, choosePreferredAnnotationVariant(merged.get(key) || null, item) as HighlightItem);
+  });
+  return Array.from(merged.values());
+};
+
+const createStableSelectionId = (
+  prefix: string,
+  pageIndex: number,
+  rects: HighlightRect[],
+  extra = ''
+) => {
+  const seed = `${prefix}|${pageIndex}|${buildNormalizedRectKey(rects)}|${String(extra || '').trim()}`;
+  return `${prefix}-${hashString(seed)}`;
+};
+
 const normalizeReaderQuestion = (item: any): ReaderQuestion | null => {
   const id = String(item?.id || '').trim();
   if (!id) return null;
@@ -449,12 +525,16 @@ const normalizeSyncedHighlight = (item: any): HighlightItem | null => {
 
 const getLegacyHighlightAnnotations = (saved: any) => {
   const source = Array.isArray(saved?.highlights) ? saved.highlights : [];
-  return source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[];
+  return dedupeEquivalentAnnotations(
+    source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[]
+  );
 };
 
 const getAnnotationsFromSavedState = (saved: any): HighlightItem[] => {
   const source = Array.isArray(saved?.annotations) ? saved.annotations : [];
-  return source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[];
+  return dedupeEquivalentAnnotations(
+    source.map((item: any) => normalizeSyncedHighlight(item)).filter(Boolean) as HighlightItem[]
+  );
 };
 
 const getVisibleHighlights = (annotations: HighlightItem[]) =>
@@ -465,17 +545,27 @@ const buildAnnotationsForSave = (
   previousAnnotations: HighlightItem[]
 ): HighlightItem[] => {
   const now = Date.now();
-  const previousMap = new Map(
+  const normalizedPreviousAnnotations = dedupeEquivalentAnnotations(
     (Array.isArray(previousAnnotations) ? previousAnnotations : [])
       .map((item) => normalizeSyncedHighlight(item))
-      .filter(Boolean)
-      .map((item) => [String(item!.id), item!])
+      .filter(Boolean) as HighlightItem[]
   );
-  const currentMap = new Map(
+  const normalizedCurrentHighlights = dedupeEquivalentAnnotations(
     (Array.isArray(currentHighlights) ? currentHighlights : [])
       .map((item) => normalizeSyncedHighlight(item))
-      .filter(Boolean)
-      .map((item) => [String(item!.id), item!])
+      .filter(Boolean) as HighlightItem[]
+  );
+  const previousMap = new Map(
+    normalizedPreviousAnnotations.map((item) => [
+      buildAnnotationIdentityKey(item) || String(item.id),
+      item
+    ])
+  );
+  const currentMap = new Map(
+    normalizedCurrentHighlights.map((item) => [
+      buildAnnotationIdentityKey(item) || String(item.id),
+      item
+    ])
   );
   const merged = new Map<string, HighlightItem>();
   const allIds = new Set([...previousMap.keys(), ...currentMap.keys()]);
@@ -532,7 +622,7 @@ const buildAnnotationsForSave = (
     }
   });
 
-  return Array.from(merged.values()).sort((a, b) => {
+  return dedupeEquivalentAnnotations(Array.from(merged.values())).sort((a, b) => {
     const deletedA = a.isDeleted ? 1 : 0;
     const deletedB = b.isDeleted ? 1 : 0;
     if (deletedA !== deletedB) return deletedA - deletedB;
@@ -581,7 +671,7 @@ const dedupeChapterAnnotations = (annotations: HighlightItem[]) => {
             : undefined
     };
   });
-  return sortHighlightItems([...noteItems, ...chapterItems]);
+  return sortHighlightItems(dedupeEquivalentAnnotations([...noteItems, ...chapterItems]));
 };
 
 const buildDocNodesFromCurrentState = (
@@ -2224,8 +2314,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const cachedTranslation = translationCacheRef.current.get(
       normalizeTranslationText(selectionText)
     );
+    const prefix = options.isChapterTitle ? 'chapter-highlight' : 'highlight';
+    const stableId =
+      typeof options.id === 'string' && options.id.trim()
+        ? options.id.trim()
+        : createStableSelectionId(prefix, selectionInfo.pageIndex, selectionInfo.rects, paper.id);
     const base: HighlightItem = {
-      id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      id: stableId,
       text: selectionText,
       color,
       pageIndex: selectionInfo.pageIndex,
@@ -2265,8 +2360,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const cachedTranslation = translationCacheRef.current.get(
       normalizeTranslationText(text)
     );
+    const prefix = options.isChapterTitle ? 'chapter-highlight' : 'highlight';
+    const stableId =
+      typeof options.id === 'string' && options.id.trim()
+        ? options.id.trim()
+        : createStableSelectionId(prefix, info.pageIndex, info.rects, paper.id);
     const base: HighlightItem = {
-      id: `h-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      id: stableId,
       text,
       color,
       pageIndex: info.pageIndex,
@@ -2560,7 +2660,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         : getCombinedOrderValue(parentId);
 
     const chapterNode: OutlineNode = {
-      id: `custom-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      id: createStableSelectionId('custom', pageIndex, rects, `${paper.id}|${parentId}`),
       title,
       pageIndex,
       topRatio,
