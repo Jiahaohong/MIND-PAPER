@@ -1296,6 +1296,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     () => (outlineNodes.length ? outlineNodes : fallbackOutline),
     [outlineNodes, fallbackOutline]
   );
+  const baseOutlineRef = useRef<OutlineNode[]>(baseOutline);
+  baseOutlineRef.current = baseOutline;
 
   const outlineRootId = baseOutline[0]?.id || `outline-root-${paper.id}`;
 
@@ -5512,7 +5514,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         setDocNodes(
           !migratedAnnotations.length && savedDocNodes.length
             ? savedDocNodes
-            : buildDocNodesFromCurrentState(paper.id, baseOutline, migratedAnnotations)
+            : buildDocNodesFromCurrentState(
+                paper.id,
+                baseOutlineRef.current.length ? baseOutlineRef.current : fallbackOutline,
+                migratedAnnotations
+              )
         );
         const savedQuestionsState = getSavedQuestionsState(saved);
         const savedMindmapState = getSavedMindmapState(saved);
@@ -5546,17 +5552,22 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     try {
       const outline = await doc.getOutline();
       const tree = outline?.length ? await buildOutlineTree(doc, outline, '') : [];
+      const rootNode: OutlineNode = {
+        id: `outline-root-${paper.id}`,
+        title: paper.title || 'Document',
+        pageIndex: 0,
+        topRatio: 0,
+        items: tree,
+        isRoot: true
+      };
       setOutlineNodes((prev) => {
-        const existingRootId = prev[0]?.id || `outline-root-${paper.id}`;
-        const rootNode: OutlineNode = {
-          id: existingRootId,
-          title: paper.title || 'Document',
-          pageIndex: 0,
-          topRatio: 0,
-          items: tree,
-          isRoot: true
-        };
-        return [rootNode];
+        const existingRootId = prev[0]?.id || rootNode.id;
+        return [{ ...rootNode, id: existingRootId }];
+      });
+      setDocNodes((prevDocNodes) => {
+        if (!Array.isArray(prevDocNodes) || !prevDocNodes.length) return prevDocNodes;
+        const currentAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+        return buildDocNodesFromCurrentState(paper.id, [{ ...rootNode }], currentAnnotations);
       });
       const rootId = `outline-root-${paper.id}`;
       setExpandedTOC((prev) => {
