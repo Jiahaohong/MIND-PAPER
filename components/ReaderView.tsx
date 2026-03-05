@@ -16,7 +16,8 @@ import {
   Ban,
   Plus,
   Pencil,
-  RefreshCw
+  RefreshCw,
+  Cloud
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { Paper, PaperReference, TOCItem, ReaderMode, AssistantTab, Message, DocNode } from '../types';
@@ -1134,6 +1135,7 @@ interface ReaderViewProps {
   pdfFile: { data: ArrayBuffer } | string | null;
   onBack: () => void;
   onUpdatePaper: (paperId: string, updates: Partial<Paper>) => void;
+  onCloudSync?: () => Promise<{ success: boolean; skipped?: boolean; error?: string } | void>;
   cloudRefreshToken?: number;
   isCloudSyncing?: boolean;
 }
@@ -1143,6 +1145,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   pdfFile,
   onBack,
   onUpdatePaper,
+  onCloudSync,
   cloudRefreshToken = 0,
   isCloudSyncing = false
 }) => {
@@ -2121,6 +2124,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       setInfoRefreshError(error?.message || '解析失败');
     } finally {
       setInfoRefreshing(false);
+    }
+  };
+
+  const handleToolbarCloudSync = async () => {
+    if (isCloudSyncing || !onCloudSync) return;
+    try {
+      await onCloudSync();
+    } catch (error: any) {
+      console.warn('[webdav-sync] reader toolbar sync failed:', error?.message || error);
     }
   };
 
@@ -6285,6 +6297,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           )}
           {viewMode === ReaderMode.MIND_MAP ? (
             <div className="flex items-center gap-1 text-gray-600">
+              <Tooltip label={isCloudSyncing ? '云同步中' : '云同步'}>
+                <button
+                  onClick={handleToolbarCloudSync}
+                  disabled={isCloudSyncing}
+                  className="p-1 rounded hover:bg-gray-200 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label="云同步"
+                >
+                  <Cloud size={14} className={isCloudSyncing ? 'animate-pulse' : ''} />
+                </button>
+              </Tooltip>
               <button
                 onClick={() => setMindmapZoom((z) => Math.max(50, z - 10))}
                 className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"
@@ -6303,6 +6325,16 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             </div>
           ) : (
             <div className="flex items-center gap-1 text-gray-600">
+              <Tooltip label={isCloudSyncing ? '云同步中' : '云同步'}>
+                <button
+                  onClick={handleToolbarCloudSync}
+                  disabled={isCloudSyncing}
+                  className="p-1 rounded hover:bg-gray-200 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label="云同步"
+                >
+                  <Cloud size={14} className={isCloudSyncing ? 'animate-pulse' : ''} />
+                </button>
+              </Tooltip>
               <button
                 onClick={() => setPdfZoom((z) => Math.max(50, z - 10))}
                 className="p-1 rounded hover:bg-gray-200 hover:text-gray-900"

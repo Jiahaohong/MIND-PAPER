@@ -2310,6 +2310,32 @@ registerWebDavSyncIpc({
   syncLibraryFromWebDavToLocal
 });
 
+ipcMain.handle('webdav-sync-smart', async () =>
+  enqueueWrite(async () => {
+    try {
+      await ensureLibraryStoreReady();
+      await flushWrites();
+      if (getSyncPending()) {
+        const result = await syncLibraryToWebDav();
+        return {
+          ...(result || {}),
+          mode: 'upload'
+        };
+      }
+      const result = await syncLibraryFromWebDavToLocal();
+      return {
+        ...(result || {}),
+        mode: 'download'
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || '云同步失败'
+      };
+    }
+  })
+);
+
 async function runBackgroundWebDavUpload() {
   if (isForceQuitting) return { success: false, skipped: true, reason: 'quitting' };
   if (startupWebDavSyncPromise) {
@@ -2821,8 +2847,6 @@ app.whenReady().then(() => {
       }
     }
   })();
-
-  ensureBackgroundWebDavRemotePoll();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

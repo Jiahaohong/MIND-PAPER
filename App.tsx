@@ -1047,10 +1047,16 @@ const App: React.FC = () => {
   };
 
   const handleCloudSyncUpload = async () => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.syncUpload) {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav) {
       return { success: false, error: '当前环境不支持云同步' };
     }
-    return window.electronAPI.webdav.syncUpload();
+    if (window.electronAPI.webdav.syncSmart) {
+      return window.electronAPI.webdav.syncSmart();
+    }
+    if (window.electronAPI.webdav.syncUpload) {
+      return window.electronAPI.webdav.syncUpload();
+    }
+    return { success: false, error: '当前环境不支持云同步' };
   };
 
   const handleCloudSyncDownload = async () => {
@@ -1178,6 +1184,7 @@ const App: React.FC = () => {
                   pdfFile={getCachedPdfFile(paper)}
                   onBack={switchToLibrary}
                   onUpdatePaper={handleUpdatePaper}
+                  onCloudSync={handleCloudSyncUpload}
                   cloudRefreshToken={cloudRefreshToken}
                   isCloudSyncing={isCloudSyncing}
                 />

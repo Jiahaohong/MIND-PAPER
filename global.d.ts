@@ -159,6 +159,19 @@ declare global {
           server?: string;
           error?: string;
         }>;
+        syncSmart?: () => Promise<{
+          success: boolean;
+          skipped?: boolean;
+          mode?: 'upload' | 'download';
+          sqliteBytes?: number;
+          uploadedPdfCount?: number;
+          uploadedPdfBytes?: number;
+          downloadedPdfCount?: number;
+          downloadedPdfBytes?: number;
+          remotePath?: string;
+          server?: string;
+          error?: string;
+        }>;
       };
       vector?: {
         status?: () => Promise<{

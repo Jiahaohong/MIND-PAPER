@@ -36,7 +36,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getSyncStatus: () => ipcRenderer.invoke('webdav-get-sync-status'),
     clearLock: () => ipcRenderer.invoke('webdav-clear-lock'),
     syncUpload: () => ipcRenderer.invoke('webdav-sync-upload'),
-    syncDownload: () => ipcRenderer.invoke('webdav-sync-download')
+    syncDownload: () => ipcRenderer.invoke('webdav-sync-download'),
+    syncSmart: () => ipcRenderer.invoke('webdav-sync-smart')
   },
   vector: {
     status: () => ipcRenderer.invoke('vector-get-status'),
