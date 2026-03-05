@@ -2314,7 +2314,6 @@ ipcMain.handle('webdav-sync-smart', async () =>
   enqueueWrite(async () => {
     try {
       await ensureLibraryStoreReady();
-      await flushWrites();
       if (getSyncPending()) {
         const result = await syncLibraryToWebDav();
         return {

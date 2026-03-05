@@ -392,6 +392,11 @@ const normalizeVersionedStateEnvelope = <T,>(
 };
 
 const buildStateComparable = (value: unknown) => JSON.stringify(value ?? null);
+const buildPaperStateAutosaveComparable = (value: unknown) =>
+  JSON.stringify({
+    ...(value && typeof value === 'object' ? (value as Record<string, unknown>) : {}),
+    updatedAt: 0
+  });
 
 const buildNextVersionedState = <T,>(
   previous: VersionedStateEnvelope<T> | null,
@@ -1271,6 +1276,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const pendingTranslationTextRef = useRef<string | null>(null);
   const saveStateTimerRef = useRef<number | null>(null);
   const paperStateLoadedRef = useRef(false);
+  const lastAutosaveComparableRef = useRef<string>('');
+  const suspendAutosaveRef = useRef(true);
+  const resumeAutosaveTimerRef = useRef<number | null>(null);
+  const loadedPaperIdRef = useRef<string | null>(null);
   const questionsStateRef = useRef<VersionedStateEnvelope<ReaderQuestion[]> | null>(null);
   const mindmapStateV2StateRef = useRef<VersionedStateEnvelope<MindmapStateV2 | null> | null>(null);
   const aiConversationsStateRef = useRef<VersionedStateEnvelope<AiConversationSyncPayload> | null>(null);
@@ -2138,7 +2147,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   useEffect(() => {
     pdfDocRef.current = null;
-  }, [paper.id, cloudRefreshToken]);
+  }, [paper.id]);
 
   const clearSelection = () => {
     setSelectionText('');
@@ -5112,7 +5121,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       questionsStateRef.current = nextQuestionsState;
       mindmapStateV2StateRef.current = nextMindmapState;
       aiConversationsStateRef.current = nextAiConversationsState;
-      window.electronAPI?.library?.savePaperState?.(paper.id, {
+      const nextStatePayload = {
         annotations,
         mindmapStateV2: nextMindmapState.value,
         mindmapStateV2State: nextMindmapState,
@@ -5122,6 +5131,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         activeChatId: nextAiConversationsState.value.activeChatId,
         aiConversationsState: nextAiConversationsState,
         updatedAt: Date.now()
+      };
+      const nextComparable = buildPaperStateAutosaveComparable(nextStatePayload);
+      if (suspendAutosaveRef.current) {
+        // During open/load normalization, keep baseline in sync but never write local state.
+        lastAutosaveComparableRef.current = nextComparable;
+        return;
+      }
+      if (!lastAutosaveComparableRef.current) {
+        // Prime baseline on initial load/cloud refresh without creating local dirty state.
+        lastAutosaveComparableRef.current = nextComparable;
+        return;
+      }
+      if (lastAutosaveComparableRef.current === nextComparable) {
+        return;
+      }
+      void window.electronAPI?.library?.savePaperState?.(paper.id, nextStatePayload).then((result: any) => {
+        if (result?.ok !== false) {
+          lastAutosaveComparableRef.current = nextComparable;
+        }
       });
     }, 400);
     return () => {
@@ -5531,70 +5559,80 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   useEffect(() => {
     let cancelled = false;
+    const shouldResetForPaperChange = loadedPaperIdRef.current !== paper.id;
+    loadedPaperIdRef.current = paper.id;
     paperStateLoadedRef.current = false;
-    setOutlineNodes([]);
-    setExpandedTOC(new Set());
-    setNumPages(0);
-    setDocNodes([]);
-    setSelectionText('');
-    setSelectionRect(null);
-    setSelectionInfo(null);
-    setActiveHighlightId(null);
-    setActiveHighlightColor(null);
-    setTranslationResult('');
-    setExpandedHighlightIds(new Set());
-    setCollapsedMindmapIds(new Set());
-    setMindmapOffset({ x: 0, y: 0 });
-    setIsMindmapPanning(false);
-    setDraggingNoteId(null);
-    setDraggingChapterId(null);
-    setDragOverMindmapTarget(null);
-    setMindmapDropLastHit('none');
-    setMindmapDropOrderDebug('');
-    dragOverMindmapTargetRef.current = null;
-    setDraggingTocNoteId(null);
-    setDraggingTocChapterId(null);
-    setDragOverTocId(null);
-    setDragGhost(null);
-    setMindmapEditing(null);
-    setMindmapEditValue('');
-    setChatThreads([]);
-    setActiveChatId(null);
-    setInput('');
-    setIsTyping(false);
-    if (typeof window !== 'undefined') {
-      if (dragNoteTimerRef.current) {
-        window.clearTimeout(dragNoteTimerRef.current);
-      }
-      if (dragChapterTimerRef.current) {
-        window.clearTimeout(dragChapterTimerRef.current);
-      }
-      if (tocDragNoteTimerRef.current) {
-        window.clearTimeout(tocDragNoteTimerRef.current);
-      }
-      if (tocDragChapterTimerRef.current) {
-        window.clearTimeout(tocDragChapterTimerRef.current);
-      }
+    lastAutosaveComparableRef.current = '';
+    suspendAutosaveRef.current = true;
+    if (resumeAutosaveTimerRef.current) {
+      window.clearTimeout(resumeAutosaveTimerRef.current);
+      resumeAutosaveTimerRef.current = null;
     }
-    dragNoteTimerRef.current = null;
-    dragChapterTimerRef.current = null;
-    dragNoteRef.current = null;
-    dragNoteTriggeredRef.current = false;
-    dragChapterRef.current = null;
-    dragChapterTriggeredRef.current = false;
-    tocDragNoteTimerRef.current = null;
-    tocDragChapterTimerRef.current = null;
-    tocDragNoteRef.current = null;
-    tocDragNoteTriggeredRef.current = false;
-    tocDragChapterRef.current = null;
-    tocDragChapterTriggeredRef.current = false;
-    mindmapLayoutRef.current = null;
-    mindmapAnchorRef.current = null;
-    mindmapPanRef.current = null;
-    mindmapStateRef.current = null;
-    questionsStateRef.current = null;
-    mindmapStateV2StateRef.current = null;
-    aiConversationsStateRef.current = null;
+    if (shouldResetForPaperChange) {
+      setOutlineNodes([]);
+      setExpandedTOC(new Set());
+      setNumPages(0);
+      setDocNodes([]);
+      setSelectionText('');
+      setSelectionRect(null);
+      setSelectionInfo(null);
+      setActiveHighlightId(null);
+      setActiveHighlightColor(null);
+      setTranslationResult('');
+      setExpandedHighlightIds(new Set());
+      setCollapsedMindmapIds(new Set());
+      setMindmapOffset({ x: 0, y: 0 });
+      setIsMindmapPanning(false);
+      setDraggingNoteId(null);
+      setDraggingChapterId(null);
+      setDragOverMindmapTarget(null);
+      setMindmapDropLastHit('none');
+      setMindmapDropOrderDebug('');
+      dragOverMindmapTargetRef.current = null;
+      setDraggingTocNoteId(null);
+      setDraggingTocChapterId(null);
+      setDragOverTocId(null);
+      setDragGhost(null);
+      setMindmapEditing(null);
+      setMindmapEditValue('');
+      setChatThreads([]);
+      setActiveChatId(null);
+      setInput('');
+      setIsTyping(false);
+      if (typeof window !== 'undefined') {
+        if (dragNoteTimerRef.current) {
+          window.clearTimeout(dragNoteTimerRef.current);
+        }
+        if (dragChapterTimerRef.current) {
+          window.clearTimeout(dragChapterTimerRef.current);
+        }
+        if (tocDragNoteTimerRef.current) {
+          window.clearTimeout(tocDragNoteTimerRef.current);
+        }
+        if (tocDragChapterTimerRef.current) {
+          window.clearTimeout(tocDragChapterTimerRef.current);
+        }
+      }
+      dragNoteTimerRef.current = null;
+      dragChapterTimerRef.current = null;
+      dragNoteRef.current = null;
+      dragNoteTriggeredRef.current = false;
+      dragChapterRef.current = null;
+      dragChapterTriggeredRef.current = false;
+      tocDragNoteTimerRef.current = null;
+      tocDragChapterTimerRef.current = null;
+      tocDragNoteRef.current = null;
+      tocDragNoteTriggeredRef.current = false;
+      tocDragChapterRef.current = null;
+      tocDragChapterTriggeredRef.current = false;
+      mindmapLayoutRef.current = null;
+      mindmapAnchorRef.current = null;
+      mindmapPanRef.current = null;
+      mindmapStateRef.current = null;
+      questionsStateRef.current = null;
+      mindmapStateV2StateRef.current = null;
+      aiConversationsStateRef.current = null;
+    }
     const loadState = async () => {
       if (typeof window === 'undefined' || !window.electronAPI?.library) {
         setQuestions([]);
@@ -5660,8 +5698,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     loadState();
     return () => {
       cancelled = true;
+      if (resumeAutosaveTimerRef.current) {
+        window.clearTimeout(resumeAutosaveTimerRef.current);
+        resumeAutosaveTimerRef.current = null;
+      }
     };
-  }, [paper.id]);
+  }, [paper.id, cloudRefreshToken]);
 
   const handleDocumentLoad = async (doc: PDFDocumentProxy) => {
     pdfDocRef.current = doc;
@@ -5695,6 +5737,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     } catch (error) {
       console.error('Outline load error:', error);
       setOutlineNodes([]);
+    } finally {
+      if (resumeAutosaveTimerRef.current) {
+        window.clearTimeout(resumeAutosaveTimerRef.current);
+      }
+      // Wait one frame window for automatic outline/order normalization to settle.
+      resumeAutosaveTimerRef.current = window.setTimeout(() => {
+        suspendAutosaveRef.current = false;
+        resumeAutosaveTimerRef.current = null;
+      }, 800);
     }
   };
 
@@ -6495,6 +6546,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                           scale={pdfZoom / 100}
                           renderAnnotationLayer={false}
                           renderTextLayer
+                          onRenderTextLayerError={(error) => {
+                            if (String((error as any)?.name || '') === 'AbortException') return;
+                            console.error('PDF text layer render error:', error);
+                          }}
                         />
                         {highlightRectsByPage.get(index)?.length ? (
                           <div className="absolute inset-0 pointer-events-none">

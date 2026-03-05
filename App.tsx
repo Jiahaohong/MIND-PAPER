@@ -897,8 +897,6 @@ const App: React.FC = () => {
       const nextDirection = String(payload?.direction || 'idle');
       setIsCloudSyncing(nextActive);
       if (lastActive && !nextActive && lastDirection === 'download') {
-        void refreshLibraryFromCloud();
-      } else if (lastActive && !nextActive && lastDirection === 'upload') {
         void refreshLibraryFromCloud(undefined, { invalidatePdfCaches: false });
       }
       lastActive = nextActive;
