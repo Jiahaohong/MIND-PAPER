@@ -2401,7 +2401,7 @@ async function runBackgroundWebDavDownload() {
     }
     console.log('[webdav-sync] background remote-poll start');
     const result = await syncLibraryFromWebDavToLocal();
-    if (remoteFingerprint.fingerprint) {
+    if (result?.success && remoteFingerprint.fingerprint) {
       lastObservedRemoteWebDavFingerprint = remoteFingerprint.fingerprint;
     }
     console.log(
@@ -2798,10 +2798,11 @@ app.whenReady().then(() => {
   })();
 
   startupWebDavSyncPromise = (async () => {
+    let startupDownloadResult = null;
     try {
       await ensureLibraryStoreReady();
-      const result = await syncLibraryFromWebDavToLocal();
-      if (result?.success) {
+      startupDownloadResult = await syncLibraryFromWebDavToLocal();
+      if (startupDownloadResult?.success) {
         await ensureLibraryStoreReady();
         const syncedPapers = await loadPapersFromSqlite();
         if (Array.isArray(syncedPapers) && syncedPapers.length) {
@@ -2812,7 +2813,9 @@ app.whenReady().then(() => {
       console.warn('[webdav-sync] startup download failed:', error?.message || error);
     } finally {
       startupWebDavSyncPromise = null;
-      await refreshRemoteWebDavFingerprint();
+      if (startupDownloadResult?.success) {
+        await refreshRemoteWebDavFingerprint();
+      }
       if (getSyncPending()) {
         queueImmediateWebDavUpload();
       }
