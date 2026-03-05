@@ -59,7 +59,7 @@ const toOptionalBoolean = (value: unknown) => {
 
 export const buildMindmapStateV2FromOutline = (
   outlineRoot: OutlineNodeLike | null | undefined,
-  updatedAt = Date.now()
+  updatedAt = 0
 ): MindmapStateV2 | null => {
   if (!outlineRoot || !outlineRoot.id) return null;
   const nodes: Record<string, MindmapStateV2Node> = {};
@@ -86,7 +86,7 @@ export const buildMindmapStateV2FromOutline = (
     version: 2,
     rootId: outlineRoot.id,
     nodes,
-    updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now()
+    updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0
   };
 };
 

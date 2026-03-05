@@ -142,38 +142,21 @@ declare global {
         }>;
         syncUpload?: () => Promise<{
           success: boolean;
-          conflict?: boolean;
           sqliteBytes?: number;
           uploadedPdfCount?: number;
           uploadedPdfBytes?: number;
           remotePath?: string;
           server?: string;
-          items?: Array<any>;
-          mode?: string;
           error?: string;
         }>;
         syncDownload?: () => Promise<{
           success: boolean;
-          conflict?: boolean;
           skipped?: boolean;
           sqliteBytes?: number;
           downloadedPdfCount?: number;
           downloadedPdfBytes?: number;
           remotePath?: string;
           server?: string;
-          items?: Array<any>;
-          mode?: string;
-          error?: string;
-        }>;
-        resolveConflicts?: (payload: {
-          strategy?: 'keep-local' | 'keep-remote' | '';
-          decisions?: Record<string, 'local' | 'remote'>;
-        }) => Promise<{
-          success: boolean;
-          resolved?: boolean;
-          uploaded?: {
-            success?: boolean;
-          };
           error?: string;
         }>;
       };

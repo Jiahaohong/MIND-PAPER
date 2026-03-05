@@ -12,27 +12,6 @@ import {
 } from './services/pdfMetadataService';
 import { resolvePaperMetadata } from './services/paperMetadataResolver';
 
-type WebDavConflictItem = {
-  paperId: string;
-  title: string;
-  localBaseVersion?: number;
-  localVersion?: number;
-  remoteVersion?: number;
-  localUpdatedAt?: number;
-  remoteUpdatedAt?: number;
-  localBehindRemote?: boolean;
-  stateConflicts?: Array<'questions' | 'mindmapStateV2' | 'aiConversations'>;
-};
-
-type ConflictSection = 'paperMeta' | 'questions' | 'mindmapStateV2' | 'aiConversations';
-
-const CONFLICT_SECTION_LABELS: Record<ConflictSection, string> = {
-  paperMeta: '论文元数据',
-  questions: '问题列表',
-  mindmapStateV2: '导图',
-  aiConversations: '聊天记录'
-};
-
 const App: React.FC = () => {
   const SAVED_WEBDAV_PASSWORD_MASK = '********';
   const DEFAULT_SETTINGS = {
@@ -70,12 +49,6 @@ const App: React.FC = () => {
   const [webdavSaving, setWebdavSaving] = useState(false);
   const [webdavClearingLock, setWebdavClearingLock] = useState(false);
   const [isCloudSyncing, setIsCloudSyncing] = useState(false);
-  const [webdavConflict, setWebdavConflict] = useState<{
-    mode: 'upload' | 'download';
-    items: WebDavConflictItem[];
-  } | null>(null);
-  const [webdavConflictDecisions, setWebdavConflictDecisions] = useState<Record<string, 'local' | 'remote'>>({});
-  const [webdavResolvingConflict, setWebdavResolvingConflict] = useState(false);
 
   const getWebDavServerEditablePart = (value: string) =>
     String(value || '')
@@ -85,32 +58,6 @@ const App: React.FC = () => {
 
   const normalizeWebDavServerInput = (value: string) =>
     getWebDavServerEditablePart(value).replace(/\/+$/, '');
-
-  const formatConflictTime = (value?: number) => {
-    const time = Number(value || 0);
-    if (!Number.isFinite(time) || time <= 0) return '-';
-    return new Date(time).toLocaleString('zh-CN', { hour12: false });
-  };
-
-  const getConflictSections = (item: WebDavConflictItem): ConflictSection[] => {
-    const sections: ConflictSection[] = [];
-    const baseVersion = Math.max(0, Number(item.localBaseVersion || 0) || 0);
-    const localVersion = Math.max(0, Number(item.localVersion || 0) || 0);
-    const remoteVersion = Math.max(0, Number(item.remoteVersion || 0) || 0);
-    if (localVersion > baseVersion && remoteVersion > baseVersion) {
-      sections.push('paperMeta');
-    }
-    const stateSections = Array.isArray(item.stateConflicts) ? item.stateConflicts : [];
-    stateSections.forEach((section) => {
-      if (
-        (section === 'questions' || section === 'mindmapStateV2' || section === 'aiConversations') &&
-        !sections.includes(section)
-      ) {
-        sections.push(section);
-      }
-    });
-    return sections;
-  };
 
   const commitWebDavServerInput = () => {
     const normalized = normalizeWebDavServerInput(webdavServerInput);
@@ -869,8 +816,10 @@ const App: React.FC = () => {
     });
   };
 
-  const refreshLibraryFromCloud = async (paperIds?: string[]) => {
-    invalidateOpenPaperCaches(paperIds);
+  const refreshLibraryFromCloud = async (paperIds?: string[], options?: { invalidatePdfCaches?: boolean }) => {
+    if (options?.invalidatePdfCaches !== false) {
+      invalidateOpenPaperCaches(paperIds);
+    }
     await loadLibrary();
     setCloudRefreshToken((prev) => prev + 1);
   };
@@ -949,6 +898,8 @@ const App: React.FC = () => {
       setIsCloudSyncing(nextActive);
       if (lastActive && !nextActive && lastDirection === 'download') {
         void refreshLibraryFromCloud();
+      } else if (lastActive && !nextActive && lastDirection === 'upload') {
+        void refreshLibraryFromCloud(undefined, { invalidatePdfCaches: false });
       }
       lastActive = nextActive;
       lastDirection = nextDirection;
@@ -965,34 +916,6 @@ const App: React.FC = () => {
     return () => {
       mounted = false;
       window.removeEventListener('mindpaper-webdav-sync', handler as EventListener);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const handler = (event: Event) => {
-      const detail = ((event as CustomEvent).detail || {}) as {
-        active?: boolean;
-        mode?: 'upload' | 'download';
-        items?: WebDavConflictItem[];
-      };
-      if (!detail?.active) {
-        setWebdavConflict(null);
-        setWebdavConflictDecisions({});
-        return;
-      }
-      const items = Array.isArray(detail.items) ? detail.items : [];
-      setWebdavConflict({
-        mode: detail.mode === 'upload' ? 'upload' : 'download',
-        items
-      });
-      setWebdavConflictDecisions(
-        Object.fromEntries(items.map((item) => [item.paperId, 'local' as const]))
-      );
-    };
-    window.addEventListener('mindpaper-webdav-conflict', handler as EventListener);
-    return () => {
-      window.removeEventListener('mindpaper-webdav-conflict', handler as EventListener);
     };
   }, []);
 
@@ -1112,8 +1035,6 @@ const App: React.FC = () => {
         const downloadResult = await handleCloudSyncDownload();
         if (downloadResult?.success) {
           setWebdavStatus('已从云端同步到本地');
-        } else if (downloadResult?.conflict) {
-          setWebdavStatus('检测到本地与云端冲突，请先处理冲突');
         } else if (!downloadResult?.skipped) {
           setWebdavStatus(downloadResult?.error || '云端同步失败');
         }
@@ -1137,35 +1058,6 @@ const App: React.FC = () => {
       return { success: false, error: '当前环境不支持云同步' };
     }
     return window.electronAPI.webdav.syncDownload();
-  };
-
-  const applyConflictStrategy = (choice: 'local' | 'remote') => {
-    if (!webdavConflict?.items?.length) return;
-    setWebdavConflictDecisions(
-      Object.fromEntries(webdavConflict.items.map((item) => [item.paperId, choice]))
-    );
-  };
-
-  const handleResolveWebDavConflict = async (strategy: 'keep-local' | 'keep-remote' | '') => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.resolveConflicts || !webdavConflict) {
-      return;
-    }
-    setWebdavResolvingConflict(true);
-    try {
-      const result = await window.electronAPI.webdav.resolveConflicts({
-        strategy,
-        decisions: webdavConflictDecisions
-      });
-      if (!result?.success) {
-        window.alert(result?.error || '处理云端冲突失败');
-        return;
-      }
-      setWebdavConflict(null);
-      setWebdavConflictDecisions({});
-      await refreshLibraryFromCloud();
-    } finally {
-      setWebdavResolvingConflict(false);
-    }
   };
 
   const handleClearWebDavLock = async () => {
@@ -1574,119 +1466,6 @@ const App: React.FC = () => {
                 className="px-3 py-1.5 rounded-md text-xs bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
               >
                 {settingsLoading ? '保存中...' : settingsSaved ? '已保存' : '保存设置'}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {webdavConflict ? (
-        <div className="fixed inset-0 z-[60] bg-black/30 flex items-center justify-center">
-          <div className="w-[680px] max-h-[80vh] overflow-hidden bg-white rounded-xl shadow-xl border border-gray-200 p-4 flex flex-col">
-            <div className="flex items-center justify-between mb-3">
-              <div>
-                <div className="text-sm font-semibold text-gray-800">云端冲突处理</div>
-                <div className="text-xs text-gray-500 mt-1">
-                  检测到本地与云端存在同一论文的差异。下方会标明冲突发生在论文元数据、问题列表、导图或聊天记录。PDF 仍然只能二选一；无冲突论文会自动同时保留。
-                </div>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 mb-3">
-              <button
-                type="button"
-                onClick={() => applyConflictStrategy('local')}
-                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50"
-              >
-                保留本地
-              </button>
-              <button
-                type="button"
-                onClick={() => applyConflictStrategy('remote')}
-                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50"
-              >
-                保留云端
-              </button>
-              <button
-                type="button"
-                onClick={() => handleResolveWebDavConflict('')}
-                disabled={webdavResolvingConflict}
-                className="px-3 py-1.5 rounded-md text-xs bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-50"
-              >
-                {webdavResolvingConflict ? '处理中...' : '合并二者'}
-              </button>
-            </div>
-
-            <div className="flex-1 overflow-auto rounded-lg border border-gray-200">
-              {webdavConflict.items.map((item) => {
-                const value = webdavConflictDecisions[item.paperId] || 'local';
-                const conflictSections = getConflictSections(item);
-                return (
-                  <div key={item.paperId} className="px-3 py-3 border-b border-gray-100 last:border-b-0">
-                    <div className="text-sm font-medium text-gray-800">{item.title || item.paperId}</div>
-                    <div className="mt-1 text-[11px] text-gray-500">
-                      基线版本 v{item.localBaseVersion || 0} / 本地版本 v{item.localVersion || 1} / 云端版本 v
-                      {item.remoteVersion || 1}
-                    </div>
-                    <div className="mt-1 text-[11px] text-gray-400">
-                      本地更新时间 {formatConflictTime(item.localUpdatedAt)} / 云端更新时间{' '}
-                      {formatConflictTime(item.remoteUpdatedAt)}
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {conflictSections.map((section) => (
-                        <span
-                          key={`${item.paperId}-${section}`}
-                          className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700 ring-1 ring-inset ring-amber-200"
-                        >
-                          {CONFLICT_SECTION_LABELS[section]}
-                        </span>
-                      ))}
-                    </div>
-                    <div className="mt-2 flex items-center gap-4 text-xs">
-                      <label className="flex items-center gap-1 text-gray-700">
-                        <input
-                          type="radio"
-                          name={`webdav-conflict-${item.paperId}`}
-                          checked={value === 'local'}
-                          onChange={() =>
-                            setWebdavConflictDecisions((prev) => ({ ...prev, [item.paperId]: 'local' }))
-                          }
-                        />
-                        本地版本
-                      </label>
-                      <label className="flex items-center gap-1 text-gray-700">
-                        <input
-                          type="radio"
-                          name={`webdav-conflict-${item.paperId}`}
-                          checked={value === 'remote'}
-                          onChange={() =>
-                            setWebdavConflictDecisions((prev) => ({ ...prev, [item.paperId]: 'remote' }))
-                          }
-                        />
-                        云端版本
-                      </label>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            <div className="mt-3 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => handleResolveWebDavConflict('keep-local')}
-                disabled={webdavResolvingConflict}
-                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-              >
-                应用当前选择
-              </button>
-              <button
-                type="button"
-                onClick={() => handleResolveWebDavConflict('keep-remote')}
-                disabled={webdavResolvingConflict}
-                className="px-3 py-1.5 rounded-md text-xs border border-gray-200 text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-              >
-                全部保留云端
               </button>
             </div>
           </div>

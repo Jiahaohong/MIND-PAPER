@@ -1604,7 +1604,8 @@ const migrateExistingLibraryToSqlite = async (paths) => {
   }
 
   await saveFoldersToSqlite(folders);
-  const normalizedPapers = await savePapersToSqlite(papers, paths, { preserveIncomingVersion: true });
+  const paperSaveResult = await savePapersToSqlite(papers, paths, { preserveIncomingVersion: true });
+  const normalizedPapers = Array.isArray(paperSaveResult?.papers) ? paperSaveResult.papers : [];
   for (const item of states) {
     // eslint-disable-next-line no-await-in-loop
     await savePaperStateToSqlite(item.paperId, item.state || {});
@@ -1651,11 +1652,9 @@ const {
   saveFoldersToSqlite,
   loadPapersFromSqlite,
   savePapersToSqlite,
-  markAllPapersBaseVersionCurrent,
   savePaperStateToSqlite,
   loadPaperStateFromSqlite,
   loadPaperStatesFromSqlite,
-  markPaperStateAnnotationsBaseVersionCurrent,
   ensureLibraryStoreReady,
   ensureLibrary
 } = sqliteModule;
@@ -2252,28 +2251,22 @@ const webDavSyncModule = createWebDavSyncModule({
   fs,
   fsNative,
   crypto,
-  formatLogTime,
   ensureLibrary,
   ensureLibraryStoreReady,
   getLibraryDb,
   getLibraryPaths,
   getPaperArticleId,
-  normalizeWebDavServer,
   getWebDavConfigFromSettings,
   getWebDavCredential,
   createWebDavClient,
   webdavLockOwner,
   ensureWebDavLock,
   releaseWebDavLock,
-  loadFoldersFromSqlite,
-  loadPapersFromSqlite,
   loadPaperStatesFromSqlite,
   loadLibraryDataFromSqliteFile,
   saveFoldersToSqlite,
   savePapersToSqlite,
-  markAllPapersBaseVersionCurrent,
   savePaperStateToSqlite,
-  markPaperStateAnnotationsBaseVersionCurrent,
   deletePaperStatesFromSqlite,
   setSyncPending,
   getSyncPending,
@@ -2285,8 +2278,7 @@ const webDavSyncModule = createWebDavSyncModule({
 const {
   getWebDavSyncState,
   syncLibraryToWebDav,
-  syncLibraryFromWebDavToLocal,
-  resolveWebDavConflicts
+  syncLibraryFromWebDavToLocal
 } = webDavSyncModule;
 
 ipcMain.handle('settings-get', async () => {
@@ -2315,8 +2307,7 @@ registerWebDavSyncIpc({
   ipcMain,
   enqueueWrite,
   syncLibraryToWebDav,
-  syncLibraryFromWebDavToLocal,
-  resolveWebDavConflicts
+  syncLibraryFromWebDavToLocal
 });
 
 async function runBackgroundWebDavUpload() {
@@ -2353,7 +2344,7 @@ async function runBackgroundWebDavUpload() {
       return { success: false, skipped: true, reason: 'nothing pending after flush' };
     }
     console.log('[webdav-sync] local-change upload start');
-    const result = await syncLibraryToWebDav({ overwriteRemote: true });
+    const result = await syncLibraryToWebDav();
     if (result?.success) {
       await refreshRemoteWebDavFingerprint();
     }
@@ -2409,14 +2400,14 @@ async function runBackgroundWebDavDownload() {
       return { success: false, skipped: true, reason: 'remote unchanged' };
     }
     console.log('[webdav-sync] background remote-poll start');
-    const result = await syncLibraryFromWebDavToLocal({ overwriteLocal: true });
+    const result = await syncLibraryFromWebDavToLocal();
     if (remoteFingerprint.fingerprint) {
       lastObservedRemoteWebDavFingerprint = remoteFingerprint.fingerprint;
     }
     console.log(
       `[webdav-sync] background remote-poll done: success=${Boolean(result?.success)} skipped=${Boolean(
         result?.skipped
-      )} conflict=${Boolean(result?.conflict)}`
+      )}`
     );
     return result;
   } catch (error) {

@@ -969,7 +969,7 @@ const buildOutlineFromDocNodes = (
       isRoot: item.kind === 'root',
       isCustom: item.kind === 'highlight_chapter' || item.kind === 'normal_chapter',
       parentId: item.parentId ?? null,
-      createdAt: Number(item.updatedAt || Date.now()),
+      createdAt: typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : undefined,
       order: typeof item.order === 'number' ? item.order : undefined
     });
   });
@@ -982,7 +982,10 @@ const buildOutlineFromDocNodes = (
       items: [],
       isRoot: true,
       parentId: null,
-      createdAt: Number(rootDoc.updatedAt || Date.now()),
+      createdAt:
+        typeof rootDoc.updatedAt === 'number' && Number.isFinite(rootDoc.updatedAt)
+          ? rootDoc.updatedAt
+          : undefined,
       order: typeof rootDoc.order === 'number' ? rootDoc.order : 0
     });
   }
@@ -2808,7 +2811,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   };
 
   const getHighlightAtPoint = (clientX: number, clientY: number) => {
-    for (const highlight of annotations) {
+    for (const highlight of visibleHighlights) {
       for (const rect of highlight.rects) {
         const page = pageRefs.current[rect.pageIndex];
         if (!page) continue;
@@ -5504,7 +5507,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   const highlightRectsByPage = useMemo(() => {
     const map = new Map<number, { rect: HighlightRect; color: string; id: string }[]>();
-    annotations.forEach((highlight) => {
+    visibleHighlights.forEach((highlight) => {
       highlight.rects.forEach((rect) => {
         const list = map.get(rect.pageIndex) || [];
         list.push({ rect, color: highlight.color, id: highlight.id });
@@ -5512,7 +5515,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       });
     });
     return map;
-  }, [annotations]);
+  }, [visibleHighlights]);
 
   useEffect(() => {
     let cancelled = false;

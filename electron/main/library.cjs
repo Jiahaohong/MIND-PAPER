@@ -28,8 +28,10 @@ const registerLibraryIpc = ({
   ipcMain.handle('library-save-folders', async (_event, payload = []) => {
     return enqueueWrite(async () => {
       await ensureLibraryStoreReady();
-      await saveFoldersToSqlite(payload);
-      setSyncPending(true);
+      const result = await saveFoldersToSqlite(payload);
+      if (result?.changed) {
+        setSyncPending(true);
+      }
       return { ok: true };
     });
   });
@@ -43,28 +45,34 @@ const registerLibraryIpc = ({
     return enqueueWrite(async () => {
       await ensureLibraryStoreReady();
       const paths = getLibraryPaths();
-      const papers = await savePapersToSqlite(payload, paths);
+      const result = await savePapersToSqlite(payload, paths);
+      const papers = Array.isArray(result?.papers) ? result.papers : [];
       await cleanupOrphanPaperStateFiles(
         paths,
         papers.map((paper) => String(paper?.id || '').trim())
       );
-      setSyncPending(true);
+      if (result?.changed) {
+        setSyncPending(true);
+      }
       return { ok: true };
     });
   });
 
   ipcMain.handle('library-save-snapshot', async (_event, payload = {}) => {
-    return enqueueWrite(async () => {
+      return enqueueWrite(async () => {
       await ensureLibraryStoreReady();
       const paths = getLibraryPaths();
-      await saveFoldersToSqlite(payload.folders);
-      const papers = await savePapersToSqlite(payload.papers, paths);
+      const foldersResult = await saveFoldersToSqlite(payload.folders);
+      const papersResult = await savePapersToSqlite(payload.papers, paths);
+      const papers = Array.isArray(papersResult?.papers) ? papersResult.papers : [];
       await cleanupOrphanPaperStateFiles(
         paths,
         papers.map((paper) => String(paper?.id || '').trim())
       );
       await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-      setSyncPending(true);
+      if (foldersResult?.changed || papersResult?.changed) {
+        setSyncPending(true);
+      }
       return { ok: true };
     });
   });
@@ -131,7 +139,9 @@ const registerLibraryIpc = ({
       const paperId = String(payload.paperId || '').trim();
       if (!paperId) return { ok: false, error: '缺少paperId' };
       const result = await savePaperStateToSqlite(paperId, payload.state || {});
-      setSyncPending(true);
+      if (result?.changed) {
+        setSyncPending(true);
+      }
       return result;
     });
   });
