@@ -1135,6 +1135,272 @@ const buildOutlineTree = async (
   return nodes.filter((node) => node.title || node.items.length);
 };
 
+type PdfReaderPaneProps = {
+  contentAreaRef: React.RefObject<HTMLDivElement>;
+  pageRefs: React.MutableRefObject<Array<HTMLDivElement | null>>;
+  viewMode: ReaderMode;
+  pdfFileForRender: { data: ArrayBuffer } | string | null;
+  paper: Paper;
+  numPages: number;
+  pdfZoom: number;
+  activeHighlightId: string | null;
+  highlightRectsByPage: Map<number, { rect: HighlightRect; color: string; id: string }[]>;
+  showPdfMarginOutline: boolean;
+  pdfMarginChildrenByPage: Map<number, any[]>;
+  expandedHighlightIds: Set<string>;
+  onSelectionMouseUp: React.MouseEventHandler<HTMLDivElement>;
+  onHighlightMouseDown: React.MouseEventHandler<HTMLDivElement>;
+  onContentScroll: React.UIEventHandler<HTMLDivElement>;
+  onDocumentLoad: (doc: PDFDocumentProxy) => void | Promise<void>;
+  onOpenMarginToolbar: (event: React.MouseEvent<HTMLElement>, item: any) => void;
+  onRemoveCustomChapter: (chapterId: string) => void;
+  onToggleExpandedHighlight: (highlightId: string) => void;
+  onRemoveHighlightNote: (note: HighlightItem) => void;
+  isManualHighlight: (item: HighlightItem) => boolean;
+};
+
+const PdfReaderPane = React.memo(
+  ({
+    contentAreaRef,
+    pageRefs,
+    viewMode,
+    pdfFileForRender,
+    paper,
+    numPages,
+    pdfZoom,
+    activeHighlightId,
+    highlightRectsByPage,
+    showPdfMarginOutline,
+    pdfMarginChildrenByPage,
+    expandedHighlightIds,
+    onSelectionMouseUp,
+    onHighlightMouseDown,
+    onContentScroll,
+    onDocumentLoad,
+    onOpenMarginToolbar,
+    onRemoveCustomChapter,
+    onToggleExpandedHighlight,
+    onRemoveHighlightNote,
+    isManualHighlight
+  }: PdfReaderPaneProps) => (
+    <div
+      ref={contentAreaRef}
+      className={`flex-1 min-w-0 overflow-auto relative ${
+        viewMode === ReaderMode.PDF ? '' : 'hidden'
+      }`}
+      onMouseUp={onSelectionMouseUp}
+      onMouseDown={onHighlightMouseDown}
+      onScroll={onContentScroll}
+    >
+      {pdfFileForRender ? (
+        <div className="min-h-full flex justify-center py-6 px-4">
+          <Document
+            file={pdfFileForRender}
+            onLoadSuccess={onDocumentLoad}
+            onLoadError={(error) => {
+              console.error('PDF load error:', error);
+            }}
+            onSourceError={(error) => {
+              console.error('PDF source error:', error);
+            }}
+            loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
+            error={<div className="text-sm text-red-500">PDF加载失败</div>}
+          >
+            {Array.from(new Array(numPages || 0), (_, index) => (
+              <div
+                key={`page_${index + 1}`}
+                ref={(el) => {
+                  pageRefs.current[index] = el;
+                }}
+                data-page-index={index}
+                className="mb-4 last:mb-0 relative"
+              >
+                <Page
+                  pageNumber={index + 1}
+                  width={800}
+                  scale={pdfZoom / 100}
+                  renderAnnotationLayer={false}
+                  renderTextLayer
+                  onRenderTextLayerError={(error) => {
+                    if (String((error as any)?.name || '') === 'AbortException') return;
+                    console.error('PDF text layer render error:', error);
+                  }}
+                />
+                {highlightRectsByPage.get(index)?.length ? (
+                  <div className="absolute inset-0 pointer-events-none">
+                    {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
+                      const isActive = item.id === activeHighlightId;
+                      const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
+                      const borderColor = isActive ? (swatch || toSolidColor(item.color)) : '';
+                      return (
+                        <div
+                          key={`mark-${index}-${rectIndex}`}
+                          className="absolute mix-blend-multiply opacity-40"
+                          style={{
+                            top: `${item.rect.y * 100}%`,
+                            left: `${item.rect.x * 100}%`,
+                            width: `${item.rect.w * 100}%`,
+                            height: `${item.rect.h * 100}%`,
+                            background: item.color,
+                            boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
+                  <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
+                    {pdfMarginChildrenByPage.get(index)!.map((group) => {
+                      const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
+                      const clampedTop = Math.max(0, Math.min(1, topRatio));
+                      return (
+                        <div
+                          key={`margin-${index}-${group.parentId}`}
+                          className="absolute left-0"
+                          style={{ top: `${clampedTop * 100}%` }}
+                        >
+                          <div className="flex flex-col gap-1">
+                            {group.items.map((item) => {
+                              const swatch =
+                                item.kind === 'note' && item.color
+                                  ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
+                                    toSolidColor(item.color)
+                                  : '#9ca3af';
+                              const label = item.label?.trim() || '（空白）';
+                              if (item.kind === 'chapter') {
+                                return (
+                                  <div key={item.key} className="relative group">
+                                    <button
+                                      type="button"
+                                      className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
+                                      style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
+                                      onMouseDown={(event) => event.stopPropagation()}
+                                      onClick={(event) => onOpenMarginToolbar(event, item)}
+                                    >
+                                      <span className="truncate flex-1">{label}</span>
+                                    </button>
+                                    {item.node?.isCustom ? (
+                                      <button
+                                        type="button"
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          onRemoveCustomChapter(item.node!.id);
+                                        }}
+                                        className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                        aria-label="删除章节"
+                                      >
+                                        <X size={12} />
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                );
+                              }
+                              const isExpanded = expandedHighlightIds.has(item.note?.id || '');
+                              const clampStyle = isExpanded
+                                ? { whiteSpace: 'pre-wrap' as const }
+                                : {
+                                    display: '-webkit-box',
+                                    WebkitLineClamp: 2,
+                                    WebkitBoxOrient: 'vertical',
+                                    overflow: 'hidden'
+                                  };
+                              return (
+                                <div key={item.key} className="relative group">
+                                  <button
+                                    type="button"
+                                    className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
+                                    style={{
+                                      borderLeft: `3px solid ${swatch}`,
+                                      paddingLeft: `${8 + (item.indentPx || 0)}px`
+                                    }}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => onOpenMarginToolbar(event, item)}
+                                    onDoubleClick={(event) => {
+                                      event.stopPropagation();
+                                      if (!item.note) return;
+                                      onToggleExpandedHighlight(item.note.id);
+                                    }}
+                                  >
+                                    <span className="leading-4 w-full" style={clampStyle}>
+                                      {label}
+                                    </span>
+                                    {item.note &&
+                                    !item.note.isChapterTitle &&
+                                    !isManualHighlight(item.note) &&
+                                    item.note.translation ? (
+                                      <span
+                                        className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                        style={clampStyle}
+                                      >
+                                        {item.note.translation}
+                                      </span>
+                                    ) : null}
+                                  </button>
+                                  {item.note && !item.note.isChapterTitle ? (
+                                    <button
+                                      type="button"
+                                      onMouseDown={(event) => event.stopPropagation()}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        onRemoveHighlightNote(item.note!);
+                                      }}
+                                      className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                      aria-label="删除笔记"
+                                    >
+                                      <X size={12} />
+                                    </button>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </Document>
+        </div>
+      ) : paper.filePath ? (
+        <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
+          正在加载PDF…
+        </div>
+      ) : (
+        <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
+          <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
+            <div className="p-12">
+              <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
+              <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
+              <div className="prose max-w-none font-serif leading-relaxed">
+                <p className="mb-4 font-bold">Abstract</p>
+                <p className="mb-8 italic text-gray-600">{paper.summary}</p>
+                <p className="mb-4 font-bold">1. Introduction</p>
+                <p>{paper.content}</p>
+                <p className="mt-4">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+                <p className="mt-4">Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  ),
+  (prev, next) =>
+    prev.viewMode === next.viewMode &&
+    prev.pdfFileForRender === next.pdfFileForRender &&
+    prev.paper === next.paper &&
+    prev.numPages === next.numPages &&
+    prev.pdfZoom === next.pdfZoom &&
+    prev.highlightRectsByPage === next.highlightRectsByPage &&
+    prev.showPdfMarginOutline === next.showPdfMarginOutline &&
+    prev.pdfMarginChildrenByPage === next.pdfMarginChildrenByPage &&
+    prev.expandedHighlightIds === next.expandedHighlightIds
+);
+
 interface ReaderViewProps {
   paper: Paper;
   pdfFile: { data: ArrayBuffer } | string | null;
@@ -6166,6 +6432,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const canToolbarAddSibling =
     Boolean(toolbarMindmapNode && toolbarMindmapNode.kind !== 'root') &&
     (viewMode !== ReaderMode.MIND_MAP || !mindmapEditing);
+  const handleToggleExpandedHighlight = useCallback((highlightId: string) => {
+    setExpandedHighlightIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(highlightId)) {
+        next.delete(highlightId);
+      } else {
+        next.add(highlightId);
+      }
+      return next;
+    });
+  }, []);
 
   return (
     <div ref={containerRef} className="flex h-[calc(100vh-40px)] bg-white overflow-hidden">
@@ -6508,219 +6785,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </div>
             ) : null}
           </div>
-        <div
-            ref={contentAreaRef}
-            className={`flex-1 min-w-0 overflow-auto relative ${
-              viewMode === ReaderMode.PDF ? '' : 'hidden'
-            }`}
-            onMouseUp={updateSelectionFromWindow}
-            onMouseDown={handleHighlightClick}
-            onScroll={handleContentScroll}
-          >
-            {pdfFileForRender ? (
-                <div className="min-h-full flex justify-center py-6 px-4">
-                  <Document
-                    file={pdfFileForRender}
-                    onLoadSuccess={handleDocumentLoad}
-                    onLoadError={(error) => {
-                      console.error('PDF load error:', error);
-                    }}
-                    onSourceError={(error) => {
-                      console.error('PDF source error:', error);
-                    }}
-                    loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
-                    error={<div className="text-sm text-red-500">PDF加载失败</div>}
-                  >
-                    {Array.from(new Array(numPages || 0), (_, index) => (
-                      <div
-                        key={`page_${index + 1}`}
-                        ref={(el) => {
-                          pageRefs.current[index] = el;
-                        }}
-                        data-page-index={index}
-                        className="mb-4 last:mb-0 relative"
-                      >
-                        <Page
-                          pageNumber={index + 1}
-                          width={800}
-                          scale={pdfZoom / 100}
-                          renderAnnotationLayer={false}
-                          renderTextLayer
-                          onRenderTextLayerError={(error) => {
-                            if (String((error as any)?.name || '') === 'AbortException') return;
-                            console.error('PDF text layer render error:', error);
-                          }}
-                        />
-                        {highlightRectsByPage.get(index)?.length ? (
-                          <div className="absolute inset-0 pointer-events-none">
-                            {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
-                              const isActive = item.id === activeHighlightId;
-                              const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
-                              const borderColor = isActive ? (swatch || toSolidColor(item.color)) : '';
-                              return (
-                                <div
-                                  key={`mark-${index}-${rectIndex}`}
-                                  className="absolute mix-blend-multiply opacity-40"
-                                  style={{
-                                    top: `${item.rect.y * 100}%`,
-                                    left: `${item.rect.x * 100}%`,
-                                    width: `${item.rect.w * 100}%`,
-                                    height: `${item.rect.h * 100}%`,
-                                    background: item.color,
-                                    boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
-                                  }}
-                                />
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                        {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
-                          <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
-                            {pdfMarginChildrenByPage.get(index)!.map((group) => {
-                              const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
-                              const clampedTop = Math.max(0, Math.min(1, topRatio));
-                              return (
-                                <div
-                                  key={`margin-${index}-${group.parentId}`}
-                                  className="absolute left-0"
-                                  style={{ top: `${clampedTop * 100}%` }}
-                                >
-                                  <div className="flex flex-col gap-1">
-                                    {group.items.map((item) => {
-                                      const swatch =
-                                        item.kind === 'note' && item.color
-                                          ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
-                                            toSolidColor(item.color)
-                                          : '#9ca3af';
-                                      const label = item.label?.trim() || '（空白）';
-                                      if (item.kind === 'chapter') {
-                                        return (
-                                          <div key={item.key} className="relative group">
-                                            <button
-                                              type="button"
-                                              className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
-                                              style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
-                                              onMouseDown={(event) => event.stopPropagation()}
-                                              onClick={(event) => openMarginToolbar(event, item)}
-                                            >
-                                              <span className="truncate flex-1">{label}</span>
-                                            </button>
-                                            {item.node?.isCustom ? (
-                                              <button
-                                                type="button"
-                                                onMouseDown={(event) => event.stopPropagation()}
-                                                onClick={(event) => {
-                                                  event.stopPropagation();
-                                                  removeCustomChapter(item.node!.id);
-                                                }}
-                                                className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                                aria-label="删除章节"
-                                              >
-                                                <X size={12} />
-                                              </button>
-                                            ) : null}
-                                          </div>
-                                        );
-                                      }
-                                      const isExpanded = expandedHighlightIds.has(item.note?.id || '');
-                                      const clampStyle = isExpanded
-                                        ? { whiteSpace: 'pre-wrap' as const }
-                                        : {
-                                            display: '-webkit-box',
-                                            WebkitLineClamp: 2,
-                                            WebkitBoxOrient: 'vertical',
-                                            overflow: 'hidden'
-                                          };
-                                      return (
-                                        <div key={item.key} className="relative group">
-                                          <button
-                                            type="button"
-                                            className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
-                                            style={{
-                                              borderLeft: `3px solid ${swatch}`,
-                                              paddingLeft: `${8 + (item.indentPx || 0)}px`
-                                            }}
-                                            onMouseDown={(event) => event.stopPropagation()}
-                                            onClick={(event) => openMarginToolbar(event, item)}
-                                            onDoubleClick={(event) => {
-                                              event.stopPropagation();
-                                              if (!item.note) return;
-                                              setExpandedHighlightIds((prev) => {
-                                                const next = new Set(prev);
-                                                if (next.has(item.note!.id)) {
-                                                  next.delete(item.note!.id);
-                                                } else {
-                                                  next.add(item.note!.id);
-                                                }
-                                                return next;
-                                              });
-                                            }}
-                                          >
-                                            <span className="leading-4 w-full" style={clampStyle}>
-                                              {label}
-                                            </span>
-                                            {item.note &&
-                                            !item.note.isChapterTitle &&
-                                            !isManualHighlight(item.note) &&
-                                            item.note.translation ? (
-                                              <span
-                                                className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
-                                                style={clampStyle}
-                                              >
-                                                {item.note.translation}
-                                              </span>
-                                            ) : null}
-                                          </button>
-                                          {item.note && !item.note.isChapterTitle ? (
-                                            <button
-                                              type="button"
-                                              onMouseDown={(event) => event.stopPropagation()}
-                                              onClick={(event) => {
-                                                event.stopPropagation();
-                                                removeHighlightNote(item.note!);
-                                              }}
-                                              className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                              aria-label="删除笔记"
-                                            >
-                                              <X size={12} />
-                                            </button>
-                                          ) : null}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </Document>
-                </div>
-              ) : paper.filePath ? (
-                <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
-                  正在加载PDF…
-                </div>
-              ) : (
-                <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
-                  <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
-                    <div className="p-12">
-                      <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
-                      <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
-                      <div className="prose max-w-none font-serif leading-relaxed">
-                        <p className="mb-4 font-bold">Abstract</p>
-                        <p className="mb-8 italic text-gray-600">{paper.summary}</p>
-                        <p className="mb-4 font-bold">1. Introduction</p>
-                        <p>{paper.content}</p>
-                        <p className="mt-4">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
-                        <p className="mt-4">Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-          </div>
+        <PdfReaderPane
+          contentAreaRef={contentAreaRef}
+          pageRefs={pageRefs}
+          viewMode={viewMode}
+          pdfFileForRender={pdfFileForRender}
+          paper={paper}
+          numPages={numPages}
+          pdfZoom={pdfZoom}
+          activeHighlightId={activeHighlightId}
+          highlightRectsByPage={highlightRectsByPage}
+          showPdfMarginOutline={showPdfMarginOutline}
+          pdfMarginChildrenByPage={pdfMarginChildrenByPage}
+          expandedHighlightIds={expandedHighlightIds}
+          onSelectionMouseUp={updateSelectionFromWindow}
+          onHighlightMouseDown={handleHighlightClick}
+          onContentScroll={handleContentScroll}
+          onDocumentLoad={handleDocumentLoad}
+          onOpenMarginToolbar={openMarginToolbar}
+          onRemoveCustomChapter={removeCustomChapter}
+          onToggleExpandedHighlight={handleToggleExpandedHighlight}
+          onRemoveHighlightNote={removeHighlightNote}
+          isManualHighlight={isManualHighlight}
+        />
       </div>
 
       {/* Resize Handle (Right) */}
