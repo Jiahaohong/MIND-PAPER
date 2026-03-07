@@ -718,7 +718,9 @@ interface LibraryViewProps {
   onDeletePaper: (paperId: string) => void;
   onMovePaperToFolder: (paperId: string, folderId: string) => void;
   onRestorePaper: (paperId: string) => void;
-  onCloudSyncUpload: () => Promise<{ success: boolean; conflict?: boolean; error?: string } | void>;
+  onCloudSync: (
+    mode?: 'auto' | 'upload' | 'download'
+  ) => Promise<{ success: boolean; skipped?: boolean; mode?: 'upload' | 'download'; error?: string } | void>;
   isCloudSyncing: boolean;
 }
 
@@ -734,7 +736,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onDeletePaper,
   onMovePaperToFolder,
   onRestorePaper,
-  onCloudSyncUpload,
+  onCloudSync,
   isCloudSyncing
 }) => {
   const MIN_LEFT_WIDTH = 180;
@@ -1409,41 +1411,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   }, [cloudSyncMessage]);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.getSyncStatus) return;
-    let mounted = true;
-    const applyStatus = (payload: any) => {
-      if (!mounted) return;
-      const active = Boolean(payload?.active);
-      setCloudSyncing(active);
-      if (payload?.message) {
-        setCloudSyncMessage(String(payload.message));
-      } else if (!active) {
-        setCloudSyncMessage('');
-      }
-    };
-
-    void window.electronAPI.webdav.getSyncStatus().then(applyStatus).catch(() => null);
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      applyStatus(detail);
-    };
-    window.addEventListener('mindpaper-webdav-sync', handler as EventListener);
-    return () => {
-      mounted = false;
-      window.removeEventListener('mindpaper-webdav-sync', handler as EventListener);
-    };
-  }, []);
+    setCloudSyncing(isCloudSyncing);
+  }, [isCloudSyncing]);
 
   const handleCloudSync = async () => {
     if (cloudSyncing) return;
     setCloudSyncMessage('');
     try {
-      const result = await onCloudSyncUpload();
+      const result = await onCloudSync('auto');
       if (result && result.success === false) {
-        setCloudSyncMessage(result.conflict ? '检测到本地与云端冲突' : result.error || '云同步失败');
+        setCloudSyncMessage(result.error || '云同步失败');
       } else {
-        setCloudSyncMessage('云同步完成');
+        const mode = String((result as any)?.mode || '').trim();
+        setCloudSyncMessage(mode === 'upload' ? '本地改动已上传' : mode === 'download' ? '已从云端更新本地' : '云同步完成');
       }
     } catch (error: any) {
       setCloudSyncMessage(error?.message || '云同步失败');

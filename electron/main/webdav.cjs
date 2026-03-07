@@ -1,13 +1,11 @@
 const WEBDAV_KEYTAR_SERVICE = 'MindPaper-WebDAV';
-const WEBDAV_LOCK_FILE = 'lock.json';
 
 const registerWebDavIpc = ({
   ipcMain,
   enqueueWrite,
   testWebDavConnection,
   saveWebDavConfig,
-  clearWebDavLock,
-  getWebDavSyncState
+  clearWebDavLock
 }) => {
   ipcMain.handle('webdav-test', async (_event, payload = {}) => testWebDavConnection(payload));
 
@@ -15,15 +13,21 @@ const registerWebDavIpc = ({
     enqueueWrite(() => saveWebDavConfig(payload))
   );
 
-  ipcMain.handle('webdav-get-sync-status', async () => getWebDavSyncState());
-
   ipcMain.handle('webdav-clear-lock', async () =>
     enqueueWrite(async () => {
+      if (typeof clearWebDavLock !== 'function') {
+        return {
+          success: false,
+          cleared: false,
+          message: '当前未启用云同步锁'
+        };
+      }
       try {
         return await clearWebDavLock();
       } catch (error) {
         return {
           success: false,
+          cleared: false,
           message: error?.message || '清除云端锁失败'
         };
       }
@@ -33,22 +37,14 @@ const registerWebDavIpc = ({
 
 const createWebDavModule = (deps = {}) => {
   const {
-    app,
     normalizeWebDavServer,
     normalizeWebDavRemotePath,
     loadSettings,
-    saveSettings,
-    lockTtlMs
+    saveSettings
   } = deps;
 
   let webdavDriverPromise = null;
   let keytarDriver = null;
-  const webdavLockOwner = {
-    sessionId: require('crypto').randomUUID(),
-    device: `${require('os').hostname()}-${app.getName()}`,
-    appVersion: app.getVersion()
-  };
-  let activeWebDavLock = null;
 
   const getWebDavDriver = async () => {
     if (webdavDriverPromise) return webdavDriverPromise;
@@ -79,9 +75,7 @@ const createWebDavModule = (deps = {}) => {
     const normalizedUser = String(username || '').trim();
     const normalizedPassword = String(password || '');
     if (!normalizedServer || !normalizedUser) return false;
-    if (!normalizedPassword) {
-      return false;
-    }
+    if (!normalizedPassword) return false;
     const keytar = getKeytarDriver();
     await keytar.setPassword(
       WEBDAV_KEYTAR_SERVICE,
@@ -119,23 +113,6 @@ const createWebDavModule = (deps = {}) => {
     return createClient(normalizeWebDavServer(server), {
       username: String(username || '').trim(),
       password: String(password || '')
-    });
-  };
-
-  const readRemoteJsonFile = async (client, remotePath) => {
-    const exists = await client.exists(remotePath);
-    if (!exists) return null;
-    const content = await client.getFileContents(remotePath, { format: 'text' });
-    try {
-      return JSON.parse(String(content || ''));
-    } catch {
-      return null;
-    }
-  };
-
-  const writeRemoteJsonFile = async (client, remotePath, payload) => {
-    await client.putFileContents(remotePath, JSON.stringify(payload, null, 2), {
-      overwrite: true
     });
   };
 
@@ -229,128 +206,12 @@ const createWebDavModule = (deps = {}) => {
     };
   };
 
-  const getRemoteWebDavLockPath = (remotePath) => `${remotePath}/${WEBDAV_LOCK_FILE}`;
-
-  const buildWebDavLockPayload = () => {
-    const now = Date.now();
-    return {
-      sessionId: webdavLockOwner.sessionId,
-      device: webdavLockOwner.device,
-      appVersion: webdavLockOwner.appVersion,
-      acquiredAt: activeWebDavLock?.acquiredAt || now,
-      refreshedAt: now,
-      expiresAt: now + lockTtlMs
-    };
-  };
-
-  const isWebDavLockAlive = (lock) =>
-    Boolean(lock && Number(lock.expiresAt || 0) > Date.now() && String(lock.sessionId || '').trim());
-
-  const isWebDavLockOwnedBySelf = (lock) =>
-    String(lock?.sessionId || '').trim() === webdavLockOwner.sessionId;
-
-  const isWebDavLockOwnedBySameDevice = (lock) =>
-    String(lock?.device || '').trim() === String(webdavLockOwner.device || '').trim();
-
-  const refreshWebDavLock = async (client, remotePath) => {
-    const payload = buildWebDavLockPayload();
-    await writeRemoteJsonFile(client, getRemoteWebDavLockPath(remotePath), payload);
-    activeWebDavLock = payload;
-  };
-
-  const acquireWebDavLock = async (client, remotePath) => {
-    const lockPath = getRemoteWebDavLockPath(remotePath);
-    const existing = await readRemoteJsonFile(client, lockPath);
-    if (
-      isWebDavLockAlive(existing) &&
-      !isWebDavLockOwnedBySelf(existing) &&
-      !isWebDavLockOwnedBySameDevice(existing)
-    ) {
-      const owner = String(existing.device || 'unknown');
-      throw new Error(`云端正在被其他设备使用: ${owner}`);
-    }
-    const payload = buildWebDavLockPayload();
-    await writeRemoteJsonFile(client, lockPath, payload);
-    activeWebDavLock = payload;
-    if (isWebDavLockAlive(existing) && isWebDavLockOwnedBySameDevice(existing) && !isWebDavLockOwnedBySelf(existing)) {
-      console.log(`[webdav-lock] took over stale same-device lock: device=${payload.device}, remote=${remotePath}`);
-    }
-    console.log(`[webdav-lock] acquired: device=${payload.device}, remote=${remotePath}`);
-    return payload;
-  };
-
-  const ensureWebDavLock = async (client, remotePath) => {
-    if (activeWebDavLock && isWebDavLockOwnedBySelf(activeWebDavLock) && isWebDavLockAlive(activeWebDavLock)) {
-      await refreshWebDavLock(client, remotePath);
-      return activeWebDavLock;
-    }
-    return acquireWebDavLock(client, remotePath);
-  };
-
-  const releaseWebDavLock = async () => {
-    if (!activeWebDavLock) return;
-    try {
-      const config = await getWebDavConfigFromSettings();
-      const password = await getWebDavCredential(config.webdavServer, config.webdavUsername);
-      if (!config.webdavServer || !config.webdavUsername || !password) {
-        activeWebDavLock = null;
-        return;
-      }
-      const client = await createWebDavClient(config.webdavServer, config.webdavUsername, password);
-      const lockPath = getRemoteWebDavLockPath(config.webdavRemotePath);
-      const remoteLock = await readRemoteJsonFile(client, lockPath);
-      if (isWebDavLockOwnedBySelf(remoteLock)) {
-        await client.deleteFile(lockPath).catch(() => null);
-        console.log(`[webdav-lock] released: remote=${config.webdavRemotePath}`);
-      }
-    } catch (error) {
-      console.warn('[webdav-lock] release failed:', error?.message || error);
-    } finally {
-      activeWebDavLock = null;
-    }
-  };
-
-  const clearWebDavLock = async () => {
-    const config = await getWebDavConfigFromSettings();
-    const server = config.webdavServer;
-    const username = config.webdavUsername;
-    const remotePath = config.webdavRemotePath;
-    const password = await getWebDavCredential(server, username);
-    if (!server || !username || !password) {
-      throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
-    }
-    const client = await createWebDavClient(server, username, password);
-    await client.getDirectoryContents('/');
-    const lockPath = getRemoteWebDavLockPath(remotePath);
-    const exists = await client.exists(lockPath);
-    if (!exists) {
-      return { success: true, cleared: false, message: '云端锁不存在' };
-    }
-    await client.deleteFile(lockPath).catch((error) => {
-      throw new Error(error?.message || '删除云端锁失败');
-    });
-    activeWebDavLock = null;
-    console.log(`[webdav-lock] force cleared: remote=${remotePath}`);
-    return { success: true, cleared: true, message: '已清除云端锁' };
-  };
-
   return {
-    getWebDavDriver,
-    getKeytarDriver,
-    saveWebDavCredential,
     getWebDavCredential,
-    hasWebDavCredential,
     createWebDavClient,
     getWebDavConfigFromSettings,
-    resolveWebDavPassword,
     testWebDavConnection,
-    saveWebDavConfig,
-    ensureWebDavLock,
-    releaseWebDavLock,
-    clearWebDavLock,
-    readRemoteJsonFile,
-    writeRemoteJsonFile,
-    webdavLockOwner
+    saveWebDavConfig
   };
 };
 

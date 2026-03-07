@@ -1,129 +1,252 @@
-const WEBDAV_PDF_MANIFEST_FILE = 'papers-manifest.json';
-const WEBDAV_LOCK_FILE = 'lock.json';
-const REMOTE_LOCK_WAIT_TIMEOUT_MS = 15000;
+const REMOTE_SYNC_DIR = 'sync';
+const REMOTE_META_FILE = `${REMOTE_SYNC_DIR}/meta.json`;
+const REMOTE_CHANGES_FILE = `${REMOTE_SYNC_DIR}/changes.json`;
+const REMOTE_LOCK_FILE = `${REMOTE_SYNC_DIR}/lock.json`;
+const REMOTE_SQLITE_FILE = 'library.sqlite';
+const REMOTE_PAPERS_DIR = 'papers';
+const REMOTE_PDF_MANIFEST_FILE = 'papers-manifest.json';
+
+const LOCAL_SYNC_LAST_APPLIED_VERSION_KEY = '__sync_last_applied_version__';
+
+const REMOTE_LOCK_TTL_MS = 10 * 60 * 1000;
+const REMOTE_LOCK_WAIT_TIMEOUT_MS = 20 * 1000;
 const REMOTE_LOCK_WAIT_POLL_MS = 1000;
+const REMOTE_CHANGE_LOG_KEEP = 5000;
 
 const registerWebDavSyncIpc = ({
   ipcMain,
   enqueueWrite,
-  syncLibraryToWebDav,
-  syncLibraryFromWebDavToLocal
+  beforeSync,
+  syncLibrary
 }) => {
-  ipcMain.handle('webdav-sync-upload', async () =>
-    enqueueWrite(async () => {
-      try {
-        return await syncLibraryToWebDav();
-      } catch (error) {
-        return {
-          success: false,
-          error: error?.message || 'WebDAV 上传失败'
-        };
+  ipcMain.handle('webdav-sync', async (_event, payload = {}) => {
+    try {
+      // Must run outside write queue to avoid waiting on self (deadlock).
+      if (typeof beforeSync === 'function') {
+        await beforeSync();
       }
-    })
-  );
-
-  ipcMain.handle('webdav-sync-download', async () =>
-    enqueueWrite(async () => {
-      try {
-        return await syncLibraryFromWebDavToLocal();
-      } catch (error) {
-        return {
-          success: false,
-          error: error?.message || 'WebDAV 下载失败'
-        };
-      }
-    })
-  );
+      return await enqueueWrite(async () => {
+        const mode = String(payload?.mode || 'auto').trim();
+        return syncLibrary({ mode });
+      });
+    } catch (error) {
+      return {
+        success: false,
+        error: error?.message || '云同步失败'
+      };
+    }
+  });
 };
 
 const createWebDavSyncModule = (deps = {}) => {
   const {
-    BrowserWindow,
     path,
     fs,
     fsNative,
     crypto,
-    ensureLibrary,
-    ensureLibraryStoreReady,
-    getLibraryDb,
+    os,
+    app,
     getLibraryPaths,
-    getPaperArticleId,
-    getWebDavConfigFromSettings,
-    getWebDavCredential,
-    createWebDavClient,
-    webdavLockOwner,
-    ensureWebDavLock,
-    releaseWebDavLock,
+    ensureLibraryStoreReady,
+    loadFoldersFromSqlite,
+    loadPapersFromSqlite,
     loadPaperStatesFromSqlite,
-    loadLibraryDataFromSqliteFile,
     saveFoldersToSqlite,
     savePapersToSqlite,
     savePaperStateToSqlite,
     deletePaperStatesFromSqlite,
-    setSyncPending,
-    getSyncPending,
+    loadLibraryDataFromSqliteFile,
     removeFileIfExists,
-    readRemoteJsonFile,
-    writeRemoteJsonFile
+    getPaperArticleId,
+    getWebDavConfigFromSettings,
+    getWebDavCredential,
+    createWebDavClient,
+    loadSyncQueueEntries,
+    clearSyncQueueEntries,
+    getSyncQueueSize,
+    withSyncQueueSuppressed,
+    getLibraryKv,
+    setLibraryKv
   } = deps;
 
-  let webdavSyncState = {
-    active: false,
-    direction: 'idle',
-    message: ''
+  const lockOwner = {
+    sessionId: crypto.randomUUID(),
+    device: `${os.hostname()}-${app.getName()}`,
+    appVersion: app.getVersion()
+  };
+  let activeLockPath = '';
+
+  const now = () => Date.now();
+
+  const getLocalAppliedVersion = () =>
+    Math.max(0, Number(getLibraryKv(LOCAL_SYNC_LAST_APPLIED_VERSION_KEY, 0) || 0));
+
+  const setLocalAppliedVersion = (version) => {
+    setLibraryKv(LOCAL_SYNC_LAST_APPLIED_VERSION_KEY, Math.max(0, Number(version || 0)));
   };
 
-  const emitWebDavSyncState = (next = {}) => {
-    webdavSyncState = {
-      ...webdavSyncState,
-      ...next
-    };
-    BrowserWindow.getAllWindows().forEach((win) => {
-      try {
-        if (win?.isDestroyed?.()) return;
-        if (win?.webContents?.isDestroyed?.()) return;
-        win.webContents.send('webdav-sync-event', webdavSyncState);
-      } catch {
-        // ignore sync event dispatch errors
-      }
+  const ensureRemoteDirectory = async (client, remotePath) => {
+    if (!(await client.exists(remotePath))) {
+      await client.createDirectory(remotePath, { recursive: true });
+    }
+  };
+
+  const readRemoteJsonFile = async (client, remoteFilePath, fallback = null) => {
+    const exists = await client.exists(remoteFilePath);
+    if (!exists) return fallback;
+    const content = await client.getFileContents(remoteFilePath, { format: 'text' });
+    try {
+      return JSON.parse(String(content || ''));
+    } catch {
+      return fallback;
+    }
+  };
+
+  const writeRemoteJsonFile = async (client, remoteFilePath, payload) => {
+    await client.putFileContents(remoteFilePath, JSON.stringify(payload, null, 2), {
+      overwrite: true
     });
   };
 
-  const cleanupRemoteSnapshot = async (snapshot = null) => {
-    const tempPath = String(snapshot?.remoteTempSqlitePath || '').trim();
-    if (!tempPath) return;
-    await removeFileIfExists(tempPath);
-  };
+  const isRemoteLockAlive = (lock) =>
+    Boolean(lock && Number(lock.expiresAt || 0) > now() && String(lock.sessionId || '').trim());
 
-  const createSqliteSyncSnapshot = async () => {
-    await ensureLibraryStoreReady();
-    const paths = getLibraryPaths();
-    const db = getLibraryDb();
-    try {
-      db.pragma('wal_checkpoint(TRUNCATE)');
-    } catch {
-      // ignore checkpoint failures and still try snapshot copy
-    }
-    const snapshotPath = `${paths.sqlitePath}.sync`;
-    await fs.copyFile(paths.sqlitePath, snapshotPath);
+  const isRemoteLockOwnedBySelf = (lock) =>
+    String(lock?.sessionId || '').trim() === String(lockOwner.sessionId || '').trim();
+
+  const buildRemoteLockPayload = () => {
+    const t = now();
     return {
-      snapshotPath,
-      fileName: 'library.sqlite'
+      sessionId: lockOwner.sessionId,
+      device: lockOwner.device,
+      appVersion: lockOwner.appVersion,
+      acquiredAt: t,
+      refreshedAt: t,
+      expiresAt: t + REMOTE_LOCK_TTL_MS
     };
   };
 
-  const uploadFileToWebDav = async (client, remotePath, localPath) => {
-    const data = await fs.readFile(localPath);
-    await client.putFileContents(remotePath, data, { overwrite: true });
-    return data.length;
+  const acquireRemoteLock = async (client, remotePath) => {
+    const lockPath = `${remotePath}/${REMOTE_LOCK_FILE}`;
+    const existing = await readRemoteJsonFile(client, lockPath, null);
+    if (isRemoteLockAlive(existing) && !isRemoteLockOwnedBySelf(existing)) {
+      throw new Error(`云端正在被其他设备同步: ${String(existing?.device || 'unknown')}`);
+    }
+    const payload = buildRemoteLockPayload();
+    await writeRemoteJsonFile(client, lockPath, payload);
+    activeLockPath = lockPath;
   };
 
-  const downloadFileFromWebDav = async (client, remotePath, localPath) => {
-    const file = await client.getFileContents(remotePath, { format: 'binary' });
-    const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
-    await fs.mkdir(path.dirname(localPath), { recursive: true });
-    await fs.writeFile(localPath, buffer);
-    return buffer.length;
+  const releaseRemoteLock = async (client) => {
+    if (!activeLockPath) return;
+    try {
+      const lock = await readRemoteJsonFile(client, activeLockPath, null);
+      if (isRemoteLockOwnedBySelf(lock)) {
+        await client.deleteFile(activeLockPath).catch(() => null);
+      }
+    } finally {
+      activeLockPath = '';
+    }
+  };
+
+  const clearWebDavLock = async () => {
+    const config = await getWebDavConfigFromSettings();
+    const server = config.webdavServer;
+    const username = config.webdavUsername;
+    const remotePath = config.webdavRemotePath;
+    const password = await getWebDavCredential(server, username);
+    if (!server || !username || !password) {
+      throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
+    }
+    const client = await createWebDavClient(server, username, password);
+    await ensureRemoteDirectory(client, remotePath);
+    const lockPath = `${remotePath}/${REMOTE_LOCK_FILE}`;
+    if (!(await client.exists(lockPath))) {
+      return { success: true, cleared: false, message: '云端锁不存在' };
+    }
+    await client.deleteFile(lockPath);
+    return { success: true, cleared: true, message: '已清除云端锁' };
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const waitForRemoteLockRelease = async (client, remotePath) => {
+    const deadline = now() + REMOTE_LOCK_WAIT_TIMEOUT_MS;
+    const lockPath = `${remotePath}/${REMOTE_LOCK_FILE}`;
+    while (true) {
+      const lock = await readRemoteJsonFile(client, lockPath, null);
+      if (!isRemoteLockAlive(lock) || isRemoteLockOwnedBySelf(lock)) {
+        return { ok: true };
+      }
+      if (now() >= deadline) {
+        return {
+          ok: false,
+          lock
+        };
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(REMOTE_LOCK_WAIT_POLL_MS);
+    }
+  };
+
+  const normalizeRemoteChange = (item) => {
+    const version = Number(item?.version || 0);
+    const entityType = String(item?.entityType || '').trim();
+    const entityId = String(item?.entityId || '').trim();
+    const action = String(item?.action || '').trim();
+    if (!Number.isFinite(version) || version <= 0) return null;
+    if (!entityType || !entityId || !action) return null;
+    return {
+      version: Math.floor(version),
+      opId: String(item?.opId || '').trim() || `v${version}-${entityType}-${entityId}`,
+      entityType,
+      entityId,
+      action,
+      payload: item?.payload && typeof item.payload === 'object' ? item.payload : {},
+      updatedAt: Number(item?.updatedAt || now())
+    };
+  };
+
+  const loadRemoteSyncState = async (client, remotePath) => {
+    const metaPath = `${remotePath}/${REMOTE_META_FILE}`;
+    const changesPath = `${remotePath}/${REMOTE_CHANGES_FILE}`;
+    const metaRaw = await readRemoteJsonFile(client, metaPath, null);
+    const changesRaw = await readRemoteJsonFile(client, changesPath, []);
+    const changes = (Array.isArray(changesRaw) ? changesRaw : [])
+      .map((item) => normalizeRemoteChange(item))
+      .filter(Boolean)
+      .sort((a, b) => a.version - b.version);
+    const latestVersion = changes.length ? Number(changes[changes.length - 1].version || 0) : 0;
+    const versionFromMeta = Number(metaRaw?.libraryVersion || 0);
+    const libraryVersion = Math.max(
+      0,
+      Number.isFinite(versionFromMeta) ? Math.floor(versionFromMeta) : 0,
+      latestVersion
+    );
+    return {
+      meta: {
+        libraryVersion,
+        updatedAt: Number(metaRaw?.updatedAt || 0) || now()
+      },
+      changes
+    };
+  };
+
+  const pruneRemoteChanges = (changes, latestVersion) => {
+    if (!Array.isArray(changes) || !changes.length) return [];
+    const minVersion = Math.max(1, Number(latestVersion || 0) - REMOTE_CHANGE_LOG_KEEP + 1);
+    return changes.filter((item) => Number(item?.version || 0) >= minVersion);
+  };
+
+  const writeRemoteSyncState = async (client, remotePath, meta, changes) => {
+    const changesPath = `${remotePath}/${REMOTE_CHANGES_FILE}`;
+    const metaPath = `${remotePath}/${REMOTE_META_FILE}`;
+    const nextChanges = pruneRemoteChanges(changes, meta.libraryVersion);
+    await writeRemoteJsonFile(client, changesPath, nextChanges);
+    await writeRemoteJsonFile(client, metaPath, {
+      libraryVersion: Number(meta.libraryVersion || 0),
+      updatedAt: now()
+    });
   };
 
   const hashFileSha1 = async (filePath) =>
@@ -152,399 +275,601 @@ const createWebDavSyncModule = (deps = {}) => {
       // eslint-disable-next-line no-await-in-loop
       const sha1 = await hashFileSha1(fullPath);
       entries[file] = {
+        sha1,
         size: Number(stat.size || 0),
-        mtimeMs: Number(stat.mtimeMs || 0),
-        sha1
+        mtimeMs: Number(stat.mtimeMs || 0)
       };
     }
     return {
       version: 1,
-      updatedAt: Date.now(),
+      updatedAt: now(),
       files: entries
     };
   };
 
-  const shouldDownloadPdfFromRemote = (fileName, localManifest, remoteManifest) => {
-    const localFiles =
-      localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
-    const remoteFiles =
-      remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
-    const localMeta = localFiles[fileName];
-    const remoteMeta = remoteFiles[fileName];
-    if (!remoteMeta) return false;
-    if (!localMeta) return true;
+  const downloadBinaryFile = async (client, remoteFilePath, localFilePath) => {
+    const file = await client.getFileContents(remoteFilePath, { format: 'binary' });
+    const buffer = Buffer.isBuffer(file) ? file : Buffer.from(file);
+    await fs.mkdir(path.dirname(localFilePath), { recursive: true });
+    await fs.writeFile(localFilePath, buffer);
+    return buffer.length;
+  };
 
-    const localSha1 = String(localMeta?.sha1 || '').trim();
-    const remoteSha1 = String(remoteMeta?.sha1 || '').trim();
-    if (localSha1 && remoteSha1) {
-      return localSha1 !== remoteSha1;
+  const uploadBinaryFile = async (client, remoteFilePath, localFilePath) => {
+    const data = await fs.readFile(localFilePath);
+    await client.putFileContents(remoteFilePath, data, { overwrite: true });
+    return data.length;
+  };
+
+  const readRemotePdfManifest = async (client, remotePath) =>
+    (await readRemoteJsonFile(client, `${remotePath}/${REMOTE_PDF_MANIFEST_FILE}`, null)) || {
+      version: 1,
+      updatedAt: 0,
+      files: {}
+    };
+
+  const syncRemotePdfFilesFromLocal = async (client, remotePath, paths) => {
+    const remotePapersPath = `${remotePath}/${REMOTE_PAPERS_DIR}`;
+    if (!(await client.exists(remotePapersPath))) {
+      await client.createDirectory(remotePapersPath, { recursive: true });
     }
-    return Number(localMeta?.size || 0) !== Number(remoteMeta?.size || 0);
-  };
+    const localManifest = await buildLocalPdfManifest(paths.papersDir);
+    const remoteManifest = await readRemotePdfManifest(client, remotePath);
+    const localFiles = localManifest.files || {};
+    const remoteFiles = remoteManifest.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
 
-  const getRemotePdfManifestPath = (remotePath) => `${remotePath}/${WEBDAV_PDF_MANIFEST_FILE}`;
-  const getRemoteLockPath = (remotePath) => `${remotePath}/${WEBDAV_LOCK_FILE}`;
-
-  const isRemoteLockAlive = (lock) =>
-    Boolean(lock && Number(lock.expiresAt || 0) > Date.now() && String(lock.sessionId || '').trim());
-
-  const isRemoteLockOwnedBySelf = (lock) =>
-    String(lock?.sessionId || '').trim() === String(webdavLockOwner?.sessionId || '').trim();
-
-  const formatRemoteLockOwner = (lock) => {
-    const device = String(lock?.device || '').trim();
-    if (device) return device;
-    const sessionId = String(lock?.sessionId || '').trim();
-    return sessionId ? `session ${sessionId.slice(0, 8)}` : 'unknown';
-  };
-
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  const waitForRemoteLockRelease = async (
-    client,
-    remotePath,
-    { timeoutMs = REMOTE_LOCK_WAIT_TIMEOUT_MS, pollMs = REMOTE_LOCK_WAIT_POLL_MS } = {}
-  ) => {
-    const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0));
-    const lockPath = getRemoteLockPath(remotePath);
-    while (true) {
-      const lock = await readRemoteJsonFile(client, lockPath).catch(() => null);
-      if (!isRemoteLockAlive(lock) || isRemoteLockOwnedBySelf(lock)) {
-        return { ok: true, lock: lock || null };
+    let uploadedPdfCount = 0;
+    let uploadedPdfBytes = 0;
+    for (const [fileName, localMeta] of Object.entries(localFiles)) {
+      const remoteMeta = remoteFiles[fileName];
+      if (remoteMeta && String(remoteMeta.sha1 || '') === String(localMeta.sha1 || '')) {
+        continue;
       }
-      if (Date.now() >= deadline) {
-        return { ok: false, lock };
-      }
-      emitWebDavSyncState({
-        active: true,
-        direction: 'download',
-        message: `云端正在同步中，等待 ${formatRemoteLockOwner(lock)} 释放锁`
-      });
+      const localFilePath = path.join(paths.papersDir, fileName);
       // eslint-disable-next-line no-await-in-loop
-      await sleep(pollMs);
+      uploadedPdfBytes += await uploadBinaryFile(client, `${remotePapersPath}/${fileName}`, localFilePath);
+      uploadedPdfCount += 1;
+    }
+
+    const staleRemoteFiles = Object.keys(remoteFiles).filter((fileName) => !localFiles[fileName]);
+    for (const fileName of staleRemoteFiles) {
+      // eslint-disable-next-line no-await-in-loop
+      await client.deleteFile(`${remotePapersPath}/${fileName}`).catch(() => null);
+    }
+
+    await writeRemoteJsonFile(client, `${remotePath}/${REMOTE_PDF_MANIFEST_FILE}`, {
+      ...localManifest,
+      updatedAt: now()
+    });
+
+    return {
+      uploadedPdfCount,
+      uploadedPdfBytes
+    };
+  };
+
+  const syncLocalPdfFilesFromRemote = async (client, remotePath, paths, papers) => {
+    const remotePapersPath = `${remotePath}/${REMOTE_PAPERS_DIR}`;
+    const remoteManifest = await readRemotePdfManifest(client, remotePath);
+    const localManifest = await buildLocalPdfManifest(paths.papersDir);
+    const expectedFiles = new Set(
+      (Array.isArray(papers) ? papers : [])
+        .map((paper) => String(paper?.id || '').trim())
+        .filter(Boolean)
+        .map((paperId) => `${getPaperArticleId(paperId)}.pdf`)
+    );
+
+    let downloadedPdfCount = 0;
+    let downloadedPdfBytes = 0;
+    for (const fileName of expectedFiles) {
+      const remoteMeta = remoteManifest?.files?.[fileName];
+      if (!remoteMeta) continue;
+      const localMeta = localManifest?.files?.[fileName];
+      if (localMeta && String(localMeta.sha1 || '') === String(remoteMeta.sha1 || '')) {
+        continue;
+      }
+      const remoteFilePath = `${remotePapersPath}/${fileName}`;
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await client.exists(remoteFilePath))) continue;
+      // eslint-disable-next-line no-await-in-loop
+      downloadedPdfBytes += await downloadBinaryFile(
+        client,
+        remoteFilePath,
+        path.join(paths.papersDir, fileName)
+      );
+      downloadedPdfCount += 1;
+    }
+
+    const localFiles = await fs.readdir(paths.papersDir).catch(() => []);
+    for (const fileName of localFiles) {
+      if (!String(fileName || '').toLowerCase().endsWith('.pdf')) continue;
+      if (expectedFiles.has(fileName)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await removeFileIfExists(path.join(paths.papersDir, fileName));
+    }
+
+    return {
+      downloadedPdfCount,
+      downloadedPdfBytes
+    };
+  };
+
+  const createSqliteSnapshot = async () => {
+    await ensureLibraryStoreReady();
+    const paths = getLibraryPaths();
+    const snapshotPath = `${paths.sqlitePath}.sync`;
+    await removeFileIfExists(snapshotPath);
+    await fs.copyFile(paths.sqlitePath, snapshotPath);
+    return snapshotPath;
+  };
+
+  const uploadLocalSqliteSnapshot = async (client, remotePath) => {
+    const paths = getLibraryPaths();
+    const snapshotPath = await createSqliteSnapshot();
+    try {
+      return await uploadBinaryFile(client, `${remotePath}/${REMOTE_SQLITE_FILE}`, snapshotPath);
+    } finally {
+      await removeFileIfExists(snapshotPath);
     }
   };
 
-  const getChangedPdfFilesForUpload = (localManifest, remoteManifest) => {
-    const localFiles =
-      localManifest?.files && typeof localManifest.files === 'object' ? localManifest.files : {};
-    const remoteFiles =
-      remoteManifest?.files && typeof remoteManifest.files === 'object' ? remoteManifest.files : {};
-    return Object.entries(localFiles)
-      .filter(([file, meta]) => {
-        const remote = remoteFiles[file];
-        if (!remote) return true;
-        return String(meta?.sha1 || '') !== String(remote?.sha1 || '');
-      })
-      .map(([file]) => file);
-  };
+  const applyRemoteChanges = async (client, remotePath, changes = []) => {
+    const paths = getLibraryPaths();
+    const list = (Array.isArray(changes) ? changes : [])
+      .map((item) => normalizeRemoteChange(item))
+      .filter(Boolean)
+      .sort((a, b) => a.version - b.version);
+    if (!list.length) {
+      return {
+        appliedCount: 0,
+        downloadedPdfCount: 0,
+        downloadedPdfBytes: 0
+      };
+    }
 
-  const buildStateMap = (states = []) =>
-    new Map(
-      (Array.isArray(states) ? states : [])
+    let folders = await loadFoldersFromSqlite();
+    let papers = await loadPapersFromSqlite();
+    const stateMap = new Map(
+      (await loadPaperStatesFromSqlite())
         .map((item) => [String(item?.paperId || '').trim(), item?.state || {}])
         .filter((entry) => entry[0])
     );
+    const pdfChanges = [];
 
-  const prepareRemoteWebDavSnapshot = async (client, remotePath, remoteSqlitePath) => {
-    const paths = getLibraryPaths();
-    const remoteTempSqlitePath = `${paths.sqlitePath}.remote-snapshot`;
-    await removeFileIfExists(remoteTempSqlitePath);
-    await downloadFileFromWebDav(client, remoteSqlitePath, remoteTempSqlitePath);
-    const remoteData = loadLibraryDataFromSqliteFile(remoteTempSqlitePath, {
-      root: paths.root,
-      papersDir: paths.papersDir
+    list.forEach((change) => {
+      if (change.entityType === 'folders' && change.action === 'upsert') {
+        const nextFolders = Array.isArray(change?.payload?.folders) ? change.payload.folders : null;
+        if (nextFolders) folders = nextFolders;
+        return;
+      }
+      if (change.entityType === 'papers' && change.action === 'upsert') {
+        const nextPapers = Array.isArray(change?.payload?.papers) ? change.payload.papers : null;
+        if (nextPapers) papers = nextPapers;
+        return;
+      }
+      if (change.entityType === 'paper_state') {
+        const paperId = String(change?.payload?.paperId || change.entityId || '').trim();
+        if (!paperId) return;
+        if (change.action === 'delete') {
+          stateMap.delete(paperId);
+          return;
+        }
+        stateMap.set(paperId, change?.payload?.state || {});
+        return;
+      }
+      if (change.entityType === 'pdf') {
+        pdfChanges.push(change);
+      }
     });
-    const localManifest = await buildLocalPdfManifest(paths.papersDir);
-    const remoteManifest = (await readRemoteJsonFile(client, getRemotePdfManifestPath(remotePath))) || {
-      version: 1,
-      updatedAt: Date.now(),
-      files: {}
-    };
+
+    const retainPaperIds = new Set(
+      (Array.isArray(papers) ? papers : []).map((paper) => String(paper?.id || '').trim()).filter(Boolean)
+    );
+
+    const saveResult = await withSyncQueueSuppressed(async () => {
+      await saveFoldersToSqlite(folders, { skipSyncQueue: true });
+      await savePapersToSqlite(papers, paths, {
+        preserveIncomingVersion: true,
+        skipSyncQueue: true
+      });
+
+      const staleStateIds = Array.from(stateMap.keys()).filter((paperId) => !retainPaperIds.has(paperId));
+      staleStateIds.forEach((paperId) => stateMap.delete(paperId));
+      const localStateIds = (await loadPaperStatesFromSqlite())
+        .map((item) => String(item?.paperId || '').trim())
+        .filter(Boolean);
+      deletePaperStatesFromSqlite(localStateIds.filter((paperId) => !stateMap.has(paperId)));
+      for (const [paperId, state] of stateMap.entries()) {
+        // eslint-disable-next-line no-await-in-loop
+        await savePaperStateToSqlite(paperId, state || {}, { skipSyncQueue: true });
+      }
+    });
+
+    let downloadedPdfCount = 0;
+    let downloadedPdfBytes = 0;
+    const remotePapersPath = `${remotePath}/${REMOTE_PAPERS_DIR}`;
+    for (const change of pdfChanges) {
+      const paperId = String(change?.payload?.paperId || change.entityId || '').trim();
+      if (!paperId) continue;
+      const fileName = `${getPaperArticleId(paperId)}.pdf`;
+      const localFilePath = path.join(paths.papersDir, fileName);
+      if (change.action === 'delete') {
+        // eslint-disable-next-line no-await-in-loop
+        await removeFileIfExists(localFilePath);
+        continue;
+      }
+      const remoteFilePath = `${remotePapersPath}/${fileName}`;
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await client.exists(remoteFilePath))) continue;
+      const remoteSha1 = String(change?.payload?.sha1 || '').trim();
+      if (remoteSha1) {
+        let localSha1 = '';
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          localSha1 = await hashFileSha1(localFilePath);
+        } catch {
+          localSha1 = '';
+        }
+        if (localSha1 && localSha1 === remoteSha1) continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      downloadedPdfBytes += await downloadBinaryFile(client, remoteFilePath, localFilePath);
+      downloadedPdfCount += 1;
+    }
+
+    const manifestResult = await syncLocalPdfFilesFromRemote(client, remotePath, paths, papers);
+    downloadedPdfCount += Number(manifestResult?.downloadedPdfCount || 0);
+    downloadedPdfBytes += Number(manifestResult?.downloadedPdfBytes || 0);
+
     return {
-      remotePath,
-      remoteSqlitePath,
-      remoteTempSqlitePath,
-      remoteData,
-      localManifest,
-      remoteManifest
+      appliedCount: list.length,
+      downloadedPdfCount,
+      downloadedPdfBytes,
+      saveResult
     };
   };
 
-  const syncLibraryFromWebDavToLocal = async () => {
-    const config = await getWebDavConfigFromSettings();
-    const server = config.webdavServer;
-    const username = config.webdavUsername;
-    const remotePath = config.webdavRemotePath;
-    const password = await getWebDavCredential(server, username);
-    if (!server || !username || !password) {
-      console.log('[webdav-sync] startup download skipped: missing config or credential');
-      return { success: false, skipped: true, reason: 'missing config or credential' };
+  const downloadFullRemoteSnapshot = async (client, remotePath, remoteVersion) => {
+    const paths = getLibraryPaths();
+    const remoteSqlitePath = `${remotePath}/${REMOTE_SQLITE_FILE}`;
+    if (!(await client.exists(remoteSqlitePath))) {
+      return {
+        success: false,
+        skipped: true,
+        reason: 'remote sqlite not found'
+      };
     }
-
-    emitWebDavSyncState({
-      active: true,
-      direction: 'download',
-      message: '正在从云端同步'
-    });
-
+    const tempPath = `${paths.sqlitePath}.remote-full`;
+    await removeFileIfExists(tempPath);
     try {
-      const client = await createWebDavClient(server, username, password);
-      await client.getDirectoryContents('/');
-      if (!(await client.exists(remotePath))) {
-        console.log(`[webdav-sync] startup download skipped: remote path not found (${server}${remotePath})`);
-        emitWebDavSyncState({
-          active: false,
-          direction: 'download',
-          message: '云端目录不存在'
+      const sqliteBytes = await downloadBinaryFile(client, remoteSqlitePath, tempPath);
+      const remoteData = loadLibraryDataFromSqliteFile(tempPath, {
+        root: paths.root,
+        papersDir: paths.papersDir
+      });
+      const folders = Array.isArray(remoteData?.folders) ? remoteData.folders : [];
+      const papers = Array.isArray(remoteData?.papers) ? remoteData.papers : [];
+      const states = Array.isArray(remoteData?.states) ? remoteData.states : [];
+      const stateMap = new Map(
+        states
+          .map((item) => [String(item?.paperId || '').trim(), item?.state || {}])
+          .filter((entry) => entry[0])
+      );
+      await withSyncQueueSuppressed(async () => {
+        await saveFoldersToSqlite(folders, { skipSyncQueue: true });
+        await savePapersToSqlite(papers, paths, {
+          preserveIncomingVersion: true,
+          skipSyncQueue: true
         });
-        return { success: false, skipped: true, reason: 'remote path not found' };
-      }
-      const remoteSqlitePath = `${remotePath}/library.sqlite`;
-      if (!(await client.exists(remoteSqlitePath))) {
-        console.log(
-          `[webdav-sync] startup download skipped: remote sqlite not found (${server}${remoteSqlitePath})`
+        const retainIds = new Set(
+          papers.map((paper) => String(paper?.id || '').trim()).filter(Boolean)
         );
-        emitWebDavSyncState({
-          active: false,
-          direction: 'download',
-          message: '云端数据库不存在'
-        });
-        return { success: false, skipped: true, reason: 'remote sqlite not found' };
-      }
-
-      const lockWaitResult = await waitForRemoteLockRelease(client, remotePath);
-      if (!lockWaitResult.ok) {
-        const owner = formatRemoteLockOwner(lockWaitResult.lock);
-        const message = `云端正在由 ${owner} 同步，请稍后重试`;
-        console.log(`[webdav-sync] startup download skipped: remote lock still active (${owner})`);
-        emitWebDavSyncState({
-          active: false,
-          direction: 'download',
-          message
-        });
-        return {
-          success: false,
-          skipped: true,
-          locked: true,
-          reason: 'remote lock active',
-          owner,
-          message
-        };
-      }
-
-      const snapshot = await prepareRemoteWebDavSnapshot(client, remotePath, remoteSqlitePath);
-      try {
-        await ensureLibrary();
-        const paths = getLibraryPaths();
-        let downloadedPdfCount = 0;
-        let downloadedPdfBytes = 0;
-        const remoteFolders = Array.isArray(snapshot?.remoteData?.folders)
-          ? snapshot.remoteData.folders
-          : [];
-        const remotePapers = (Array.isArray(snapshot?.remoteData?.papers) ? snapshot.remoteData.papers : []).sort(
-          (a, b) => {
-            const aTime = Number(a?.uploadedAt || 0);
-            const bTime = Number(b?.uploadedAt || 0);
-            if (aTime !== bTime) return bTime - aTime;
-            return String(a?.title || '').localeCompare(String(b?.title || ''), 'zh-Hans-CN');
-          }
-        );
-        const remoteStateMap = buildStateMap(snapshot?.remoteData?.states);
-        const sqliteStat = await fs.stat(snapshot?.remoteTempSqlitePath).catch(() => null);
-        const sqliteBytes = Number(sqliteStat?.size || 0);
-
-        await ensureLibraryStoreReady();
-        await saveFoldersToSqlite(remoteFolders);
-        await savePapersToSqlite(remotePapers, paths, { preserveIncomingVersion: true });
-        const retainedIds = new Set(remotePapers.map((paper) => String(paper?.id || '').trim()).filter(Boolean));
         const localStateIds = (await loadPaperStatesFromSqlite())
           .map((item) => String(item?.paperId || '').trim())
           .filter(Boolean);
-        deletePaperStatesFromSqlite(localStateIds.filter((paperId) => !retainedIds.has(paperId)));
-        for (const paperId of retainedIds) {
+        deletePaperStatesFromSqlite(localStateIds.filter((paperId) => !retainIds.has(paperId)));
+        for (const paperId of retainIds) {
           // eslint-disable-next-line no-await-in-loop
-          await savePaperStateToSqlite(paperId, remoteStateMap.get(paperId) || {});
+          await savePaperStateToSqlite(paperId, stateMap.get(paperId) || {}, { skipSyncQueue: true });
         }
-
-        const remotePapersPath = `${remotePath}/papers`;
-        const expectedPdfFiles = new Set();
-        for (const paper of remotePapers) {
-          const paperId = String(paper?.id || '').trim();
-          if (!paperId) continue;
-          const fileName = `${getPaperArticleId(paperId)}.pdf`;
-          expectedPdfFiles.add(fileName);
-          if (!snapshot?.remoteManifest?.files?.[fileName]) continue;
-          if (!shouldDownloadPdfFromRemote(fileName, snapshot.localManifest, snapshot.remoteManifest)) {
-            continue;
-          }
-          const localPdfPath = path.join(paths.papersDir, fileName);
-          // eslint-disable-next-line no-await-in-loop
-          downloadedPdfBytes += await downloadFileFromWebDav(client, `${remotePapersPath}/${fileName}`, localPdfPath);
-          downloadedPdfCount += 1;
-        }
-        const localPdfFiles = await fs.readdir(paths.papersDir).catch(() => []);
-        for (const file of localPdfFiles) {
-          if (!String(file || '').toLowerCase().endsWith('.pdf')) continue;
-          if (expectedPdfFiles.has(file)) continue;
-          // eslint-disable-next-line no-await-in-loop
-          await removeFileIfExists(path.join(paths.papersDir, file));
-        }
-
-        console.log(
-          `[webdav-sync] download complete: sqlite=${sqliteBytes}B, pdfs=${downloadedPdfCount}, pdfBytes=${downloadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
-        );
-        setSyncPending(false);
-        emitWebDavSyncState({
-          active: false,
-          direction: 'download',
-          message: '云端同步完成'
-        });
-        return {
-          success: true,
-          sqliteBytes,
-          downloadedPdfCount,
-          downloadedPdfBytes,
-          remotePath,
-          server
-        };
-      } finally {
-        await cleanupRemoteSnapshot(snapshot);
-      }
-    } catch (error) {
-      emitWebDavSyncState({
-        active: false,
-        direction: 'download',
-        message: error?.message || '云端同步失败'
       });
-      throw error;
+      const { downloadedPdfCount, downloadedPdfBytes } = await syncLocalPdfFilesFromRemote(
+        client,
+        remotePath,
+        paths,
+        papers
+      );
+      setLocalAppliedVersion(remoteVersion);
+      return {
+        success: true,
+        mode: 'download',
+        sqliteBytes,
+        downloadedPdfCount,
+        downloadedPdfBytes,
+        remoteVersion
+      };
+    } finally {
+      await removeFileIfExists(tempPath);
     }
   };
 
-  const syncLibraryToWebDav = async () => {
+  const pullRemoteChanges = async (client, remotePath) => {
+    await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_SYNC_DIR}`);
+    const lockResult = await waitForRemoteLockRelease(client, remotePath);
+    if (!lockResult.ok) {
+      return {
+        success: false,
+        skipped: true,
+        locked: true,
+        error: `云端正在由 ${String(lockResult.lock?.device || 'unknown')} 同步，请稍后重试`
+      };
+    }
+
+    const remoteState = await loadRemoteSyncState(client, remotePath);
+    const remoteVersion = Number(remoteState?.meta?.libraryVersion || 0);
+    const localAppliedVersion = getLocalAppliedVersion();
+    if (remoteVersion <= localAppliedVersion) {
+      return {
+        success: true,
+        skipped: true,
+        mode: 'download',
+        remoteVersion
+      };
+    }
+
+    const pendingRemote = remoteState.changes.filter(
+      (item) => Number(item?.version || 0) > localAppliedVersion
+    );
+    if (!pendingRemote.length || Number(pendingRemote[0]?.version || 0) > localAppliedVersion + 1) {
+      return downloadFullRemoteSnapshot(client, remotePath, remoteVersion);
+    }
+
+    const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote);
+    setLocalAppliedVersion(remoteVersion);
+    return {
+      success: true,
+      mode: 'download',
+      remoteVersion,
+      appliedChangeCount: applyResult.appliedCount,
+      downloadedPdfCount: applyResult.downloadedPdfCount,
+      downloadedPdfBytes: applyResult.downloadedPdfBytes
+    };
+  };
+
+  const normalizeLocalQueueEntry = (entry) => {
+    const entityType = String(entry?.entityType || '').trim();
+    const entityId = String(entry?.entityId || '').trim();
+    const action = String(entry?.action || '').trim();
+    if (!entityType || !entityId || !action) return null;
+    return {
+      entityType,
+      entityId,
+      action,
+      payload: entry?.payload && typeof entry.payload === 'object' ? entry.payload : {},
+      updatedAt: Number(entry?.updatedAt || now())
+    };
+  };
+
+  const enrichPdfQueuePayload = async (entry, paths) => {
+    if (entry.entityType !== 'pdf') return entry;
+    const paperId = String(entry?.payload?.paperId || entry.entityId || '').trim();
+    if (!paperId) return entry;
+    const fileName = `${getPaperArticleId(paperId)}.pdf`;
+    const filePath = path.join(paths.papersDir, fileName);
+    if (entry.action === 'delete') {
+      return {
+        ...entry,
+        payload: {
+          paperId,
+          fileName
+        }
+      };
+    }
+    let stat = null;
+    try {
+      stat = await fs.stat(filePath);
+    } catch {
+      stat = null;
+    }
+    if (!stat?.isFile?.()) {
+      return {
+        ...entry,
+        action: 'delete',
+        payload: { paperId, fileName }
+      };
+    }
+    const sha1 = await hashFileSha1(filePath);
+    return {
+      ...entry,
+      payload: {
+        paperId,
+        fileName,
+        sha1,
+        size: Number(stat.size || 0),
+        mtimeMs: Number(stat.mtimeMs || 0)
+      }
+    };
+  };
+
+  const uploadLocalChanges = async (client, remotePath) => {
+    const paths = getLibraryPaths();
+    await ensureRemoteDirectory(client, remotePath);
+    await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_SYNC_DIR}`);
+    await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_PAPERS_DIR}`);
+
+    await acquireRemoteLock(client, remotePath);
+    try {
+      const remoteState = await loadRemoteSyncState(client, remotePath);
+      const remoteVersion = Number(remoteState?.meta?.libraryVersion || 0);
+      const localAppliedVersion = getLocalAppliedVersion();
+
+      let appliedChangeCount = 0;
+      let downloadedPdfCount = 0;
+      let downloadedPdfBytes = 0;
+      if (remoteVersion > localAppliedVersion) {
+        const pendingRemote = remoteState.changes.filter(
+          (item) => Number(item?.version || 0) > localAppliedVersion
+        );
+        if (pendingRemote.length && Number(pendingRemote[0]?.version || 0) === localAppliedVersion + 1) {
+          const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote);
+          appliedChangeCount = Number(applyResult.appliedCount || 0);
+          downloadedPdfCount = Number(applyResult.downloadedPdfCount || 0);
+          downloadedPdfBytes = Number(applyResult.downloadedPdfBytes || 0);
+          setLocalAppliedVersion(remoteVersion);
+        } else {
+          const fullDownloadResult = await downloadFullRemoteSnapshot(client, remotePath, remoteVersion);
+          if (fullDownloadResult?.success) {
+            appliedChangeCount = Number(fullDownloadResult?.appliedChangeCount || 0);
+            downloadedPdfCount = Number(fullDownloadResult?.downloadedPdfCount || 0);
+            downloadedPdfBytes = Number(fullDownloadResult?.downloadedPdfBytes || 0);
+          }
+        }
+      }
+
+      const queueEntriesRaw = loadSyncQueueEntries();
+      if (!queueEntriesRaw.length) {
+        return {
+          success: true,
+          mode: appliedChangeCount || downloadedPdfCount ? 'download' : 'upload',
+          skipped: true,
+          remoteVersion: Number(remoteState?.meta?.libraryVersion || 0),
+          appliedChangeCount,
+          downloadedPdfCount,
+          downloadedPdfBytes
+        };
+      }
+
+      const queueEntries = [];
+      for (const item of queueEntriesRaw) {
+        const normalized = normalizeLocalQueueEntry(item);
+        if (!normalized) continue;
+        // eslint-disable-next-line no-await-in-loop
+        queueEntries.push(await enrichPdfQueuePayload(normalized, paths));
+      }
+
+      let uploadedPdfCount = 0;
+      let uploadedPdfBytes = 0;
+      for (const entry of queueEntries) {
+        if (entry.entityType !== 'pdf') continue;
+        const paperId = String(entry?.payload?.paperId || entry.entityId || '').trim();
+        if (!paperId) continue;
+        const fileName = String(entry?.payload?.fileName || `${getPaperArticleId(paperId)}.pdf`).trim();
+        const remoteFilePath = `${remotePath}/${REMOTE_PAPERS_DIR}/${fileName}`;
+        if (entry.action === 'delete') {
+          // eslint-disable-next-line no-await-in-loop
+          await client.deleteFile(remoteFilePath).catch(() => null);
+          continue;
+        }
+        const localFilePath = path.join(paths.papersDir, fileName);
+        // eslint-disable-next-line no-await-in-loop
+        uploadedPdfBytes += await uploadBinaryFile(client, remoteFilePath, localFilePath);
+        uploadedPdfCount += 1;
+      }
+
+      const sqliteBytes = await uploadLocalSqliteSnapshot(client, remotePath);
+      const manifestResult = await syncRemotePdfFilesFromLocal(client, remotePath, paths);
+      uploadedPdfCount += Number(manifestResult?.uploadedPdfCount || 0);
+      uploadedPdfBytes += Number(manifestResult?.uploadedPdfBytes || 0);
+
+      const nextChanges = [...remoteState.changes];
+      let nextVersion = Number(remoteState?.meta?.libraryVersion || 0);
+      queueEntries.forEach((entry) => {
+        nextVersion += 1;
+        nextChanges.push({
+          version: nextVersion,
+          opId: `${lockOwner.sessionId}:${nextVersion}:${entry.entityType}:${entry.entityId}`,
+          entityType: entry.entityType,
+          entityId: entry.entityId,
+          action: entry.action,
+          payload: entry.payload,
+          updatedAt: entry.updatedAt || now()
+        });
+      });
+      await writeRemoteSyncState(
+        client,
+        remotePath,
+        {
+          libraryVersion: nextVersion,
+          updatedAt: now()
+        },
+        nextChanges
+      );
+
+      clearSyncQueueEntries(queueEntriesRaw);
+      setLocalAppliedVersion(nextVersion);
+      return {
+        success: true,
+        mode: 'upload',
+        remoteVersion: nextVersion,
+        sqliteBytes,
+        uploadedPdfCount,
+        uploadedPdfBytes,
+        appliedChangeCount,
+        downloadedPdfCount,
+        downloadedPdfBytes
+      };
+    } finally {
+      await releaseRemoteLock(client);
+    }
+  };
+
+  const syncLibrary = async ({ mode = 'auto' } = {}) => {
+    await ensureLibraryStoreReady();
     const config = await getWebDavConfigFromSettings();
     const server = config.webdavServer;
     const username = config.webdavUsername;
     const remotePath = config.webdavRemotePath;
     const password = await getWebDavCredential(server, username);
     if (!server || !username || !password) {
-      throw new Error('请先在设置中完成 WebDAV 配置并保存凭据');
-    }
-
-    emitWebDavSyncState({
-      active: true,
-      direction: 'upload',
-      message: '正在上传到云端'
-    });
-    console.log(`[webdav-sync] upload start: remote=${server}${remotePath}`);
-
-    try {
-      console.log('[webdav-sync] upload step start: connect');
-      const client = await createWebDavClient(server, username, password);
-      await client.getDirectoryContents('/');
-      console.log('[webdav-sync] upload step done: connect');
-      if (!(await client.exists(remotePath))) {
-        console.log(`[webdav-sync] upload step start: ensure remote dir ${remotePath}`);
-        await client.createDirectory(remotePath, { recursive: true });
-        console.log(`[webdav-sync] upload step done: ensure remote dir ${remotePath}`);
-      }
-      console.log('[webdav-sync] upload step start: acquire lock');
-      await ensureWebDavLock(client, remotePath);
-      console.log('[webdav-sync] upload step done: acquire lock');
-      const remotePapersPath = `${remotePath}/papers`;
-      if (!(await client.exists(remotePapersPath))) {
-        console.log(`[webdav-sync] upload step start: ensure remote dir ${remotePapersPath}`);
-        await client.createDirectory(remotePapersPath, { recursive: true });
-        console.log(`[webdav-sync] upload step done: ensure remote dir ${remotePapersPath}`);
-      }
-
-      const paths = getLibraryPaths();
-      const remoteSqlitePath = `${remotePath}/library.sqlite`;
-      if (await client.exists(remoteSqlitePath)) {
-        console.log('[webdav-sync] upload step mode: overwrite remote snapshot');
-      }
-      console.log('[webdav-sync] upload step start: create sqlite snapshot');
-      const snapshot = await createSqliteSyncSnapshot();
-      console.log(`[webdav-sync] upload step done: create sqlite snapshot path=${snapshot.snapshotPath}`);
-      let uploadedPdfCount = 0;
-      let uploadedPdfBytes = 0;
-      let sqliteBytes = 0;
-
-      try {
-        console.log('[webdav-sync] upload step start: upload sqlite');
-        sqliteBytes = await uploadFileToWebDav(client, `${remotePath}/${snapshot.fileName}`, snapshot.snapshotPath);
-        console.log(`[webdav-sync] upload step done: upload sqlite bytes=${sqliteBytes}`);
-        console.log('[webdav-sync] upload step start: build local pdf manifest');
-        const localManifest = await buildLocalPdfManifest(paths.papersDir);
-        console.log(
-          `[webdav-sync] upload step done: build local pdf manifest files=${Object.keys(localManifest.files || {}).length}`
-        );
-        console.log('[webdav-sync] upload step start: read remote pdf manifest');
-        const remoteManifest = await readRemoteJsonFile(client, getRemotePdfManifestPath(remotePath));
-        console.log(
-          `[webdav-sync] upload step done: read remote pdf manifest files=${Object.keys(remoteManifest?.files || {}).length}`
-        );
-        const filesToUpload = getChangedPdfFilesForUpload(localManifest, remoteManifest);
-        console.log(`[webdav-sync] upload step start: upload changed pdfs count=${filesToUpload.length}`);
-        const remoteFiles =
-          remoteManifest?.files && typeof remoteManifest.files === 'object'
-            ? Object.keys(remoteManifest.files)
-            : [];
-        for (const file of filesToUpload) {
-          const localPath = path.join(paths.papersDir, file);
-          uploadedPdfBytes += await uploadFileToWebDav(client, `${remotePapersPath}/${file}`, localPath);
-          uploadedPdfCount += 1;
-        }
-        console.log(
-          `[webdav-sync] upload step done: upload changed pdfs count=${uploadedPdfCount} bytes=${uploadedPdfBytes}`
-        );
-        console.log('[webdav-sync] upload step start: delete remote stale pdfs');
-        for (const remoteFile of remoteFiles) {
-          if (localManifest.files[remoteFile]) continue;
-          await client.deleteFile(`${remotePapersPath}/${remoteFile}`).catch(() => null);
-        }
-        console.log('[webdav-sync] upload step done: delete remote stale pdfs');
-        console.log('[webdav-sync] upload step start: write remote pdf manifest');
-        await writeRemoteJsonFile(client, getRemotePdfManifestPath(remotePath), localManifest);
-        console.log('[webdav-sync] upload step done: write remote pdf manifest');
-      } finally {
-        await removeFileIfExists(snapshot.snapshotPath);
-      }
-
-      console.log(
-        `[webdav-sync] upload complete: sqlite=${sqliteBytes}B, pdfs=${uploadedPdfCount}, pdfBytes=${uploadedPdfBytes}B, remote=${server}${remotePath}, syncPending=${getSyncPending()}`
-      );
-      setSyncPending(false);
-      emitWebDavSyncState({
-        active: false,
-        direction: 'upload',
-        message: '上传完成'
-      });
       return {
-        success: true,
-        sqliteBytes,
-        uploadedPdfCount,
-        uploadedPdfBytes,
-        remotePath,
-        server
+        success: false,
+        skipped: true,
+        reason: 'missing config or credential',
+        error: '请先在设置中完成 WebDAV 配置并保存凭据'
       };
-    } catch (error) {
-      console.warn(`[webdav-sync] upload failed: ${error?.message || error}`);
-      emitWebDavSyncState({
-        active: false,
-        direction: 'upload',
-        message: error?.message || '上传失败'
-      });
-      throw error;
-    } finally {
-      await releaseWebDavLock();
     }
+
+    const client = await createWebDavClient(server, username, password);
+    await client.getDirectoryContents('/');
+
+    const normalizedMode = String(mode || 'auto').trim();
+    if (normalizedMode === 'download') {
+      const result = await pullRemoteChanges(client, remotePath);
+      return {
+        ...result,
+        server,
+        remotePath
+      };
+    }
+    if (normalizedMode === 'upload') {
+      const result = await uploadLocalChanges(client, remotePath);
+      return {
+        ...result,
+        server,
+        remotePath
+      };
+    }
+
+    const pendingCount = Number(getSyncQueueSize() || 0);
+    if (pendingCount > 0) {
+      const result = await uploadLocalChanges(client, remotePath);
+      return {
+        ...result,
+        server,
+        remotePath
+      };
+    }
+    const result = await pullRemoteChanges(client, remotePath);
+    return {
+      ...result,
+      server,
+      remotePath
+    };
   };
 
   return {
-    getWebDavSyncState: () => webdavSyncState,
-    syncLibraryFromWebDavToLocal,
-    syncLibraryToWebDav
+    syncLibrary,
+    clearWebDavLock
   };
 };
 

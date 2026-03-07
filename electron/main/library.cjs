@@ -17,7 +17,7 @@ const registerLibraryIpc = ({
   removeFileIfExists,
   deletePapersFromSqlite,
   deletePaperVectorPoints,
-  setSyncPending
+  recordSyncChange
 }) => {
   ipcMain.handle('library-get-folders', async () => {
     await ensureLibraryStoreReady();
@@ -28,10 +28,7 @@ const registerLibraryIpc = ({
   ipcMain.handle('library-save-folders', async (_event, payload = []) => {
     return enqueueWrite(async () => {
       await ensureLibraryStoreReady();
-      const result = await saveFoldersToSqlite(payload);
-      if (result?.changed) {
-        setSyncPending(true);
-      }
+      await saveFoldersToSqlite(payload);
       return { ok: true };
     });
   });
@@ -51,9 +48,6 @@ const registerLibraryIpc = ({
         paths,
         papers.map((paper) => String(paper?.id || '').trim())
       );
-      if (result?.changed) {
-        setSyncPending(true);
-      }
       return { ok: true };
     });
   });
@@ -70,9 +64,6 @@ const registerLibraryIpc = ({
         papers.map((paper) => String(paper?.id || '').trim())
       );
       await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-      if (foldersResult?.changed || papersResult?.changed) {
-        setSyncPending(true);
-      }
       return { ok: true };
     });
   });
@@ -90,7 +81,14 @@ const registerLibraryIpc = ({
       const filePath = require('path').join(paths.papersDir, `${paperPointId}.pdf`);
       await fs.writeFile(filePath, buffer);
       await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
-      setSyncPending(true);
+      if (typeof recordSyncChange === 'function') {
+        recordSyncChange({
+          entityType: 'pdf',
+          entityId: paperId,
+          action: 'upsert',
+          payload: { paperId }
+        });
+      }
       return { ok: true, filePath };
     });
   });
@@ -139,9 +137,6 @@ const registerLibraryIpc = ({
       const paperId = String(payload.paperId || '').trim();
       if (!paperId) return { ok: false, error: '缺少paperId' };
       const result = await savePaperStateToSqlite(paperId, payload.state || {});
-      if (result?.changed) {
-        setSyncPending(true);
-      }
       return result;
     });
   });
@@ -162,7 +157,6 @@ const registerLibraryIpc = ({
       await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
       deletePapersFromSqlite([paperId]);
       await deletePaperVectorPoints([paperId]);
-      setSyncPending(true);
       const papers = await loadPapersFromSqlite();
       const remainIds = Array.isArray(papers)
         ? papers
@@ -194,7 +188,6 @@ const registerLibraryIpc = ({
       }
       deletePapersFromSqlite(ids);
       await deletePaperVectorPoints(ids);
-      setSyncPending(true);
       const papers = await loadPapersFromSqlite();
       const idSet = new Set(ids);
       const remainIds = Array.isArray(papers)

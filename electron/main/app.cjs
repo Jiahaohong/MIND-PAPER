@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs/promises');
 const fsNative = require('fs');
 const crypto = require('crypto');
+const os = require('os');
 const { spawn } = require('child_process');
 const { createMainWindow } = require('./window.cjs');
 const createSqliteModule = require('./sqlite.cjs');
@@ -36,7 +37,6 @@ const SUMMARY_EMBED_MAX_TEXT_LEN = 6000;
 const LIBRARY_SQLITE_VERSION = 1;
 const LIBRARY_FOLDERS_POINT_KEY = '__folders__';
 const LIBRARY_MIGRATION_POINT_KEY = '__migration__';
-const LIBRARY_SYNC_PENDING_KEY = '__sync_pending__';
 const TRANSLATE_SYSTEM_PROMPT =
   '你是翻译引擎。请将用户提供的文本翻译成中文，只输出翻译结果，不要添加解释。';
 const CNKI_TOKEN_URL = 'https://dict.cnki.net/fyzs-front-api/getToken';
@@ -44,10 +44,8 @@ const CNKI_TRANSLATE_URL = 'https://dict.cnki.net/fyzs-front-api/translate/liter
 const CNKI_REGEX = /(查看名企职位.+?https:\/\/dict\.cnki\.net[a-zA-Z./]+.html?)/g;
 const CNKI_AES_KEY = '4e87183cfd3a45fe';
 const CNKI_TOKEN_TTL = 300 * 1000;
+const CNKI_TRANSLATE_INTERVAL_MS = 1500;
 const DEFAULT_WEBDAV_REMOTE_PATH = '/mindpaper';
-const WEBDAV_LOCK_TTL_MS = 12 * 60 * 60 * 1000;
-const WEBDAV_REMOTE_POLL_INTERVAL_MS = 30 * 1000;
-const WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS = 1000;
 
 let settingsLoaded = false;
 let writeChain = Promise.resolve();
@@ -66,15 +64,11 @@ let runtimeSettings = {
 };
 
 let cnkiTokenCache = { token: '', t: 0 };
+let cnkiLastTranslateRequestAt = 0;
 let qdrantBootPromise = null;
 let qdrantProcess = null;
 let qdrantStartedByApp = false;
 let summaryVectorSyncChain = Promise.resolve();
-let startupWebDavSyncPromise = null;
-let webdavLocalUploadTimer = null;
-let webdavRemotePollTimer = null;
-let webdavBackgroundSyncInFlight = false;
-let lastObservedRemoteWebDavFingerprint = '';
 const PROGRESS_STAGES = new Set([
   '开始解析基本信息',
   '完成解析基本信息',
@@ -159,79 +153,6 @@ const enqueueWrite = (task) => {
 };
 
 const flushWrites = () => writeChain;
-
-const getRemoteWebDavFingerprint = async () => {
-  const config = await getWebDavConfigFromSettings();
-  const server = config.webdavServer;
-  const username = config.webdavUsername;
-  const remotePath = config.webdavRemotePath;
-  const password = await getWebDavCredential(server, username);
-  if (!server || !username || !password) {
-    return { ok: false, skipped: true, reason: 'missing config or credential' };
-  }
-
-  const client = await createWebDavClient(server, username, password);
-  await client.getDirectoryContents('/');
-  if (!(await client.exists(remotePath))) {
-    return { ok: false, skipped: true, reason: 'remote path not found' };
-  }
-
-  const remoteItemsResp = await client.getDirectoryContents(remotePath).catch(() => []);
-  const remoteItems = Array.isArray(remoteItemsResp) ? remoteItemsResp : [];
-  const findRemoteEntry = (name) =>
-    remoteItems.find((item) => path.basename(String(item?.filename || '')) === name) || null;
-  const sqliteEntry = findRemoteEntry('library.sqlite');
-  const manifest = (await readRemoteJsonFile(client, `${remotePath}/papers-manifest.json`).catch(() => null)) || null;
-  const fingerprint = JSON.stringify({
-    server,
-    remotePath,
-    sqlite: sqliteEntry
-      ? {
-          size: Number(sqliteEntry?.size || 0),
-          lastmod: String(sqliteEntry?.lastmod || ''),
-          etag: String(sqliteEntry?.etag || '')
-        }
-      : null,
-    manifest: manifest
-      ? {
-          updatedAt: Number(manifest?.updatedAt || 0),
-          fileCount:
-            manifest?.files && typeof manifest.files === 'object' ? Object.keys(manifest.files).length : 0
-        }
-      : null
-  });
-  return {
-    ok: true,
-    fingerprint
-  };
-};
-
-const refreshRemoteWebDavFingerprint = async () => {
-  try {
-    const result = await getRemoteWebDavFingerprint();
-    if (result?.ok && typeof result.fingerprint === 'string') {
-      lastObservedRemoteWebDavFingerprint = result.fingerprint;
-    }
-    return result;
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || 'refresh remote fingerprint failed'
-    };
-  }
-};
-
-const clearWebDavLocalUploadTimer = () => {
-  if (!webdavLocalUploadTimer) return;
-  clearTimeout(webdavLocalUploadTimer);
-  webdavLocalUploadTimer = null;
-};
-
-const clearWebDavRemotePollTimer = () => {
-  if (!webdavRemotePollTimer) return;
-  clearInterval(webdavRemotePollTimer);
-  webdavRemotePollTimer = null;
-};
 
 const resolveLibraryPath = (value) => {
   const raw = String(value || '').trim();
@@ -321,8 +242,7 @@ const webDavModule = createWebDavModule({
   normalizeWebDavServer,
   normalizeWebDavRemotePath,
   loadSettings,
-  saveSettings,
-  lockTtlMs: WEBDAV_LOCK_TTL_MS
+  saveSettings
 });
 
 const {
@@ -330,13 +250,7 @@ const {
   createWebDavClient,
   getWebDavConfigFromSettings,
   testWebDavConnection,
-  saveWebDavConfig,
-  ensureWebDavLock,
-  releaseWebDavLock,
-  clearWebDavLock,
-  readRemoteJsonFile,
-  writeRemoteJsonFile,
-  webdavLockOwner
+  saveWebDavConfig
 } = webDavModule;
 
 const buildOpenAIUrl = (baseUrl) => {
@@ -506,6 +420,7 @@ const cnkiTranslate = async (text) => {
     let data;
     let response;
     const request = async () => {
+      await waitForCnkiTranslateSlot();
       response = await fetch(CNKI_TRANSLATE_URL, {
         method: 'POST',
         headers: {
@@ -550,6 +465,15 @@ const cnkiTranslate = async (text) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const waitForCnkiTranslateSlot = async () => {
+  const now = Date.now();
+  const elapsed = now - cnkiLastTranslateRequestAt;
+  if (elapsed < CNKI_TRANSLATE_INTERVAL_MS) {
+    await sleep(CNKI_TRANSLATE_INTERVAL_MS - elapsed);
+  }
+  cnkiLastTranslateRequestAt = Date.now();
+};
+
 const cnkiTranslateWithRetry = async (text, maxAttempts = 10) => {
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -559,7 +483,7 @@ const cnkiTranslateWithRetry = async (text, maxAttempts = 10) => {
     } catch (error) {
       lastError = error;
       if (attempt < maxAttempts) {
-        await sleep(1000);
+        await sleep(CNKI_TRANSLATE_INTERVAL_MS);
       }
     }
   }
@@ -1623,7 +1547,6 @@ const sqliteModule = createSqliteModule({
   path,
   fs,
   fsNative,
-  syncPendingKey: LIBRARY_SYNC_PENDING_KEY,
   getLibraryPaths,
   loadSettings,
   sanitizePaperForMeta,
@@ -1642,8 +1565,11 @@ const {
   ensureLibrarySqliteSchema,
   getLibraryKv,
   setLibraryKv,
-  getSyncPending,
-  setSyncPending: setRawSyncPending,
+  recordSyncChange,
+  loadSyncQueueEntries,
+  clearSyncQueueEntries,
+  getSyncQueueSize,
+  withSyncQueueSuppressed,
   deletePaperStatesFromSqlite,
   deletePapersFromSqlite,
   mapSqlitePaperRow,
@@ -2246,40 +2172,36 @@ const searchPaperOpenSource = async (title) => {
 };
 
 const webDavSyncModule = createWebDavSyncModule({
-  BrowserWindow,
   path,
   fs,
   fsNative,
   crypto,
-  ensureLibrary,
-  ensureLibraryStoreReady,
-  getLibraryDb,
+  os,
+  app,
   getLibraryPaths,
-  getPaperArticleId,
-  getWebDavConfigFromSettings,
-  getWebDavCredential,
-  createWebDavClient,
-  webdavLockOwner,
-  ensureWebDavLock,
-  releaseWebDavLock,
+  ensureLibraryStoreReady,
+  loadFoldersFromSqlite,
+  loadPapersFromSqlite,
   loadPaperStatesFromSqlite,
-  loadLibraryDataFromSqliteFile,
   saveFoldersToSqlite,
   savePapersToSqlite,
   savePaperStateToSqlite,
   deletePaperStatesFromSqlite,
-  setSyncPending,
-  getSyncPending,
+  loadLibraryDataFromSqliteFile,
   removeFileIfExists,
-  readRemoteJsonFile,
-  writeRemoteJsonFile
+  getPaperArticleId,
+  getWebDavConfigFromSettings,
+  getWebDavCredential,
+  createWebDavClient,
+  loadSyncQueueEntries,
+  clearSyncQueueEntries,
+  getSyncQueueSize,
+  withSyncQueueSuppressed,
+  getLibraryKv,
+  setLibraryKv
 });
 
-const {
-  getWebDavSyncState,
-  syncLibraryToWebDav,
-  syncLibraryFromWebDavToLocal
-} = webDavSyncModule;
+const { syncLibrary, clearWebDavLock } = webDavSyncModule;
 
 ipcMain.handle('settings-get', async () => {
   const settings = await loadSettings();
@@ -2299,183 +2221,15 @@ registerWebDavIpc({
   enqueueWrite,
   testWebDavConnection,
   saveWebDavConfig,
-  clearWebDavLock,
-  getWebDavSyncState
+  clearWebDavLock
 });
 
 registerWebDavSyncIpc({
   ipcMain,
   enqueueWrite,
-  syncLibraryToWebDav,
-  syncLibraryFromWebDavToLocal
+  beforeSync: flushWrites,
+  syncLibrary
 });
-
-ipcMain.handle('webdav-sync-smart', async () =>
-  enqueueWrite(async () => {
-    try {
-      await ensureLibraryStoreReady();
-      if (getSyncPending()) {
-        const result = await syncLibraryToWebDav();
-        return {
-          ...(result || {}),
-          mode: 'upload'
-        };
-      }
-      const result = await syncLibraryFromWebDavToLocal();
-      return {
-        ...(result || {}),
-        mode: 'download'
-      };
-    } catch (error) {
-      return {
-        success: false,
-        error: error?.message || '云同步失败'
-      };
-    }
-  })
-);
-
-async function runBackgroundWebDavUpload() {
-  if (isForceQuitting) return { success: false, skipped: true, reason: 'quitting' };
-  if (startupWebDavSyncPromise) {
-    if (getSyncPending()) {
-      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
-    }
-    return { success: false, skipped: true, reason: 'startup sync running' };
-  }
-  if (webdavBackgroundSyncInFlight) {
-    if (getSyncPending()) {
-      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
-    }
-    return { success: false, skipped: true, reason: 'background sync already running' };
-  }
-  if (getWebDavSyncState()?.active) {
-    if (getSyncPending()) {
-      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
-    }
-    return { success: false, skipped: true, reason: 'sync already active' };
-  }
-  if (pendingWrites > 0) {
-    queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
-    return { success: false, skipped: true, reason: 'pending local writes' };
-  }
-  if (!getSyncPending()) return { success: false, skipped: true, reason: 'nothing pending' };
-
-  webdavBackgroundSyncInFlight = true;
-  try {
-    await ensureLibraryStoreReady();
-    await flushWrites();
-    if (!getSyncPending()) {
-      return { success: false, skipped: true, reason: 'nothing pending after flush' };
-    }
-    console.log('[webdav-sync] local-change upload start');
-    const result = await syncLibraryToWebDav();
-    if (result?.success) {
-      await refreshRemoteWebDavFingerprint();
-    }
-    console.log(
-      `[webdav-sync] local-change upload done: success=${Boolean(result?.success)} skipped=${Boolean(
-        result?.skipped
-      )}`
-    );
-    return result;
-  } catch (error) {
-    console.warn('[webdav-sync] local-change upload failed:', error?.message || error);
-    return {
-      success: false,
-      error: error?.message || 'local-change upload failed'
-    };
-  } finally {
-    webdavBackgroundSyncInFlight = false;
-    if (getSyncPending() && !isForceQuitting) {
-      queueImmediateWebDavUpload(WEBDAV_LOCAL_UPLOAD_RETRY_DELAY_MS);
-    }
-  }
-}
-
-async function runBackgroundWebDavDownload() {
-  if (isForceQuitting) return { success: false, skipped: true, reason: 'quitting' };
-  if (startupWebDavSyncPromise) return { success: false, skipped: true, reason: 'startup sync running' };
-  if (webdavBackgroundSyncInFlight) {
-    return { success: false, skipped: true, reason: 'background sync already running' };
-  }
-  if (getWebDavSyncState()?.active) return { success: false, skipped: true, reason: 'sync already active' };
-  if (pendingWrites > 0) return { success: false, skipped: true, reason: 'pending local writes' };
-  if (getSyncPending()) return { success: false, skipped: true, reason: 'local changes pending upload' };
-
-  webdavBackgroundSyncInFlight = true;
-  try {
-    await ensureLibraryStoreReady();
-    await flushWrites();
-    if (getSyncPending()) {
-      return { success: false, skipped: true, reason: 'local changes pending upload after flush' };
-    }
-    const remoteFingerprint = await getRemoteWebDavFingerprint();
-    if (!remoteFingerprint?.ok) {
-      return {
-        success: false,
-        skipped: true,
-        reason: remoteFingerprint?.reason || remoteFingerprint?.error || 'remote fingerprint unavailable'
-      };
-    }
-    if (
-      remoteFingerprint.fingerprint &&
-      remoteFingerprint.fingerprint === lastObservedRemoteWebDavFingerprint
-    ) {
-      return { success: false, skipped: true, reason: 'remote unchanged' };
-    }
-    console.log('[webdav-sync] background remote-poll start');
-    const result = await syncLibraryFromWebDavToLocal();
-    if (result?.success && remoteFingerprint.fingerprint) {
-      lastObservedRemoteWebDavFingerprint = remoteFingerprint.fingerprint;
-    }
-    console.log(
-      `[webdav-sync] background remote-poll done: success=${Boolean(result?.success)} skipped=${Boolean(
-        result?.skipped
-      )}`
-    );
-    return result;
-  } catch (error) {
-    console.warn('[webdav-sync] background remote-poll failed:', error?.message || error);
-    return {
-      success: false,
-      error: error?.message || 'background remote-poll failed'
-    };
-  } finally {
-    webdavBackgroundSyncInFlight = false;
-  }
-}
-
-function queueImmediateWebDavUpload(delayMs = 0) {
-  if (isForceQuitting) return;
-  clearWebDavLocalUploadTimer();
-  webdavLocalUploadTimer = setTimeout(() => {
-    webdavLocalUploadTimer = null;
-    void runBackgroundWebDavUpload();
-  }, Math.max(0, Number(delayMs || 0)));
-  if (typeof webdavLocalUploadTimer?.unref === 'function') {
-    webdavLocalUploadTimer.unref();
-  }
-}
-
-function ensureBackgroundWebDavRemotePoll() {
-  if (isForceQuitting || webdavRemotePollTimer) return;
-  webdavRemotePollTimer = setInterval(() => {
-    void runBackgroundWebDavDownload();
-  }, WEBDAV_REMOTE_POLL_INTERVAL_MS);
-  if (typeof webdavRemotePollTimer?.unref === 'function') {
-    webdavRemotePollTimer.unref();
-  }
-}
-
-function setSyncPending(value) {
-  setRawSyncPending(value);
-  if (Boolean(value)) {
-    queueImmediateWebDavUpload();
-    return;
-  }
-  clearWebDavLocalUploadTimer();
-}
 
 registerLibraryIpc({
   ipcMain,
@@ -2496,7 +2250,7 @@ registerLibraryIpc({
   removeFileIfExists,
   deletePapersFromSqlite: sqliteModule.deletePapersFromSqlite,
   deletePaperVectorPoints,
-  setSyncPending
+  recordSyncChange
 });
 
 ipcMain.handle('translate-text', async (_event, payload = {}) => {
@@ -2606,6 +2360,26 @@ ipcMain.handle('log-progress', async (_event, payload = {}) => {
   const stage = String(payload?.stage || '').trim();
   const paperId = String(payload?.paperId || '').trim();
   logProgress(stage, paperId);
+  return { ok: true };
+});
+
+ipcMain.handle('debug-log', async (_event, payload = {}) => {
+  const tag = String(payload?.tag || 'debug').trim() || 'debug';
+  const message = String(payload?.message || '').trim();
+  const event = String(payload?.event || '').trim();
+  const paperId = String(payload?.paperId || '').trim();
+  const data = payload?.payload;
+  const base = message || event || '(empty)';
+  const suffix = paperId ? ` paper=${paperId}` : '';
+  if (data && typeof data === 'object') {
+    try {
+      console.log(`[${tag}] ${base}${suffix} ${JSON.stringify(data)}`);
+    } catch {
+      console.log(`[${tag}] ${base}${suffix}`);
+    }
+  } else {
+    console.log(`[${tag}] ${base}${suffix}`);
+  }
   return { ok: true };
 });
 
@@ -2822,31 +2596,6 @@ app.whenReady().then(() => {
     }
   })();
 
-  startupWebDavSyncPromise = (async () => {
-    let startupDownloadResult = null;
-    try {
-      await ensureLibraryStoreReady();
-      startupDownloadResult = await syncLibraryFromWebDavToLocal();
-      if (startupDownloadResult?.success) {
-        await ensureLibraryStoreReady();
-        const syncedPapers = await loadPapersFromSqlite();
-        if (Array.isArray(syncedPapers) && syncedPapers.length) {
-          void enqueueSummaryVectorSync(syncedPapers);
-        }
-      }
-    } catch (error) {
-      console.warn('[webdav-sync] startup download failed:', error?.message || error);
-    } finally {
-      startupWebDavSyncPromise = null;
-      if (startupDownloadResult?.success) {
-        await refreshRemoteWebDavFingerprint();
-      }
-      if (getSyncPending()) {
-        queueImmediateWebDavUpload();
-      }
-    }
-  })();
-
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
@@ -2858,11 +2607,8 @@ app.on('before-quit', (event) => {
   if (isForceQuitting) return;
   event.preventDefault();
   isForceQuitting = true;
-  clearWebDavLocalUploadTimer();
-  clearWebDavRemotePollTimer();
   Promise.resolve()
     .then(async () => {
-      await releaseWebDavLock();
       try {
         await stopManagedQdrant();
       } catch {

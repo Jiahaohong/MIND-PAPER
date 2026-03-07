@@ -886,38 +886,6 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.getSyncStatus) return;
-    let mounted = true;
-    let lastActive = false;
-    let lastDirection = 'idle';
-
-    const applyStatus = (payload: any) => {
-      if (!mounted) return;
-      const nextActive = Boolean(payload?.active);
-      const nextDirection = String(payload?.direction || 'idle');
-      setIsCloudSyncing(nextActive);
-      if (lastActive && !nextActive && lastDirection === 'download') {
-        void refreshLibraryFromCloud(undefined, { invalidatePdfCaches: false });
-      }
-      lastActive = nextActive;
-      lastDirection = nextDirection;
-    };
-
-    void window.electronAPI.webdav.getSyncStatus().then(applyStatus).catch(() => null);
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      applyStatus(detail);
-    };
-
-    window.addEventListener('mindpaper-webdav-sync', handler as EventListener);
-    return () => {
-      mounted = false;
-      window.removeEventListener('mindpaper-webdav-sync', handler as EventListener);
-    };
-  }, []);
-
-  useEffect(() => {
     if (!libraryLoaded) return;
     if (isCloudSyncing) return;
     if (typeof window === 'undefined' || !window.electronAPI?.library) return;
@@ -1030,7 +998,7 @@ const App: React.FC = () => {
       setWebdavPassword(Boolean(result?.webdavHasPassword) ? SAVED_WEBDAV_PASSWORD_MASK : '');
       setWebdavStatus('WebDAV 配置和凭据已保存');
       if (window.confirm('WebDAV 已保存，是否立即从云端同步到本地？')) {
-        const downloadResult = await handleCloudSyncDownload();
+        const downloadResult = await handleCloudSync('download');
         if (downloadResult?.success) {
           setWebdavStatus('已从云端同步到本地');
         } else if (!downloadResult?.skipped) {
@@ -1044,24 +1012,24 @@ const App: React.FC = () => {
     }
   };
 
-  const handleCloudSyncUpload = async () => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav) {
+  const handleCloudSync = async (mode: 'auto' | 'upload' | 'download' = 'auto') => {
+    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.sync) {
       return { success: false, error: '当前环境不支持云同步' };
     }
-    if (window.electronAPI.webdav.syncSmart) {
-      return window.electronAPI.webdav.syncSmart();
+    if (isCloudSyncing) {
+      return { success: false, error: '云同步进行中' };
     }
-    if (window.electronAPI.webdav.syncUpload) {
-      return window.electronAPI.webdav.syncUpload();
+    setIsCloudSyncing(true);
+    try {
+      const result = await window.electronAPI.webdav.sync({ mode });
+      const normalizedMode = String(result?.mode || '');
+      if (result?.success && (mode === 'download' || normalizedMode === 'download')) {
+        await refreshLibraryFromCloud(undefined, { invalidatePdfCaches: false });
+      }
+      return result;
+    } finally {
+      setIsCloudSyncing(false);
     }
-    return { success: false, error: '当前环境不支持云同步' };
-  };
-
-  const handleCloudSyncDownload = async () => {
-    if (typeof window === 'undefined' || !window.electronAPI?.webdav?.syncDownload) {
-      return { success: false, error: '当前环境不支持云同步' };
-    }
-    return window.electronAPI.webdav.syncDownload();
   };
 
   const handleClearWebDavLock = async () => {
@@ -1091,10 +1059,10 @@ const App: React.FC = () => {
     <div className="h-screen w-screen bg-gray-200 flex flex-col font-sans text-gray-900 overflow-hidden">
       
       {/* Safari-style Toolbar / Title Bar */}
-      <div className="h-10 bg-white/80 backdrop-blur flex items-center border-b border-gray-200 select-none px-3 py-[4px] gap-4">
+      <div className="h-10 bg-white/80 backdrop-blur flex items-center border-b border-gray-200 select-none px-2 py-[4px] gap-4">
          
          {/* Library / Home Button */}
-         <div className="p-1 shrink-0">
+         <div className="pl-0.5 pr-0 shrink-0">
            <Tooltip label="主界面">
              <button 
                onClick={switchToLibrary}
@@ -1140,7 +1108,7 @@ const App: React.FC = () => {
          </div>
 
          {/* Settings Button */}
-         <div className="py-1 shrink-0">
+         <div className="py-0.5 pr-0.5 shrink-0">
            <Tooltip label="设置">
              <button
                className="p-1.5 text-gray-500 hover:bg-gray-200 rounded-md"
@@ -1168,7 +1136,7 @@ const App: React.FC = () => {
             onDeletePaper={handleDeletePaper}
             onMovePaperToFolder={handleMovePaperToFolder}
             onRestorePaper={handleRestorePaper}
-            onCloudSyncUpload={handleCloudSyncUpload}
+            onCloudSync={handleCloudSync}
             isCloudSyncing={isCloudSyncing}
           />
         </div>
@@ -1182,7 +1150,7 @@ const App: React.FC = () => {
                   pdfFile={getCachedPdfFile(paper)}
                   onBack={switchToLibrary}
                   onUpdatePaper={handleUpdatePaper}
-                  onCloudSync={handleCloudSyncUpload}
+                  onCloudSync={handleCloudSync}
                   cloudRefreshToken={cloudRefreshToken}
                   isCloudSyncing={isCloudSyncing}
                 />
@@ -1481,7 +1449,3 @@ const App: React.FC = () => {
 };
 
 export default App;
-      const isUnknownLike = (value: string) => {
-        const v = String(value || '').trim().toLowerCase();
-        return !v || v === 'unknown' || v === 'unknow';
-      };

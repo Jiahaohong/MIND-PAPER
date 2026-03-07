@@ -71,6 +71,13 @@ declare global {
         stage: string;
         paperId?: string;
       }) => Promise<{ ok: boolean }>;
+      debugLog?: (payload: {
+        tag?: string;
+        message?: string;
+        event?: string;
+        paperId?: string;
+        payload?: any;
+      }) => Promise<{ ok: boolean }>;
       settingsGet?: () => Promise<{
         translationEngine?: 'cnki' | 'openai';
         apiKey?: string;
@@ -130,39 +137,19 @@ declare global {
           webdavRemotePath?: string;
           webdavHasPassword?: boolean;
         }>;
-        getSyncStatus?: () => Promise<{
-          active: boolean;
-          direction?: string;
-          message?: string;
-        }>;
         clearLock?: () => Promise<{
           success: boolean;
           cleared?: boolean;
           message?: string;
         }>;
-        syncUpload?: () => Promise<{
+        sync?: (payload?: {
+          mode?: 'auto' | 'upload' | 'download';
+        }) => Promise<{
           success: boolean;
-          sqliteBytes?: number;
-          uploadedPdfCount?: number;
-          uploadedPdfBytes?: number;
-          remotePath?: string;
-          server?: string;
-          error?: string;
-        }>;
-        syncDownload?: () => Promise<{
-          success: boolean;
-          skipped?: boolean;
-          sqliteBytes?: number;
-          downloadedPdfCount?: number;
-          downloadedPdfBytes?: number;
-          remotePath?: string;
-          server?: string;
-          error?: string;
-        }>;
-        syncSmart?: () => Promise<{
-          success: boolean;
-          skipped?: boolean;
           mode?: 'upload' | 'download';
+          skipped?: boolean;
+          locked?: boolean;
+          owner?: string;
           sqliteBytes?: number;
           uploadedPdfCount?: number;
           uploadedPdfBytes?: number;

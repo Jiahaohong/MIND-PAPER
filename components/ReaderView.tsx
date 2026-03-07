@@ -18,7 +18,7 @@ import {
   Plus,
   Pencil,
   RefreshCw,
-  Cloud
+  Loader2
 } from 'lucide-react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { Paper, PaperReference, TOCItem, ReaderMode, AssistantTab, Message, DocNode } from '../types';
@@ -160,6 +160,7 @@ type OutlineNode = {
   title: string;
   pageIndex: number | null;
   topRatio: number | null;
+  leftRatio?: number | null;
   items: OutlineNode[];
   isRoot?: boolean;
   isCustom?: boolean;
@@ -712,18 +713,20 @@ const dedupeChapterAnnotations = (annotations: HighlightItem[]) => {
         return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
       });
     const preferred = sorted[0];
-    const withFallback = sorted.find((item) => item.parentId || typeof item.topRatio === 'number');
+    const withParentId = sorted.find((item) => String(item.parentId || '').trim().length > 0);
+    const withTopRatio = sorted.find((item) => typeof item.topRatio === 'number');
+    const withOrder = sorted.find((item) => typeof item.order === 'number');
     return {
       ...preferred,
-      parentId: preferred.parentId ?? withFallback?.parentId ?? null,
+      parentId: String(preferred.parentId || '').trim() || withParentId?.parentId || null,
       topRatio:
         preferred.topRatio ??
-        (typeof withFallback?.topRatio === 'number' ? withFallback.topRatio : null),
+        (typeof withTopRatio?.topRatio === 'number' ? withTopRatio.topRatio : null),
       order:
         typeof preferred.order === 'number'
           ? preferred.order
-          : typeof withFallback?.order === 'number'
-            ? withFallback.order
+          : typeof withOrder?.order === 'number'
+            ? withOrder.order
             : undefined
     };
   });
@@ -1190,7 +1193,9 @@ interface ReaderViewProps {
   pdfFile: { data: ArrayBuffer } | string | null;
   onBack: () => void;
   onUpdatePaper: (paperId: string, updates: Partial<Paper>) => void;
-  onCloudSync?: () => Promise<{ success: boolean; skipped?: boolean; error?: string } | void>;
+  onCloudSync?: (
+    mode?: 'auto' | 'upload' | 'download'
+  ) => Promise<{ success: boolean; skipped?: boolean; mode?: 'upload' | 'download'; error?: string } | void>;
   cloudRefreshToken?: number;
   isCloudSyncing?: boolean;
 }
@@ -1301,6 +1306,29 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       // ignore progress logging errors
     }
   };
+  const logDebugToMain = async (
+    event: string,
+    payload: Record<string, unknown>,
+    options?: { paperId?: string }
+  ) => {
+    const safePayload = payload || {};
+    try {
+      console.log(`[reader-debug] ${event}`, safePayload);
+    } catch {
+      // ignore renderer console errors
+    }
+    if (typeof window === 'undefined' || !window.electronAPI?.debugLog) return;
+    try {
+      await window.electronAPI.debugLog({
+        tag: 'reader-debug',
+        event,
+        paperId: options?.paperId || paper.id,
+        payload: safePayload
+      });
+    } catch {
+      // ignore main debug logging errors
+    }
+  };
 
   const formatDateYmd = (value: string) => {
     const raw = String(value || '').trim();
@@ -1405,6 +1433,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const tocDragChapterTriggeredRef = useRef(false);
   const tocSuppressClickUntilRef = useRef(0);
   const tocParentMapRef = useRef<Map<string, string | null>>(new Map());
+  const outlineDisplayRef = useRef<OutlineNode[]>([]);
   const dragStateRef = useRef<{ side: 'left' | 'right'; startX: number; start: number } | null>(null);
   const hasInitWidthsRef = useRef(false);
   const tocEditInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -2465,7 +2494,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     return rects.every((rect) => Number(rect.w || 0) === 0 && Number(rect.h || 0) === 0);
   }, []);
 
-  const findParentNode = (
+  const findParentNode = useCallback((
     nodes: OutlineNode[],
     targetId: string,
     parent: OutlineNode | null = null
@@ -2478,14 +2507,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }
     }
     return null;
-  };
+  }, []);
 
   const resolveParentForChapter = useCallback((chapterId: string) => {
     const custom = customChapterNodeMap.get(chapterId);
     if (custom?.parentId) return custom.parentId;
-    const parentNode = findParentNode(outlineDisplay, chapterId, null);
+    const parentNode = findParentNode(outlineDisplayRef.current, chapterId, null);
     return parentNode?.id || outlineRootId;
-  }, [customChapterNodeMap, outlineDisplay, outlineRootId]);
+  }, [customChapterNodeMap, findParentNode, outlineRootId]);
 
   const detachCustomChapter = useCallback((
     chapterId: string,
@@ -2713,22 +2742,108 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     if (!title) return;
     const rects = selectionInfo.rects.filter((rect) => rect.pageIndex >= 0);
     if (!rects.length || selectionInfo.pageIndex == null) return;
-    const topRatio = Math.min(...rects.map((rect) => rect.y ?? 0));
-    const pageIndex = selectionInfo.pageIndex;
-    const parentChapter = findChapterForPosition(pageIndex, topRatio, nativeChapterParentOutline);
-    const parentId = parentChapter && !parentChapter.isRoot ? parentChapter.id : outlineRootId;
-    const activeHighlight = activeHighlightId ? annotationById.get(activeHighlightId) || null : null;
-    const order =
-      activeHighlight && !activeHighlight.isChapterTitle
-        ? getCombinedEntryOrderValue(parentId, 'note', activeHighlight.id) ??
-          getCombinedOrderValue(parentId)
-        : getCombinedOrderValue(parentId);
+    const anchorRect = rects
+      .slice()
+      .sort((a, b) => {
+        if ((a.pageIndex ?? 0) !== (b.pageIndex ?? 0)) return (a.pageIndex ?? 0) - (b.pageIndex ?? 0);
+        if ((a.y ?? 0) !== (b.y ?? 0)) return (a.y ?? 0) - (b.y ?? 0);
+        return (a.x ?? 0) - (b.x ?? 0);
+      })[0];
+    const topRatio =
+      typeof anchorRect?.y === 'number'
+        ? anchorRect.y
+        : Math.min(...rects.map((rect) => rect.y ?? 0));
+    const leftRatio = typeof anchorRect?.x === 'number' ? anchorRect.x : 0;
+    const pageIndex =
+      typeof anchorRect?.pageIndex === 'number'
+        ? anchorRect.pageIndex
+        : selectionInfo.pageIndex;
+    const parentChapter = findChapterForPosition(pageIndex, topRatio);
+    const hasNearestHeadingAbove = Boolean(parentChapter && !parentChapter.isRoot);
+    const parentId = hasNearestHeadingAbove
+      ? String(parentChapter?.id || '').trim() || outlineRootId
+      : outlineRootId;
+    const { order, siblingOrderPatch } = getNodeOrderValueByChildPositionSlot(
+      parentId,
+      pageIndex,
+      topRatio,
+      leftRatio
+    );
+    const rootNode = outlineDisplay[0] || null;
+    const mountParentNode =
+      parentId === outlineRootId ? rootNode : findOutlineNodeById(outlineDisplay, parentId);
+    const summarizeChildren = (items: OutlineNode[]) =>
+      (items || []).map((item) => ({
+        id: item.id,
+        title: item.title,
+        pageIndex: item.pageIndex ?? null,
+        topRatio: item.topRatio ?? null,
+        leftRatio: item.leftRatio ?? null,
+        order: typeof item.order === 'number' ? item.order : null,
+        isCustom: Boolean(item.isCustom)
+      }));
+    const summarizeNotes = (items: HighlightItem[]) =>
+      (items || []).map((item) => {
+        const key = getHighlightSortKey(item);
+        return {
+          id: item.id,
+          text: item.text,
+          pageIndex: key.pageIndex ?? null,
+          topRatio: key.top ?? null,
+          leftRatio: key.left ?? null,
+          order: typeof item.order === 'number' ? item.order : null
+        };
+      });
+    const mountParentNotes = noteAnnotations.filter(
+      (item) => item.chapterId === parentId && !item.isChapterTitle
+    );
+    void logDebugToMain('create-custom-chapter-from-selection', {
+      selectedText: title,
+      selectedAnchor: {
+        pageIndex: anchorRect?.pageIndex ?? pageIndex,
+        x: anchorRect?.x ?? null,
+        y: anchorRect?.y ?? topRatio
+      },
+      computedPosition: {
+        pageIndex,
+        topRatio,
+        leftRatio
+      },
+      mountParent: mountParentNode
+        ? {
+            id: mountParentNode.id,
+            title: mountParentNode.title,
+            isRoot: Boolean(mountParentNode.isRoot)
+          }
+        : null,
+      mountParentChildren: summarizeChildren(mountParentNode?.items || []),
+      mountParentNotes: summarizeNotes(mountParentNotes),
+      rootNode: rootNode
+        ? {
+            id: rootNode.id,
+            title: rootNode.title
+          }
+        : null,
+      rootChildren: summarizeChildren(rootNode?.items || []),
+      computedOrder: order,
+      siblingOrderPatch: Array.from(siblingOrderPatch.entries()).map(([id, patchedOrder]) => ({
+        id,
+        order: patchedOrder
+      })),
+      chapterHighlightDraft: {
+        pageIndex,
+        topRatio,
+        leftRatio,
+        order
+      }
+    });
 
     const chapterNode: OutlineNode = {
       id: createStableSelectionId('custom', pageIndex, rects, `${paper.id}|${parentId}`),
       title,
       pageIndex,
       topRatio,
+      leftRatio,
       items: [],
       isCustom: true,
       parentId,
@@ -2736,7 +2851,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       order
     };
 
-    setCustomChapters((prev) => [...prev, chapterNode]);
+    setCustomChapters((prev) => {
+      const withPatchedOrders =
+        siblingOrderPatch.size > 0
+          ? prev.map((item) => {
+              const nextOrder = siblingOrderPatch.get(item.id);
+              if (typeof nextOrder !== 'number') return item;
+              if (typeof item.order === 'number' && Math.abs(item.order - nextOrder) <= 1e-6) {
+                return item;
+              }
+              return { ...item, order: nextOrder };
+            })
+          : prev;
+      return [...withPatchedOrders, chapterNode];
+    });
     setExpandedTOC((prev) => {
       const next = new Set(prev);
       next.add(parentId);
@@ -2751,9 +2879,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 ...item,
                 text: selectionText,
                 color: 'rgba(107, 114, 128, 0.35)',
+                pageIndex,
+                topRatio,
+                rects,
                 isChapterTitle: true,
                 chapterId: chapterNode.id,
-                chapterNodeId: chapterNode.id
+                chapterNodeId: chapterNode.id,
+                parentId,
+                order
               }
             : item
         )
@@ -2763,7 +2896,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       const chapterHighlight = buildHighlightFromSelection('rgba(107, 114, 128, 0.35)', {
         isChapterTitle: true,
         chapterId: chapterNode.id,
-        chapterNodeId: chapterNode.id
+        chapterNodeId: chapterNode.id,
+        parentId,
+        pageIndex,
+        topRatio,
+        rects,
+        order
       });
       if (chapterHighlight) {
         setHighlights((prev) => [...prev, chapterHighlight]);
@@ -2907,6 +3045,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   }, [visibleHighlights]);
 
   const handleHighlightClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (typeof window !== 'undefined') {
+      const selection = window.getSelection();
+      if (selection && !selection.isCollapsed && selection.toString().trim().length) {
+        return;
+      }
+    }
     if (isPointInNativeSelection(event.clientX, event.clientY)) {
       return;
     }
@@ -3068,364 +3212,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }, 800);
     }
   }, [paper.id, paper.title]);
-
-  const pdfDocumentContent = useMemo(() => {
-    if (pdfFileForRender) {
-      return (
-        <div className="min-h-full flex justify-center py-6 px-4">
-          <Document
-            file={pdfFileForRender}
-            onLoadSuccess={handleDocumentLoad}
-            onLoadError={(error) => {
-              console.error('PDF load error:', error);
-            }}
-            onSourceError={(error) => {
-              console.error('PDF source error:', error);
-            }}
-            loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
-            error={<div className="text-sm text-red-500">PDF加载失败</div>}
-          >
-            {Array.from(new Array(numPages || 0), (_, index) => (
-              <div
-                key={`page_${index + 1}`}
-                ref={(el) => {
-                  pageRefs.current[index] = el;
-                }}
-                data-page-index={index}
-                className="mb-4 last:mb-0 relative"
-              >
-                <Page
-                  pageNumber={index + 1}
-                  width={800}
-                  scale={pdfZoom / 100}
-                  renderAnnotationLayer={false}
-                  renderTextLayer
-                  onRenderTextLayerError={(error) => {
-                    if (String((error as any)?.name || '') === 'AbortException') return;
-                    console.error('PDF text layer render error:', error);
-                  }}
-                />
-                {highlightRectsByPage.get(index)?.length ? (
-                  <div className="absolute inset-0 pointer-events-none">
-                    {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
-                      const isActive = item.id === activeHighlightId;
-                      const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
-                      const borderColor = isActive ? swatch || toSolidColor(item.color) : '';
-                      return (
-                        <div
-                          key={`mark-${index}-${rectIndex}`}
-                          className="absolute mix-blend-multiply opacity-40"
-                          style={{
-                            top: `${item.rect.y * 100}%`,
-                            left: `${item.rect.x * 100}%`,
-                            width: `${item.rect.w * 100}%`,
-                            height: `${item.rect.h * 100}%`,
-                            background: item.color,
-                            boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
-                          }}
-                        />
-                      );
-                    })}
-                  </div>
-                ) : null}
-                {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
-                  <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
-                    {pdfMarginChildrenByPage.get(index)!.map((group) => {
-                      const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
-                      const clampedTop = Math.max(0, Math.min(1, topRatio));
-                      return (
-                        <div
-                          key={`margin-${index}-${group.parentId}`}
-                          className="absolute left-0"
-                          style={{ top: `${clampedTop * 100}%` }}
-                        >
-                          <div className="flex flex-col gap-1">
-                            {group.items.map((item) => {
-                              const swatch =
-                                item.kind === 'note' && item.color
-                                  ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
-                                    toSolidColor(item.color)
-                                  : '#9ca3af';
-                              const label = item.label?.trim() || '（空白）';
-                              if (item.kind === 'chapter') {
-                                return (
-                                  <div key={item.key} className="relative group">
-                                    <button
-                                      type="button"
-                                      className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
-                                      style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
-                                      onMouseDown={(event) => event.stopPropagation()}
-                                      onClick={(event) => openMarginToolbar(event, item)}
-                                    >
-                                      <span className="truncate flex-1">{label}</span>
-                                    </button>
-                                    {item.node?.isCustom ? (
-                                      <button
-                                        type="button"
-                                        onMouseDown={(event) => event.stopPropagation()}
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          removeCustomChapter(item.node!.id);
-                                        }}
-                                        className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                        aria-label="删除章节"
-                                      >
-                                        <X size={12} />
-                                      </button>
-                                    ) : null}
-                                  </div>
-                                );
-                              }
-                              const isExpanded = expandedHighlightIds.has(item.note?.id || '');
-                              const clampStyle = isExpanded
-                                ? { whiteSpace: 'pre-wrap' as const }
-                                : {
-                                    display: '-webkit-box',
-                                    WebkitLineClamp: 2,
-                                    WebkitBoxOrient: 'vertical',
-                                    overflow: 'hidden'
-                                  };
-                              return (
-                                <div key={item.key} className="relative group">
-                                  <button
-                                    type="button"
-                                    className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
-                                    style={{
-                                      borderLeft: `3px solid ${swatch}`,
-                                      paddingLeft: `${8 + (item.indentPx || 0)}px`
-                                    }}
-                                    onMouseDown={(event) => event.stopPropagation()}
-                                    onClick={(event) => openMarginToolbar(event, item)}
-                                    onDoubleClick={(event) => {
-                                      event.stopPropagation();
-                                      if (!item.note) return;
-                                      setExpandedHighlightIds((prev) => {
-                                        const next = new Set(prev);
-                                        if (next.has(item.note!.id)) {
-                                          next.delete(item.note!.id);
-                                        } else {
-                                          next.add(item.note!.id);
-                                        }
-                                        return next;
-                                      });
-                                    }}
-                                  >
-                                    <span className="leading-4 w-full" style={clampStyle}>
-                                      {label}
-                                    </span>
-                                    {item.note &&
-                                    !item.note.isChapterTitle &&
-                                    !isManualHighlight(item.note) &&
-                                    item.note.translation ? (
-                                      <span
-                                        className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
-                                        style={clampStyle}
-                                      >
-                                        {item.note.translation}
-                                      </span>
-                                    ) : null}
-                                  </button>
-                                  {item.note && !item.note.isChapterTitle ? (
-                                    <button
-                                      type="button"
-                                      onMouseDown={(event) => event.stopPropagation()}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        removeHighlightNote(item.note!);
-                                      }}
-                                      className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
-                                      aria-label="删除笔记"
-                                    >
-                                      <X size={12} />
-                                    </button>
-                                  ) : null}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : null}
-              </div>
-            ))}
-          </Document>
-        </div>
-      );
-    }
-    if (paper.filePath) {
-      return (
-        <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
-          正在加载PDF…
-        </div>
-      );
-    }
-    return (
-      <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
-        <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
-          <div className="p-12">
-            <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
-            <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
-            <div className="prose max-w-none font-serif leading-relaxed">
-              <p className="mb-4 font-bold">Abstract</p>
-              <p className="mb-8 italic text-gray-600">{paper.summary}</p>
-              <p className="mb-4 font-bold">1. Introduction</p>
-              <p>{paper.content}</p>
-              <p className="mt-4">
-                Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor
-                incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud
-                exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
-              </p>
-              <p className="mt-4">
-                Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu
-                fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa
-                qui officia deserunt mollit anim id est laborum.
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
-    );
-  }, [
-    pdfFileForRender,
-    handleDocumentLoad,
-    numPages,
-    pdfZoom,
-    highlightRectsByPage,
-    activeHighlightId,
-    showPdfMarginOutline,
-    pdfMarginChildrenByPage,
-    openMarginToolbar,
-    expandedHighlightIds,
-    removeCustomChapter,
-    isManualHighlight,
-    removeHighlightNote,
-    paper.filePath,
-    paper.title,
-    paper.author,
-    paper.date,
-    paper.summary,
-    paper.content
-  ]);
-
-  const selectionOverlay = useMemo(() => {
-    if (typeof document === 'undefined' || viewMode !== ReaderMode.PDF) return null;
-    const hasToolbar = Boolean(selectionRect && selectionText);
-    const hasQuestionPicker = Boolean(questionPicker.open && questionPickerStyle);
-    if (!hasToolbar && !hasQuestionPicker) return null;
-    return createPortal(
-      <>
-        {hasToolbar ? (
-          <div
-            className="fixed z-30"
-            style={toolbarStyle || undefined}
-            ref={selectionToolbarRef}
-            onMouseDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="w-80 rounded-lg border border-gray-200 bg-white shadow-lg p-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-1.5">
-                  {HIGHLIGHT_COLORS.map((color) => (
-                    <Tooltip key={color.id} label="高亮" placement="top">
-                      <button
-                        type="button"
-                        className="w-5 h-5 rounded-md border border-gray-300 flex items-center justify-center"
-                        onClick={() => addHighlight(color.fill)}
-                      >
-                        <span className="w-3 h-3 rounded-sm" style={{ background: color.swatch }} />
-                      </button>
-                    </Tooltip>
-                  ))}
-                  <Tooltip label="章节标题" placement="top">
-                    <button
-                      type="button"
-                      className="w-5 h-5 rounded-md border border-gray-300 text-[10px] font-semibold text-gray-700 hover:bg-gray-50"
-                      onClick={createCustomChapterFromSelection}
-                    >
-                      T
-                    </button>
-                  </Tooltip>
-                  <Tooltip label="清除格式" placement="top">
-                    <button
-                      type="button"
-                      className="w-5 h-5 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 flex items-center justify-center"
-                      onClick={clearFormatting}
-                    >
-                      <Ban size={12} />
-                    </button>
-                  </Tooltip>
-                </div>
-                <Tooltip label="相关问题" placement="top">
-                  <button
-                    type="button"
-                    className="text-[11px] px-1.5 py-0.5 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
-                    onClick={openQuestionPicker}
-                  >
-                    相关问题
-                  </button>
-                </Tooltip>
-              </div>
-              <div className="mt-2 text-[11px] text-gray-500 bg-gray-50 rounded-md p-2 min-h-[44px]">
-                {translationResult || '选中文本以显示翻译'}
-              </div>
-            </div>
-          </div>
-        ) : null}
-        {hasQuestionPicker ? (
-          <div
-            ref={questionPickerRef}
-            className="fixed z-30"
-            style={questionPickerStyle || undefined}
-            onMouseDown={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-            }}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="w-56 rounded-lg border border-gray-200 bg-white shadow-lg p-2">
-              <div className="text-[11px] font-semibold text-gray-500 mb-1">关联到阅读问题</div>
-              {questions.length ? (
-                <div className="max-h-48 overflow-y-auto space-y-1">
-                  {questions.map((question) => (
-                    <button
-                      key={question.id}
-                      type="button"
-                      className="w-full text-left text-xs px-2 py-1 rounded hover:bg-gray-100"
-                      onClick={() => attachHighlightToQuestion(question)}
-                    >
-                      {question.text}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div className="text-[11px] text-gray-400 px-2 py-2">暂无阅读问题</div>
-              )}
-            </div>
-          </div>
-        ) : null}
-      </>,
-      document.body
-    );
-  }, [
-    viewMode,
-    selectionRect,
-    selectionText,
-    toolbarStyle,
-    questionPicker.open,
-    questionPickerStyle,
-    translationResult,
-    questions,
-    addHighlight,
-    createCustomChapterFromSelection,
-    clearFormatting,
-    openQuestionPicker,
-    attachHighlightToQuestion
-  ]);
 
   const jumpToHighlight = (note: HighlightItem) => {
     const page = pageRefs.current[note.pageIndex];
@@ -3997,6 +3783,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               isChapterTitle: true,
               chapterId: newId,
               chapterNodeId: newId,
+              parentId,
               color: 'rgba(107, 114, 128, 0.35)'
             }
           : item
@@ -4795,6 +4582,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }),
     [paper.id, docNodesForRender, outlineRootId, baseOutline, paper.title]
   );
+  outlineDisplayRef.current = outlineDisplay;
 
   const findOutlineNodeById = (nodes: OutlineNode[], targetId: string): OutlineNode | null => {
     for (const node of nodes) {
@@ -4838,7 +4626,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     const pageIndex =
       item.pageIndex ?? (rects.length ? rects[0].pageIndex : 0);
     const top = rects.length ? Math.min(...rects.map((rect) => rect.y ?? 0)) : 0;
-    return { pageIndex, top };
+    const left = rects.length ? Math.min(...rects.map((rect) => rect.x ?? 0)) : 0;
+    return { pageIndex, top, left };
   };
 
   type CombinedEntry = {
@@ -4848,6 +4637,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     order?: number;
     pageIndex: number;
     top: number;
+    left: number;
     index: number;
   };
 
@@ -4861,6 +4651,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         pageIndex:
           typeof node.pageIndex === 'number' ? node.pageIndex : Number.POSITIVE_INFINITY,
         top: typeof node.topRatio === 'number' ? node.topRatio : 0,
+        left: typeof node.leftRatio === 'number' ? node.leftRatio : 0,
         index
       })),
       ...notes.map((note, index) => {
@@ -4873,6 +4664,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
           pageIndex:
             typeof key.pageIndex === 'number' ? key.pageIndex : Number.POSITIVE_INFINITY,
           top: typeof key.top === 'number' ? key.top : 0,
+          left: typeof key.left === 'number' ? key.left : 0,
           index: index + nodes.length
         };
       })
@@ -4887,6 +4679,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       .sort((a, b) => {
         if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
         if (a.top !== b.top) return a.top - b.top;
+        if (a.left !== b.left) return a.left - b.left;
         return a.index - b.index;
       });
     const map = new Map<string, number>();
@@ -5081,6 +4874,108 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       return (currentOrder + prevOrder) / 2;
     }
     return currentOrder - 0.0001;
+  };
+
+  const compareNodePosition = (
+    left: { pageIndex?: number | null; topRatio?: number | null; leftRatio?: number | null; id?: string },
+    right: { pageIndex?: number | null; topRatio?: number | null; leftRatio?: number | null; id?: string }
+  ) => {
+    const leftPage =
+      typeof left.pageIndex === 'number' ? left.pageIndex : Number.POSITIVE_INFINITY;
+    const rightPage =
+      typeof right.pageIndex === 'number' ? right.pageIndex : Number.POSITIVE_INFINITY;
+    if (leftPage !== rightPage) return leftPage - rightPage;
+    const leftTop = typeof left.topRatio === 'number' ? left.topRatio : 0;
+    const rightTop = typeof right.topRatio === 'number' ? right.topRatio : 0;
+    if (leftTop !== rightTop) return leftTop - rightTop;
+    const leftX = typeof left.leftRatio === 'number' ? left.leftRatio : 0;
+    const rightX = typeof right.leftRatio === 'number' ? right.leftRatio : 0;
+    if (leftX !== rightX) return leftX - rightX;
+    return String(left.id || '').localeCompare(String(right.id || ''), undefined, {
+      sensitivity: 'base'
+    });
+  };
+
+  const getNodeOrderValueByChildPositionSlot = (
+    parentId: string,
+    pageIndex: number,
+    topRatio: number,
+    leftRatio = 0
+  ): { order: number; siblingOrderPatch: Map<string, number> } => {
+    const parentNode =
+      parentId === outlineRootId
+        ? outlineDisplay[0] || null
+        : findOutlineNodeById(outlineDisplay, parentId);
+    const nodes = parentNode?.items || [];
+    const notes = noteAnnotations.filter((item) => item.chapterId === parentId && !item.isChapterTitle);
+    const entries = buildCombinedEntries(nodes, notes);
+    if (!entries.length) {
+      return { order: 0, siblingOrderPatch: new Map<string, number>() };
+    }
+    const sortedByPosition = entries
+      .slice()
+      .sort((a, b) =>
+        compareNodePosition(
+          { pageIndex: a.pageIndex, topRatio: a.top, leftRatio: a.left, id: a.key },
+          { pageIndex: b.pageIndex, topRatio: b.top, leftRatio: b.left, id: b.key }
+        )
+      );
+    const normalizedOrderByKey = new Map<string, number>();
+    let lastOrder = Number.NEGATIVE_INFINITY;
+    sortedByPosition.forEach((entry, index) => {
+      const baseOrder =
+        typeof entry.order === 'number' && Number.isFinite(entry.order) ? entry.order : index;
+      const nextOrder =
+        !Number.isFinite(lastOrder) || baseOrder > lastOrder + 1e-6 ? baseOrder : lastOrder + 1;
+      normalizedOrderByKey.set(entry.key, nextOrder);
+      lastOrder = nextOrder;
+    });
+
+    const siblingOrderPatch = new Map<string, number>();
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    sortedByPosition.forEach((entry) => {
+      if (entry.kind !== 'node') return;
+      const node = nodeById.get(entry.id);
+      if (!node?.isCustom) return;
+      const normalized = normalizedOrderByKey.get(entry.key);
+      if (typeof normalized !== 'number') return;
+      if (typeof node.order !== 'number' || Math.abs(node.order - normalized) > 1e-6) {
+        siblingOrderPatch.set(entry.id, normalized);
+      }
+    });
+
+    const target = { pageIndex, topRatio, leftRatio, id: 'target' };
+    const insertIndex = sortedByPosition.findIndex(
+      (entry) =>
+        compareNodePosition(
+          {
+            pageIndex: entry.pageIndex,
+            topRatio: entry.top,
+            leftRatio: entry.left,
+            id: entry.key
+          },
+          target
+        ) > 0
+    );
+    const prevEntry =
+      insertIndex < 0 ? sortedByPosition[sortedByPosition.length - 1] : sortedByPosition[insertIndex - 1];
+    const nextEntry = insertIndex < 0 ? null : sortedByPosition[insertIndex] || null;
+    const prevOrder = prevEntry ? normalizedOrderByKey.get(prevEntry.key) : undefined;
+    const nextOrder = nextEntry ? normalizedOrderByKey.get(nextEntry.key) : undefined;
+
+    if (typeof prevOrder === 'number' && typeof nextOrder === 'number') {
+      if (nextOrder - prevOrder > 1e-6) {
+        return { order: (prevOrder + nextOrder) / 2, siblingOrderPatch };
+      }
+      return { order: prevOrder + 0.5, siblingOrderPatch };
+    }
+    if (typeof prevOrder === 'number') {
+      return { order: prevOrder + 1, siblingOrderPatch };
+    }
+    if (typeof nextOrder === 'number') {
+      return { order: nextOrder - 1, siblingOrderPatch };
+    }
+    return { order: 0, siblingOrderPatch };
   };
 
   const getNodeOrderValueAfter = (parentId: string, nodeId: string) => {
@@ -5742,12 +5637,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     });
   }, [outlineDisplay, highlightChapterIdSet]);
 
-  const nativeChapterParentOutline = useMemo(() => {
-    const list = getFlatOutlineByPosition(baseOutline);
-    if (!list.length) return list;
-    return list.filter((node) => node.isRoot || !node.isCustom);
-  }, [baseOutline]);
-
   useEffect(() => {
     if (!outlineDisplay.length) return;
     const notesByParent = new Map<string, HighlightItem[]>();
@@ -5995,6 +5884,364 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     });
     return map;
   }, [visibleHighlights]);
+
+  const pdfDocumentContent = useMemo(() => {
+    if (pdfFileForRender) {
+      return (
+        <div className="min-h-full flex justify-center py-6 px-4">
+          <Document
+            file={pdfFileForRender}
+            onLoadSuccess={handleDocumentLoad}
+            onLoadError={(error) => {
+              console.error('PDF load error:', error);
+            }}
+            onSourceError={(error) => {
+              console.error('PDF source error:', error);
+            }}
+            loading={<div className="text-sm text-gray-400">正在加载PDF…</div>}
+            error={<div className="text-sm text-red-500">PDF加载失败</div>}
+          >
+            {Array.from(new Array(numPages || 0), (_, index) => (
+              <div
+                key={`page_${index + 1}`}
+                ref={(el) => {
+                  pageRefs.current[index] = el;
+                }}
+                data-page-index={index}
+                className="mb-4 last:mb-0 relative"
+              >
+                <Page
+                  pageNumber={index + 1}
+                  width={800}
+                  scale={pdfZoom / 100}
+                  renderAnnotationLayer={false}
+                  renderTextLayer
+                  onRenderTextLayerError={(error) => {
+                    if (String((error as any)?.name || '') === 'AbortException') return;
+                    console.error('PDF text layer render error:', error);
+                  }}
+                />
+                {highlightRectsByPage.get(index)?.length ? (
+                  <div className="absolute inset-0 pointer-events-none">
+                    {highlightRectsByPage.get(index)!.map((item, rectIndex) => {
+                      const isActive = item.id === activeHighlightId;
+                      const swatch = HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch;
+                      const borderColor = isActive ? swatch || toSolidColor(item.color) : '';
+                      return (
+                        <div
+                          key={`mark-${index}-${rectIndex}`}
+                          className="absolute mix-blend-multiply opacity-40"
+                          style={{
+                            top: `${item.rect.y * 100}%`,
+                            left: `${item.rect.x * 100}%`,
+                            width: `${item.rect.w * 100}%`,
+                            height: `${item.rect.h * 100}%`,
+                            background: item.color,
+                            boxShadow: isActive ? `0 0 0 1px ${borderColor}` : undefined
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : null}
+                {showPdfMarginOutline && pdfMarginChildrenByPage.get(index)?.length ? (
+                  <div className="absolute top-0 bottom-0 left-full ml-4 w-[220px]">
+                    {pdfMarginChildrenByPage.get(index)!.map((group) => {
+                      const topRatio = typeof group.topRatio === 'number' ? group.topRatio : 0;
+                      const clampedTop = Math.max(0, Math.min(1, topRatio));
+                      return (
+                        <div
+                          key={`margin-${index}-${group.parentId}`}
+                          className="absolute left-0"
+                          style={{ top: `${clampedTop * 100}%` }}
+                        >
+                          <div className="flex flex-col gap-1">
+                            {group.items.map((item) => {
+                              const swatch =
+                                item.kind === 'note' && item.color
+                                  ? HIGHLIGHT_COLORS.find((color) => color.fill === item.color)?.swatch ||
+                                    toSolidColor(item.color)
+                                  : '#9ca3af';
+                              const label = item.label?.trim() || '（空白）';
+                              if (item.kind === 'chapter') {
+                                return (
+                                  <div key={item.key} className="relative group">
+                                    <button
+                                      type="button"
+                                      className="group w-full text-left flex items-center py-1 px-2 cursor-pointer text-sm text-gray-700 rounded my-0.5 hover:bg-gray-200"
+                                      style={{ paddingLeft: `${8 + (item.indentPx || 0)}px` }}
+                                      onMouseDown={(event) => event.stopPropagation()}
+                                      onClick={(event) => openMarginToolbar(event, item)}
+                                    >
+                                      <span className="truncate flex-1">{label}</span>
+                                    </button>
+                                    {item.node?.isCustom ? (
+                                      <button
+                                        type="button"
+                                        onMouseDown={(event) => event.stopPropagation()}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          removeCustomChapter(item.node!.id);
+                                        }}
+                                        className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                        aria-label="删除章节"
+                                      >
+                                        <X size={12} />
+                                      </button>
+                                    ) : null}
+                                  </div>
+                                );
+                              }
+                              const isExpanded = expandedHighlightIds.has(item.note?.id || '');
+                              const clampStyle = isExpanded
+                                ? { whiteSpace: 'pre-wrap' as const }
+                                : {
+                                    display: '-webkit-box',
+                                    WebkitLineClamp: 2,
+                                    WebkitBoxOrient: 'vertical',
+                                    overflow: 'hidden'
+                                  };
+                              return (
+                                <div key={item.key} className="relative group">
+                                  <button
+                                    type="button"
+                                    className="w-full text-left text-xs rounded px-2 py-1 pr-6 border border-transparent hover:bg-gray-200 flex flex-col items-start text-gray-600"
+                                    style={{
+                                      borderLeft: `3px solid ${swatch}`,
+                                      paddingLeft: `${8 + (item.indentPx || 0)}px`
+                                    }}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={(event) => openMarginToolbar(event, item)}
+                                    onDoubleClick={(event) => {
+                                      event.stopPropagation();
+                                      if (!item.note) return;
+                                      setExpandedHighlightIds((prev) => {
+                                        const next = new Set(prev);
+                                        if (next.has(item.note!.id)) {
+                                          next.delete(item.note!.id);
+                                        } else {
+                                          next.add(item.note!.id);
+                                        }
+                                        return next;
+                                      });
+                                    }}
+                                  >
+                                    <span className="leading-4 w-full" style={clampStyle}>
+                                      {label}
+                                    </span>
+                                    {item.note &&
+                                    !item.note.isChapterTitle &&
+                                    !isManualHighlight(item.note) &&
+                                    item.note.translation ? (
+                                      <span
+                                        className="mt-0.5 text-[10px] leading-4 text-gray-500 w-full"
+                                        style={clampStyle}
+                                      >
+                                        {item.note.translation}
+                                      </span>
+                                    ) : null}
+                                  </button>
+                                  {item.note && !item.note.isChapterTitle ? (
+                                    <button
+                                      type="button"
+                                      onMouseDown={(event) => event.stopPropagation()}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        removeHighlightNote(item.note!);
+                                      }}
+                                      className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition"
+                                      aria-label="删除笔记"
+                                    >
+                                      <X size={12} />
+                                    </button>
+                                  ) : null}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </Document>
+        </div>
+      );
+    }
+    if (paper.filePath) {
+      return (
+        <div className="min-h-full flex items-center justify-center text-sm text-gray-400">
+          正在加载PDF…
+        </div>
+      );
+    }
+    return (
+      <div className="min-h-full flex justify-center py-8 px-4 origin-top transition-transform duration-200">
+        <div className="w-[800px] bg-white shadow-lg min-h-[1100px] text-gray-800">
+          <div className="p-12">
+            <h1 className="text-3xl font-serif font-bold mb-4">{paper.title}</h1>
+            <p className="text-sm text-gray-500 mb-8 border-b pb-4">{paper.author} • {paper.date}</p>
+            <div className="prose max-w-none font-serif leading-relaxed">
+              <p className="mb-4 font-bold">Abstract</p>
+              <p className="mb-8 italic text-gray-600">{paper.summary}</p>
+              <p className="mb-4 font-bold">1. Introduction</p>
+              <p>{paper.content}</p>
+              <p className="mt-4">
+                Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor
+                incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud
+                exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
+              </p>
+              <p className="mt-4">
+                Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu
+                fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa
+                qui officia deserunt mollit anim id est laborum.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }, [
+    pdfFileForRender,
+    handleDocumentLoad,
+    numPages,
+    pdfZoom,
+    highlightRectsByPage,
+    activeHighlightId,
+    showPdfMarginOutline,
+    pdfMarginChildrenByPage,
+    openMarginToolbar,
+    expandedHighlightIds,
+    removeCustomChapter,
+    isManualHighlight,
+    removeHighlightNote,
+    paper.filePath,
+    paper.title,
+    paper.author,
+    paper.date,
+    paper.summary,
+    paper.content
+  ]);
+
+  const selectionOverlay = useMemo(() => {
+    if (typeof document === 'undefined' || viewMode !== ReaderMode.PDF) return null;
+    const hasToolbar = Boolean(selectionRect && selectionText);
+    const hasQuestionPicker = Boolean(questionPicker.open && questionPickerStyle);
+    if (!hasToolbar && !hasQuestionPicker) return null;
+    return createPortal(
+      <>
+        {hasToolbar ? (
+          <div
+            className="fixed z-30"
+            style={toolbarStyle || undefined}
+            ref={selectionToolbarRef}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="w-80 rounded-lg border border-gray-200 bg-white shadow-lg p-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  {HIGHLIGHT_COLORS.map((color) => (
+                    <Tooltip key={color.id} label="高亮" placement="top">
+                      <button
+                        type="button"
+                        className="w-5 h-5 rounded-md border border-gray-300 flex items-center justify-center"
+                        onClick={() => addHighlight(color.fill)}
+                      >
+                        <span className="w-3 h-3 rounded-sm" style={{ background: color.swatch }} />
+                      </button>
+                    </Tooltip>
+                  ))}
+                  <Tooltip label="章节标题" placement="top">
+                    <button
+                      type="button"
+                      className="w-5 h-5 rounded-md border border-gray-300 text-[10px] font-semibold text-gray-700 hover:bg-gray-50"
+                      onClick={createCustomChapterFromSelection}
+                    >
+                      T
+                    </button>
+                  </Tooltip>
+                  <Tooltip label="清除格式" placement="top">
+                    <button
+                      type="button"
+                      className="w-5 h-5 rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 flex items-center justify-center"
+                      onClick={clearFormatting}
+                    >
+                      <Ban size={12} />
+                    </button>
+                  </Tooltip>
+                </div>
+                <Tooltip label="相关问题" placement="top">
+                  <button
+                    type="button"
+                    className="text-[11px] px-1.5 py-0.5 rounded border border-gray-200 text-gray-600 hover:bg-gray-50"
+                    onClick={openQuestionPicker}
+                  >
+                    相关问题
+                  </button>
+                </Tooltip>
+              </div>
+              <div className="mt-2 text-[11px] text-gray-500 bg-gray-50 rounded-md p-2 min-h-[44px]">
+                {translationResult || '选中文本以显示翻译'}
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {hasQuestionPicker ? (
+          <div
+            ref={questionPickerRef}
+            className="fixed z-30"
+            style={questionPickerStyle || undefined}
+            onMouseDown={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="w-56 rounded-lg border border-gray-200 bg-white shadow-lg p-2">
+              <div className="text-[11px] font-semibold text-gray-500 mb-1">关联到阅读问题</div>
+              {questions.length ? (
+                <div className="max-h-48 overflow-y-auto space-y-1">
+                  {questions.map((question) => (
+                    <button
+                      key={question.id}
+                      type="button"
+                      className="w-full text-left text-xs px-2 py-1 rounded hover:bg-gray-100"
+                      onClick={() => attachHighlightToQuestion(question)}
+                    >
+                      {question.text}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-[11px] text-gray-400 px-2 py-2">暂无阅读问题</div>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </>,
+      document.body
+    );
+  }, [
+    viewMode,
+    selectionRect,
+    selectionText,
+    toolbarStyle,
+    questionPicker.open,
+    questionPickerStyle,
+    translationResult,
+    questions,
+    addHighlight,
+    createCustomChapterFromSelection,
+    clearFormatting,
+    openQuestionPicker,
+    attachHighlightToQuestion
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -6750,7 +6997,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   className="p-1 rounded hover:bg-gray-200 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
                   aria-label="云同步"
                 >
-                  <Cloud size={14} className={isCloudSyncing ? 'animate-pulse' : ''} />
+                  {isCloudSyncing ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <svg
+                      className="h-[14px] w-[14px]"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
+                    </svg>
+                  )}
                 </button>
               </Tooltip>
               <button
@@ -6778,7 +7039,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   className="p-1 rounded hover:bg-gray-200 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
                   aria-label="云同步"
                 >
-                  <Cloud size={14} className={isCloudSyncing ? 'animate-pulse' : ''} />
+                  {isCloudSyncing ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <svg
+                      className="h-[14px] w-[14px]"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
+                    </svg>
+                  )}
                 </button>
               </Tooltip>
               <button
@@ -6903,13 +7178,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </div>
             ) : null}
           </div>
-        <div
+          <div
             ref={contentAreaRef}
             className={`flex-1 min-w-0 overflow-auto relative ${
               viewMode === ReaderMode.PDF ? '' : 'hidden'
             }`}
             onMouseUp={updateSelectionFromWindow}
-            onMouseDown={handleHighlightClick}
+            onClick={handleHighlightClick}
             onScroll={handleContentScroll}
           >
             {pdfDocumentContent}

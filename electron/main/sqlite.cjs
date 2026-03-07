@@ -3,7 +3,6 @@ module.exports = function createSqliteModule(deps = {}) {
     path,
     fs,
     fsNative,
-    syncPendingKey,
     getLibraryPaths,
     loadSettings,
     sanitizePaperForMeta,
@@ -18,6 +17,10 @@ module.exports = function createSqliteModule(deps = {}) {
   let libraryDb = null;
   let libraryDbRoot = '';
   let libraryStoreReadyPromise = null;
+  let syncQueueSuppressedDepth = 0;
+
+  const SYNC_ENTITY_TYPES = new Set(['folders', 'papers', 'paper_state', 'pdf']);
+  const SYNC_ACTIONS = new Set(['upsert', 'delete']);
 
   const safeJsonParse = (value, fallback) => {
     if (typeof value !== 'string' || !value.trim()) return fallback;
@@ -114,8 +117,25 @@ module.exports = function createSqliteModule(deps = {}) {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS sync_queue (
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(entity_type, entity_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS sync_delete_log (
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        deleted_at INTEGER NOT NULL,
+        PRIMARY KEY(entity_type, entity_id)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_papers_sort_order ON papers(sort_order);
       CREATE INDEX IF NOT EXISTS idx_papers_folder_id ON papers(folder_id);
+      CREATE INDEX IF NOT EXISTS idx_sync_queue_updated_at ON sync_queue(updated_at);
     `);
     const columns = db.prepare("PRAGMA table_info('papers')").all();
     const columnNames = new Set(columns.map((column) => String(column?.name || '').trim()));
@@ -148,10 +168,115 @@ module.exports = function createSqliteModule(deps = {}) {
     ).run(String(key || '').trim(), JSON.stringify(value ?? null), Date.now());
   };
 
-  const getSyncPending = () => Boolean(getLibraryKv(syncPendingKey, false));
+  const shouldTrackSyncQueue = (options = {}) =>
+    !syncQueueSuppressedDepth && !Boolean(options?.skipSyncQueue);
 
-  const setSyncPending = (value) => {
-    setLibraryKv(syncPendingKey, Boolean(value));
+  const normalizeSyncEntityType = (value) => {
+    const normalized = String(value || '').trim();
+    if (!SYNC_ENTITY_TYPES.has(normalized)) {
+      throw new Error(`不支持的同步实体类型: ${normalized || '(empty)'}`);
+    }
+    return normalized;
+  };
+
+  const normalizeSyncAction = (value) => {
+    const normalized = String(value || '').trim();
+    if (!SYNC_ACTIONS.has(normalized)) {
+      throw new Error(`不支持的同步动作: ${normalized || '(empty)'}`);
+    }
+    return normalized;
+  };
+
+  const recordSyncChange = (change = {}, options = {}) => {
+    if (!shouldTrackSyncQueue(options)) return;
+    const entityType = normalizeSyncEntityType(change.entityType);
+    const entityId = String(change.entityId || '').trim();
+    const action = normalizeSyncAction(change.action || 'upsert');
+    if (!entityId) {
+      throw new Error(`同步实体缺少 id: ${entityType}`);
+    }
+    const payload =
+      change.payload && typeof change.payload === 'object' && !Array.isArray(change.payload)
+        ? change.payload
+        : {};
+    const payloadJson = JSON.stringify(payload);
+    const updatedAt = Number(change.updatedAt || Date.now());
+    const db = getLibraryDb();
+    db.prepare(
+      `
+        INSERT INTO sync_queue (entity_type, entity_id, action, payload_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+          action = excluded.action,
+          payload_json = excluded.payload_json,
+          updated_at = excluded.updated_at
+      `
+    ).run(entityType, entityId, action, payloadJson, updatedAt);
+
+    if (action === 'delete') {
+      db.prepare(
+        `
+          INSERT INTO sync_delete_log (entity_type, entity_id, deleted_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+            deleted_at = excluded.deleted_at
+        `
+      ).run(entityType, entityId, updatedAt);
+    } else {
+      db.prepare('DELETE FROM sync_delete_log WHERE entity_type = ? AND entity_id = ?').run(
+        entityType,
+        entityId
+      );
+    }
+  };
+
+  const loadSyncQueueEntries = () => {
+    const db = getLibraryDb();
+    return db
+      .prepare('SELECT entity_type, entity_id, action, payload_json, updated_at FROM sync_queue ORDER BY updated_at ASC')
+      .all()
+      .map((row) => ({
+        entityType: String(row?.entity_type || '').trim(),
+        entityId: String(row?.entity_id || '').trim(),
+        action: String(row?.action || '').trim(),
+        payload: safeJsonParse(row?.payload_json, {}),
+        updatedAt: Number(row?.updated_at || 0)
+      }))
+      .filter((item) => item.entityType && item.entityId && item.action);
+  };
+
+  const clearSyncQueueEntries = (entries = null) => {
+    const db = getLibraryDb();
+    if (!entries) {
+      db.prepare('DELETE FROM sync_queue').run();
+      return;
+    }
+    const normalized = (Array.isArray(entries) ? entries : [])
+      .map((entry) => ({
+        entityType: String(entry?.entityType || '').trim(),
+        entityId: String(entry?.entityId || '').trim()
+      }))
+      .filter((entry) => entry.entityType && entry.entityId);
+    if (!normalized.length) return;
+    const remove = db.prepare('DELETE FROM sync_queue WHERE entity_type = ? AND entity_id = ?');
+    const tx = db.transaction((items) => {
+      items.forEach((item) => remove.run(item.entityType, item.entityId));
+    });
+    tx(normalized);
+  };
+
+  const getSyncQueueSize = () => {
+    const db = getLibraryDb();
+    return Number(db.prepare('SELECT COUNT(*) AS count FROM sync_queue').get()?.count || 0);
+  };
+
+  const withSyncQueueSuppressed = async (task) => {
+    syncQueueSuppressedDepth += 1;
+    try {
+      return await task();
+    } finally {
+      syncQueueSuppressedDepth = Math.max(0, syncQueueSuppressedDepth - 1);
+    }
   };
 
   const deletePaperStatesFromSqlite = (paperIds = []) => {
@@ -162,13 +287,42 @@ module.exports = function createSqliteModule(deps = {}) {
     db.prepare(`DELETE FROM paper_states WHERE paper_id IN (${placeholders})`).run(...ids);
   };
 
-  const deletePapersFromSqlite = (paperIds = []) => {
+  const deletePapersFromSqlite = (paperIds = [], options = {}) => {
     const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
     if (!ids.length) return [];
     deletePaperStatesFromSqlite(ids);
     const db = getLibraryDb();
     const placeholders = ids.map(() => '?').join(', ');
     db.prepare(`DELETE FROM papers WHERE id IN (${placeholders})`).run(...ids);
+    recordSyncChange(
+      {
+        entityType: 'papers',
+        entityId: 'library',
+        action: 'upsert',
+        payload: { papers: buildCurrentPapersSnapshot() }
+      },
+      options
+    );
+    ids.forEach((paperId) => {
+      recordSyncChange(
+        {
+          entityType: 'paper_state',
+          entityId: paperId,
+          action: 'delete',
+          payload: { paperId }
+        },
+        options
+      );
+      recordSyncChange(
+        {
+          entityType: 'pdf',
+          entityId: paperId,
+          action: 'delete',
+          payload: { paperId }
+        },
+        options
+      );
+    });
     return ids;
   };
 
@@ -243,7 +397,7 @@ module.exports = function createSqliteModule(deps = {}) {
     }
   };
 
-  const saveFoldersToSqlite = async (folders) => {
+  const saveFoldersToSqlite = async (folders, options = {}) => {
     const payload = Array.isArray(folders) ? folders : [];
     const changed = JSON.stringify(loadFoldersFromSqlite ? await loadFoldersFromSqlite() : []) !== JSON.stringify(payload);
     if (!changed) {
@@ -253,6 +407,15 @@ module.exports = function createSqliteModule(deps = {}) {
       };
     }
     setLibraryKv('folders', payload);
+    recordSyncChange(
+      {
+        entityType: 'folders',
+        entityId: 'library',
+        action: 'upsert',
+        payload: { folders: payload }
+      },
+      options
+    );
     return {
       folders: payload,
       changed: true
@@ -260,6 +423,13 @@ module.exports = function createSqliteModule(deps = {}) {
   };
 
   const loadPapersFromSqlite = async () => {
+    const db = getLibraryDb();
+    const paths = getLibraryPaths();
+    const rows = db.prepare('SELECT * FROM papers ORDER BY sort_order ASC, uploaded_at ASC, id ASC').all();
+    return rows.map((row) => mapSqlitePaperRow(row, paths));
+  };
+
+  const buildCurrentPapersSnapshot = () => {
     const db = getLibraryDb();
     const paths = getLibraryPaths();
     const rows = db.prepare('SELECT * FROM papers ORDER BY sort_order ASC, uploaded_at ASC, id ASC').all();
@@ -454,13 +624,46 @@ module.exports = function createSqliteModule(deps = {}) {
     if (vectorReadyPapers.length) {
       void enqueueSummaryVectorSync(vectorReadyPapers);
     }
+
+    if (changed) {
+      recordSyncChange(
+        {
+          entityType: 'papers',
+          entityId: 'library',
+          action: 'upsert',
+          payload: { papers: persistedPapers }
+        },
+        options
+      );
+      removedPaperIds.forEach((paperId) => {
+        recordSyncChange(
+          {
+            entityType: 'paper_state',
+            entityId: paperId,
+            action: 'delete',
+            payload: { paperId }
+          },
+          options
+        );
+        recordSyncChange(
+          {
+            entityType: 'pdf',
+            entityId: paperId,
+            action: 'delete',
+            payload: { paperId }
+          },
+          options
+        );
+      });
+    }
+
     return {
       papers: persistedPapers,
       changed
     };
   };
 
-  const savePaperStateToSqlite = async (paperId, state) => {
+  const savePaperStateToSqlite = async (paperId, state, options = {}) => {
     const normalizedPaperId = String(paperId || '').trim();
     if (!normalizedPaperId) return { ok: false, error: '缺少paperId' };
     const db = getLibraryDb();
@@ -481,6 +684,18 @@ module.exports = function createSqliteModule(deps = {}) {
           updated_at = excluded.updated_at
       `
     ).run(normalizedPaperId, nextStateJson, Date.now());
+    recordSyncChange(
+      {
+        entityType: 'paper_state',
+        entityId: normalizedPaperId,
+        action: 'upsert',
+        payload: {
+          paperId: normalizedPaperId,
+          state: state || {}
+        }
+      },
+      options
+    );
     return { ok: true, changed: true };
   };
 
@@ -543,8 +758,11 @@ module.exports = function createSqliteModule(deps = {}) {
     ensureLibrarySqliteSchema,
     getLibraryKv,
     setLibraryKv,
-    getSyncPending,
-    setSyncPending,
+    recordSyncChange,
+    loadSyncQueueEntries,
+    clearSyncQueueEntries,
+    getSyncQueueSize,
+    withSyncQueueSuppressed,
     deletePaperStatesFromSqlite,
     deletePapersFromSqlite,
     mapSqlitePaperRow,
