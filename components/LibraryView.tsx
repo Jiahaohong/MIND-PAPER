@@ -720,7 +720,14 @@ interface LibraryViewProps {
   onRestorePaper: (paperId: string) => void;
   onCloudSync: (
     mode?: 'auto' | 'upload' | 'download'
-  ) => Promise<{ success: boolean; skipped?: boolean; mode?: 'upload' | 'download'; error?: string } | void>;
+  ) => Promise<{
+    success: boolean;
+    skipped?: boolean;
+    mode?: 'upload' | 'download';
+    error?: string;
+    downloadedPdfCount?: number;
+    appliedChangeCount?: number;
+  } | void>;
   isCloudSyncing: boolean;
 }
 
@@ -1423,7 +1430,16 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         setCloudSyncMessage(result.error || '云同步失败');
       } else {
         const mode = String((result as any)?.mode || '').trim();
-        setCloudSyncMessage(mode === 'upload' ? '本地改动已上传' : mode === 'download' ? '已从云端更新本地' : '云同步完成');
+        const skipped = Boolean((result as any)?.skipped);
+        if (mode === 'upload') {
+          setCloudSyncMessage(skipped ? '本地无改动，无需上传' : '本地改动已上传');
+          return;
+        }
+        if (mode === 'download') {
+          setCloudSyncMessage(skipped ? '云端无新变更' : '已从云端更新本地');
+          return;
+        }
+        setCloudSyncMessage('云同步完成');
       }
     } catch (error: any) {
       setCloudSyncMessage(error?.message || '云同步失败');

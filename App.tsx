@@ -1023,8 +1023,13 @@ const App: React.FC = () => {
     try {
       const result = await window.electronAPI.webdav.sync({ mode });
       const normalizedMode = String(result?.mode || '');
-      if (result?.success && (mode === 'download' || normalizedMode === 'download')) {
-        await refreshLibraryFromCloud(undefined, { invalidatePdfCaches: false });
+      const isDownloadMode = mode === 'download' || normalizedMode === 'download';
+      const skipped = Boolean(result?.skipped);
+      if (result?.success && isDownloadMode && !skipped) {
+        const downloadedPdfCount = Number(result?.downloadedPdfCount || 0);
+        await refreshLibraryFromCloud(undefined, {
+          invalidatePdfCaches: downloadedPdfCount > 0
+        });
       }
       return result;
     } finally {
