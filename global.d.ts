@@ -155,6 +155,8 @@ declare global {
           uploadedPdfBytes?: number;
           downloadedPdfCount?: number;
           downloadedPdfBytes?: number;
+          appliedChangeCount?: number;
+          pulledRemote?: boolean;
           remotePath?: string;
           server?: string;
           error?: string;

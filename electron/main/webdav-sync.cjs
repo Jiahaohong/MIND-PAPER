@@ -706,6 +706,7 @@ const createWebDavSyncModule = (deps = {}) => {
       let appliedChangeCount = 0;
       let downloadedPdfCount = 0;
       let downloadedPdfBytes = 0;
+      let pulledRemote = false;
       if (remoteVersion > localAppliedVersion) {
         const pendingRemote = remoteState.changes.filter(
           (item) => Number(item?.version || 0) > localAppliedVersion
@@ -716,12 +717,14 @@ const createWebDavSyncModule = (deps = {}) => {
           downloadedPdfCount = Number(applyResult.downloadedPdfCount || 0);
           downloadedPdfBytes = Number(applyResult.downloadedPdfBytes || 0);
           setLocalAppliedVersion(remoteVersion);
+          pulledRemote = true;
         } else {
           const fullDownloadResult = await downloadFullRemoteSnapshot(client, remotePath, remoteVersion);
           if (fullDownloadResult?.success) {
             appliedChangeCount = Number(fullDownloadResult?.appliedChangeCount || 0);
             downloadedPdfCount = Number(fullDownloadResult?.downloadedPdfCount || 0);
             downloadedPdfBytes = Number(fullDownloadResult?.downloadedPdfBytes || 0);
+            pulledRemote = true;
           }
         }
       }
@@ -735,7 +738,8 @@ const createWebDavSyncModule = (deps = {}) => {
           remoteVersion: Number(remoteState?.meta?.libraryVersion || 0),
           appliedChangeCount,
           downloadedPdfCount,
-          downloadedPdfBytes
+          downloadedPdfBytes,
+          pulledRemote
         };
       }
 
@@ -806,7 +810,8 @@ const createWebDavSyncModule = (deps = {}) => {
         uploadedPdfBytes,
         appliedChangeCount,
         downloadedPdfCount,
-        downloadedPdfBytes
+        downloadedPdfBytes,
+        pulledRemote
       };
     } finally {
       await releaseRemoteLock(client);

@@ -1025,7 +1025,10 @@ const App: React.FC = () => {
       const normalizedMode = String(result?.mode || '');
       const isDownloadMode = mode === 'download' || normalizedMode === 'download';
       const skipped = Boolean(result?.skipped);
-      if (result?.success && isDownloadMode && !skipped) {
+      const pulledRemote = Boolean((result as any)?.pulledRemote);
+      const shouldRefreshFromCloud =
+        Boolean(result?.success) && ((isDownloadMode && !skipped) || pulledRemote);
+      if (shouldRefreshFromCloud) {
         const downloadedPdfCount = Number(result?.downloadedPdfCount || 0);
         await refreshLibraryFromCloud(undefined, {
           invalidatePdfCaches: downloadedPdfCount > 0
