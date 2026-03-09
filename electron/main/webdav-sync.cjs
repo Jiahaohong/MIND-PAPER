@@ -27,9 +27,11 @@ const registerWebDavSyncIpc = ({
       }
       return await enqueueWrite(async () => {
         const mode = String(payload?.mode || 'auto').trim();
+        console.log(`[webdav-sync-debug] ipc request: mode=${mode}`);
         return syncLibrary({ mode });
       });
     } catch (error) {
+      console.log(`[webdav-sync-debug] ipc failed: ${error?.message || error}`);
       return {
         success: false,
         error: error?.message || '云同步失败'
@@ -75,8 +77,22 @@ const createWebDavSyncModule = (deps = {}) => {
     appVersion: app.getVersion()
   };
   let activeLockPath = '';
+  let syncRunSeq = 0;
 
   const now = () => Date.now();
+
+  const stringifyDebugPayload = (payload) => {
+    try {
+      return JSON.stringify(payload || {});
+    } catch {
+      return '{"error":"payload stringify failed"}';
+    }
+  };
+
+  const logSyncDebug = (runId, step, payload = {}) => {
+    const prefix = runId ? `[webdav-sync-debug][${runId}]` : '[webdav-sync-debug]';
+    console.log(`${prefix} ${step} ${stringifyDebugPayload(payload)}`);
+  };
 
   const getLocalAppliedVersion = () =>
     Math.max(0, Number(getLibraryKv(LOCAL_SYNC_LAST_APPLIED_VERSION_KEY, 0) || 0));
@@ -170,15 +186,28 @@ const createWebDavSyncModule = (deps = {}) => {
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  const waitForRemoteLockRelease = async (client, remotePath) => {
+  const waitForRemoteLockRelease = async (client, remotePath, runId = '') => {
     const deadline = now() + REMOTE_LOCK_WAIT_TIMEOUT_MS;
     const lockPath = `${remotePath}/${REMOTE_LOCK_FILE}`;
+    logSyncDebug(runId, 'lock wait start', {
+      lockPath,
+      timeoutMs: REMOTE_LOCK_WAIT_TIMEOUT_MS,
+      pollMs: REMOTE_LOCK_WAIT_POLL_MS
+    });
     while (true) {
       const lock = await readRemoteJsonFile(client, lockPath, null);
       if (!isRemoteLockAlive(lock) || isRemoteLockOwnedBySelf(lock)) {
+        logSyncDebug(runId, 'lock wait done', {
+          released: true,
+          owner: String(lock?.device || '')
+        });
         return { ok: true };
       }
       if (now() >= deadline) {
+        logSyncDebug(runId, 'lock wait timeout', {
+          owner: String(lock?.device || ''),
+          expiresAt: Number(lock?.expiresAt || 0)
+        });
         return {
           ok: false,
           lock
@@ -413,12 +442,21 @@ const createWebDavSyncModule = (deps = {}) => {
     }
   };
 
-  const applyRemoteChanges = async (client, remotePath, changes = []) => {
+  const applyRemoteChanges = async (client, remotePath, changes = [], runId = '') => {
     const paths = getLibraryPaths();
     const list = (Array.isArray(changes) ? changes : [])
       .map((item) => normalizeRemoteChange(item))
       .filter(Boolean)
       .sort((a, b) => a.version - b.version);
+    const entityTypeCount = list.reduce((acc, item) => {
+      const key = String(item?.entityType || 'unknown');
+      acc[key] = Number(acc[key] || 0) + 1;
+      return acc;
+    }, {});
+    logSyncDebug(runId, 'apply remote start', {
+      changeCount: list.length,
+      entityTypeCount
+    });
     if (!list.length) {
       return {
         appliedCount: 0,
@@ -529,10 +567,17 @@ const createWebDavSyncModule = (deps = {}) => {
     };
   };
 
-  const downloadFullRemoteSnapshot = async (client, remotePath, remoteVersion) => {
+  const downloadFullRemoteSnapshot = async (client, remotePath, remoteVersion, runId = '') => {
     const paths = getLibraryPaths();
     const remoteSqlitePath = `${remotePath}/${REMOTE_SQLITE_FILE}`;
+    logSyncDebug(runId, 'full snapshot start', {
+      remoteVersion,
+      remoteSqlitePath
+    });
     if (!(await client.exists(remoteSqlitePath))) {
+      logSyncDebug(runId, 'full snapshot skipped', {
+        reason: 'remote sqlite not found'
+      });
       return {
         success: false,
         skipped: true,
@@ -580,6 +625,14 @@ const createWebDavSyncModule = (deps = {}) => {
         papers
       );
       setLocalAppliedVersion(remoteVersion);
+      logSyncDebug(runId, 'full snapshot done', {
+        remoteVersion,
+        sqliteBytes,
+        paperCount: papers.length,
+        stateCount: states.length,
+        downloadedPdfCount,
+        downloadedPdfBytes
+      });
       return {
         success: true,
         mode: 'download',
@@ -593,10 +646,13 @@ const createWebDavSyncModule = (deps = {}) => {
     }
   };
 
-  const pullRemoteChanges = async (client, remotePath) => {
+  const pullRemoteChanges = async (client, remotePath, runId = '') => {
     await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_SYNC_DIR}`);
-    const lockResult = await waitForRemoteLockRelease(client, remotePath);
+    const lockResult = await waitForRemoteLockRelease(client, remotePath, runId);
     if (!lockResult.ok) {
+      logSyncDebug(runId, 'pull blocked by lock', {
+        owner: String(lockResult.lock?.device || 'unknown')
+      });
       return {
         success: false,
         skipped: true,
@@ -608,7 +664,16 @@ const createWebDavSyncModule = (deps = {}) => {
     const remoteState = await loadRemoteSyncState(client, remotePath);
     const remoteVersion = Number(remoteState?.meta?.libraryVersion || 0);
     const localAppliedVersion = getLocalAppliedVersion();
+    logSyncDebug(runId, 'pull compare versions', {
+      localAppliedVersion,
+      remoteVersion,
+      remoteChangeCount: Array.isArray(remoteState?.changes) ? remoteState.changes.length : 0
+    });
     if (remoteVersion <= localAppliedVersion) {
+      logSyncDebug(runId, 'pull skipped up-to-date', {
+        localAppliedVersion,
+        remoteVersion
+      });
       return {
         success: true,
         skipped: true,
@@ -620,12 +685,28 @@ const createWebDavSyncModule = (deps = {}) => {
     const pendingRemote = remoteState.changes.filter(
       (item) => Number(item?.version || 0) > localAppliedVersion
     );
+    logSyncDebug(runId, 'pull pending changes', {
+      pendingCount: pendingRemote.length,
+      firstPendingVersion: Number(pendingRemote[0]?.version || 0)
+    });
     if (!pendingRemote.length || Number(pendingRemote[0]?.version || 0) > localAppliedVersion + 1) {
-      return downloadFullRemoteSnapshot(client, remotePath, remoteVersion);
+      logSyncDebug(runId, 'pull choose full snapshot', {
+        reason: !pendingRemote.length ? 'no pending delta' : 'delta gap'
+      });
+      return downloadFullRemoteSnapshot(client, remotePath, remoteVersion, runId);
     }
 
-    const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote);
+    logSyncDebug(runId, 'pull choose delta apply', {
+      pendingCount: pendingRemote.length
+    });
+    const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote, runId);
     setLocalAppliedVersion(remoteVersion);
+    logSyncDebug(runId, 'pull done', {
+      remoteVersion,
+      appliedChangeCount: applyResult.appliedCount,
+      downloadedPdfCount: applyResult.downloadedPdfCount,
+      downloadedPdfBytes: applyResult.downloadedPdfBytes
+    });
     return {
       success: true,
       mode: 'download',
@@ -691,17 +772,26 @@ const createWebDavSyncModule = (deps = {}) => {
     };
   };
 
-  const uploadLocalChanges = async (client, remotePath) => {
+  const uploadLocalChanges = async (client, remotePath, runId = '') => {
     const paths = getLibraryPaths();
     await ensureRemoteDirectory(client, remotePath);
     await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_SYNC_DIR}`);
     await ensureRemoteDirectory(client, `${remotePath}/${REMOTE_PAPERS_DIR}`);
 
+    logSyncDebug(runId, 'upload start', {
+      remotePath,
+      localQueueSize: Number(getSyncQueueSize() || 0)
+    });
     await acquireRemoteLock(client, remotePath);
     try {
       const remoteState = await loadRemoteSyncState(client, remotePath);
       const remoteVersion = Number(remoteState?.meta?.libraryVersion || 0);
       const localAppliedVersion = getLocalAppliedVersion();
+      logSyncDebug(runId, 'upload compare versions', {
+        localAppliedVersion,
+        remoteVersion,
+        remoteChangeCount: Array.isArray(remoteState?.changes) ? remoteState.changes.length : 0
+      });
 
       let appliedChangeCount = 0;
       let downloadedPdfCount = 0;
@@ -712,14 +802,26 @@ const createWebDavSyncModule = (deps = {}) => {
           (item) => Number(item?.version || 0) > localAppliedVersion
         );
         if (pendingRemote.length && Number(pendingRemote[0]?.version || 0) === localAppliedVersion + 1) {
-          const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote);
+          logSyncDebug(runId, 'upload preflight pull via delta', {
+            pendingCount: pendingRemote.length
+          });
+          const applyResult = await applyRemoteChanges(client, remotePath, pendingRemote, runId);
           appliedChangeCount = Number(applyResult.appliedCount || 0);
           downloadedPdfCount = Number(applyResult.downloadedPdfCount || 0);
           downloadedPdfBytes = Number(applyResult.downloadedPdfBytes || 0);
           setLocalAppliedVersion(remoteVersion);
           pulledRemote = true;
         } else {
-          const fullDownloadResult = await downloadFullRemoteSnapshot(client, remotePath, remoteVersion);
+          logSyncDebug(runId, 'upload preflight pull via full snapshot', {
+            pendingCount: pendingRemote.length,
+            firstPendingVersion: Number(pendingRemote[0]?.version || 0)
+          });
+          const fullDownloadResult = await downloadFullRemoteSnapshot(
+            client,
+            remotePath,
+            remoteVersion,
+            runId
+          );
           if (fullDownloadResult?.success) {
             appliedChangeCount = Number(fullDownloadResult?.appliedChangeCount || 0);
             downloadedPdfCount = Number(fullDownloadResult?.downloadedPdfCount || 0);
@@ -730,7 +832,16 @@ const createWebDavSyncModule = (deps = {}) => {
       }
 
       const queueEntriesRaw = loadSyncQueueEntries();
+      logSyncDebug(runId, 'upload queue read', {
+        queueCount: queueEntriesRaw.length
+      });
       if (!queueEntriesRaw.length) {
+        logSyncDebug(runId, 'upload skipped no local queue', {
+          remoteVersion: Number(remoteState?.meta?.libraryVersion || 0),
+          pulledRemote,
+          appliedChangeCount,
+          downloadedPdfCount
+        });
         return {
           success: true,
           mode: appliedChangeCount || downloadedPdfCount ? 'download' : 'upload',
@@ -750,6 +861,15 @@ const createWebDavSyncModule = (deps = {}) => {
         // eslint-disable-next-line no-await-in-loop
         queueEntries.push(await enrichPdfQueuePayload(normalized, paths));
       }
+      const queueTypeCount = queueEntries.reduce((acc, item) => {
+        const key = String(item?.entityType || 'unknown');
+        acc[key] = Number(acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      logSyncDebug(runId, 'upload queue normalized', {
+        queueCount: queueEntries.length,
+        queueTypeCount
+      });
 
       let uploadedPdfCount = 0;
       let uploadedPdfBytes = 0;
@@ -801,6 +921,17 @@ const createWebDavSyncModule = (deps = {}) => {
 
       clearSyncQueueEntries(queueEntriesRaw);
       setLocalAppliedVersion(nextVersion);
+      logSyncDebug(runId, 'upload done', {
+        remoteVersion: nextVersion,
+        sqliteBytes,
+        uploadedPdfCount,
+        uploadedPdfBytes,
+        appliedChangeCount,
+        downloadedPdfCount,
+        downloadedPdfBytes,
+        pulledRemote,
+        clearedQueueCount: queueEntriesRaw.length
+      });
       return {
         success: true,
         mode: 'upload',
@@ -815,17 +946,35 @@ const createWebDavSyncModule = (deps = {}) => {
       };
     } finally {
       await releaseRemoteLock(client);
+      logSyncDebug(runId, 'upload lock released', {
+        activeLockPath: activeLockPath || ''
+      });
     }
   };
 
   const syncLibrary = async ({ mode = 'auto' } = {}) => {
     await ensureLibraryStoreReady();
+    syncRunSeq += 1;
+    const runId = `${String(now())}-${syncRunSeq}`;
     const config = await getWebDavConfigFromSettings();
     const server = config.webdavServer;
     const username = config.webdavUsername;
     const remotePath = config.webdavRemotePath;
     const password = await getWebDavCredential(server, username);
+    logSyncDebug(runId, 'sync start', {
+      mode: String(mode || 'auto').trim(),
+      server: String(server || ''),
+      username: String(username || ''),
+      remotePath: String(remotePath || ''),
+      localAppliedVersion: getLocalAppliedVersion(),
+      pendingQueueSize: Number(getSyncQueueSize() || 0)
+    });
     if (!server || !username || !password) {
+      logSyncDebug(runId, 'sync failed missing config', {
+        hasServer: Boolean(server),
+        hasUsername: Boolean(username),
+        hasPassword: Boolean(password)
+      });
       return {
         success: false,
         skipped: true,
@@ -839,7 +988,9 @@ const createWebDavSyncModule = (deps = {}) => {
 
     const normalizedMode = String(mode || 'auto').trim();
     if (normalizedMode === 'download') {
-      const result = await pullRemoteChanges(client, remotePath);
+      logSyncDebug(runId, 'sync branch', { branch: 'forced-download' });
+      const result = await pullRemoteChanges(client, remotePath, runId);
+      logSyncDebug(runId, 'sync result', result);
       return {
         ...result,
         server,
@@ -847,7 +998,9 @@ const createWebDavSyncModule = (deps = {}) => {
       };
     }
     if (normalizedMode === 'upload') {
-      const result = await uploadLocalChanges(client, remotePath);
+      logSyncDebug(runId, 'sync branch', { branch: 'forced-upload' });
+      const result = await uploadLocalChanges(client, remotePath, runId);
+      logSyncDebug(runId, 'sync result', result);
       return {
         ...result,
         server,
@@ -857,14 +1010,24 @@ const createWebDavSyncModule = (deps = {}) => {
 
     const pendingCount = Number(getSyncQueueSize() || 0);
     if (pendingCount > 0) {
-      const result = await uploadLocalChanges(client, remotePath);
+      logSyncDebug(runId, 'sync branch', {
+        branch: 'auto-upload',
+        pendingQueueSize: pendingCount
+      });
+      const result = await uploadLocalChanges(client, remotePath, runId);
+      logSyncDebug(runId, 'sync result', result);
       return {
         ...result,
         server,
         remotePath
       };
     }
-    const result = await pullRemoteChanges(client, remotePath);
+    logSyncDebug(runId, 'sync branch', {
+      branch: 'auto-download',
+      pendingQueueSize: pendingCount
+    });
+    const result = await pullRemoteChanges(client, remotePath, runId);
+    logSyncDebug(runId, 'sync result', result);
     return {
       ...result,
       server,
