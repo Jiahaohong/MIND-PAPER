@@ -4,7 +4,6 @@ const fs = require('fs/promises');
 const fsNative = require('fs');
 const crypto = require('crypto');
 const os = require('os');
-const { spawn } = require('child_process');
 const { createMainWindow } = require('./window.cjs');
 const createSqliteModule = require('./sqlite.cjs');
 const { createWebDavModule, registerWebDavIpc } = require('./webdav.cjs');
@@ -13,9 +12,6 @@ const { registerLibraryIpc } = require('./library.cjs');
 
 const isDev = !app.isPackaged;
 const devServerURL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:3001';
-const DEFAULT_QDRANT_URL = 'http://127.0.0.1:6333';
-const PROJECT_ROOT = path.join(__dirname, '..', '..');
-const DEV_RESOURCES_ROOT = path.join(PROJECT_ROOT, 'resources');
 const DEV_USER_DATA_PATH = path.join(app.getPath('appData'), `${app.getName()}-dev`);
 
 if (isDev) {
@@ -26,17 +22,11 @@ const SETTINGS_PATH = path.join(app.getPath('userData'), 'settings.json');
 const DEFAULT_LIBRARY_ROOT = path.join(app.getPath('userData'), 'Library');
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-3.5-turbo';
-const DEFAULT_LIBRARY_META_COLLECTION = 'library_meta';
-const DEFAULT_PAPERS_VECTOR_COLLECTION = 'papers';
-const LIBRARY_META_VECTOR_NAME = 'meta';
-const LIBRARY_META_VECTOR_DIM = 1;
 const PAPERS_VECTOR_NAME = 'summary';
 const DEFAULT_SUMMARY_EMBEDDING_MODEL = 'text-embedding-3-small';
 const DEFAULT_SUMMARY_VECTOR_DIM = 1024;
 const SUMMARY_EMBED_MAX_TEXT_LEN = 6000;
 const LIBRARY_SQLITE_VERSION = 1;
-const LIBRARY_FOLDERS_POINT_KEY = '__folders__';
-const LIBRARY_MIGRATION_POINT_KEY = '__migration__';
 const TRANSLATE_SYSTEM_PROMPT =
   '你是翻译引擎。请将用户提供的文本翻译成中文，只输出翻译结果，不要添加解释。';
 const CNKI_TOKEN_URL = 'https://dict.cnki.net/fyzs-front-api/getToken';
@@ -67,9 +57,6 @@ let runtimeSettings = {
 
 let cnkiTokenCache = { token: '', t: 0 };
 let cnkiLastTranslateRequestAt = 0;
-let qdrantBootPromise = null;
-let qdrantProcess = null;
-let qdrantStartedByApp = false;
 let summaryVectorSyncChain = Promise.resolve();
 const PROGRESS_STAGES = new Set([
   '开始解析基本信息',
@@ -102,24 +89,6 @@ const logProgress = (stage, paperId = '') => {
   });
 };
 
-const formatLogTime = (value) => {
-  const time = Number(value || 0);
-  if (!Number.isFinite(time) || time <= 0) return '-';
-  const date = new Date(time);
-  if (Number.isNaN(date.getTime())) return '-';
-  const pad = (part) => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
-    date.getHours()
-  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-};
-
-const getQdrantUrl = () => process.env.MINDPAPER_QDRANT_URL || DEFAULT_QDRANT_URL;
-const getLibraryMetaCollection = () =>
-  String(process.env.MINDPAPER_LIBRARY_META_COLLECTION || DEFAULT_LIBRARY_META_COLLECTION).trim() ||
-  DEFAULT_LIBRARY_META_COLLECTION;
-const getPapersVectorCollection = () =>
-  String(process.env.MINDPAPER_PAPERS_COLLECTION || DEFAULT_PAPERS_VECTOR_COLLECTION).trim() ||
-  DEFAULT_PAPERS_VECTOR_COLLECTION;
 const getConfiguredSummaryVectorDim = () => {
   const dim = Number(process.env.MINDPAPER_SUMMARY_VECTOR_DIM || DEFAULT_SUMMARY_VECTOR_DIM);
   return Number.isFinite(dim) && dim > 0 ? Math.floor(dim) : DEFAULT_SUMMARY_VECTOR_DIM;
@@ -130,7 +99,7 @@ const isUuid = (value) =>
     String(value || '').trim()
   );
 
-const toQdrantPointId = (value) => {
+const toStablePointId = (value) => {
   const normalized = String(value || '').trim();
   if (!normalized) return '';
   if (isUuid(normalized)) return normalized.toLowerCase();
@@ -196,8 +165,7 @@ const sanitizeSettings = (payload = {}) => ({
 });
 
 const getLibraryRoot = () => runtimeSettings.libraryPath || DEFAULT_LIBRARY_ROOT;
-const getQdrantStoragePath = () => path.join(getLibraryRoot(), 'qdrant-data');
-const getLegacyQdrantStoragePath = () => path.join(app.getPath('userData'), 'qdrant-data');
+const getPaperArticleId = (paperId) => toStablePointId(String(paperId || '').trim());
 
 const getLibraryPaths = () => {
   const root = getLibraryRoot();
@@ -501,385 +469,6 @@ const cnkiTranslateWithRetry = async (text, maxAttempts = 10) => {
   throw lastError || new Error('CNKI翻译失败');
 };
 
-const isQdrantReachable = async (url, timeoutMs = 1000) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`${url.replace(/\/$/, '')}/collections`, {
-      method: 'GET',
-      signal: controller.signal
-    });
-    return Boolean(response.ok);
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
-const parseLocalQdrantTarget = (rawUrl) => {
-  try {
-    const parsed = new URL(rawUrl);
-    const host = parsed.hostname;
-    const isLocalHost =
-      host === '127.0.0.1' || host === 'localhost' || host === '::1';
-    if (!isLocalHost) return null;
-    const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
-    if (!Number.isFinite(port) || port <= 0) return null;
-    return {
-      host: host === '::1' ? '127.0.0.1' : host,
-      port
-    };
-  } catch {
-    return null;
-  }
-};
-
-const waitForQdrantReady = async (url, timeoutMs = 15000) => {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    // eslint-disable-next-line no-await-in-loop
-    const ok = await isQdrantReachable(url, 1200);
-    if (ok) return true;
-    // eslint-disable-next-line no-await-in-loop
-    await sleep(400);
-  }
-  return false;
-};
-
-const getQdrantBinaryName = () => {
-  const platformBinaryMap = {
-    darwin: 'qdrant-macos',
-    win32: 'qdrant-win.exe',
-    linux: 'qdrant-linux'
-  };
-  return platformBinaryMap[process.platform] || 'qdrant';
-};
-
-const resolveQdrantCandidates = (localTarget, storagePath) => {
-  const candidates = [];
-  const qdrantBinName = getQdrantBinaryName();
-  const envBin = String(process.env.MINDPAPER_QDRANT_BIN || '').trim();
-  const packagedPath = path.join(process.resourcesPath || '', 'qdrant', qdrantBinName);
-  const devLocalPath = path.join(PROJECT_ROOT, 'resources', 'qdrant', qdrantBinName);
-  const envOverrides = {
-    QDRANT__SERVICE__HOST: '127.0.0.1',
-    QDRANT__SERVICE__HTTP_PORT: String(localTarget.port),
-    QDRANT__STORAGE__STORAGE_PATH: storagePath
-  };
-
-  const appendCandidates = (command, isPath = false) => {
-    if (!command) return;
-    if (candidates.some((item) => item.command === command && !item.args.length)) return;
-    candidates.push({ command, args: [], envOverrides, isPath });
-  };
-
-  const envBinLooksLikePath =
-    envBin.startsWith('.') || envBin.startsWith('/') || envBin.startsWith('\\') || /[\\/]/.test(envBin);
-  appendCandidates(envBin, envBinLooksLikePath);
-  appendCandidates(packagedPath, true);
-  appendCandidates(devLocalPath, true);
-  appendCandidates('qdrant');
-  if (process.platform === 'win32') {
-    appendCandidates('qdrant.exe');
-  }
-  return candidates;
-};
-
-const ensureQdrantReady = async () => {
-  const qdrantUrl = getQdrantUrl();
-  if (await isQdrantReachable(qdrantUrl, 1200)) return true;
-  if (qdrantBootPromise) return qdrantBootPromise;
-
-  qdrantBootPromise = (async () => {
-    await loadSettings();
-    const localTarget = parseLocalQdrantTarget(qdrantUrl);
-    if (!localTarget) {
-      console.warn(`[vector-index] qdrant not reachable: ${qdrantUrl}`);
-      return false;
-    }
-    const storagePath = getQdrantStoragePath();
-    const legacyStoragePath = getLegacyQdrantStoragePath();
-    if (storagePath !== legacyStoragePath) {
-      let targetExists = false;
-      try {
-        await fs.access(storagePath);
-        targetExists = true;
-      } catch {
-        targetExists = false;
-      }
-      if (!targetExists) {
-        try {
-          await fs.access(legacyStoragePath);
-          await fs.mkdir(path.dirname(storagePath), { recursive: true });
-          try {
-            await fs.rename(legacyStoragePath, storagePath);
-          } catch {
-            await fs.cp(legacyStoragePath, storagePath, { recursive: true });
-          }
-          console.log(
-            `[vector-index] qdrant storage migrated: ${legacyStoragePath} -> ${storagePath}`
-          );
-        } catch {
-          // legacy storage does not exist
-        }
-      }
-    }
-    await fs.mkdir(storagePath, { recursive: true });
-    console.log(`[vector-index] qdrant storage path: ${storagePath}`);
-    const candidates = resolveQdrantCandidates(localTarget, storagePath);
-
-    for (const candidate of candidates) {
-      let proc = null;
-      try {
-        console.log(`[vector-index] trying qdrant binary: ${candidate.command}`);
-        if (candidate.isPath) {
-          try {
-            await fs.access(candidate.command);
-            await fs.chmod(candidate.command, 0o755);
-          } catch {
-            continue;
-          }
-        }
-        proc = spawn(candidate.command, candidate.args, {
-          cwd: storagePath,
-          env: {
-            ...process.env,
-            ...(candidate.envOverrides || {})
-          },
-          stdio: ['ignore', 'pipe', 'pipe'],
-          windowsHide: true
-        });
-
-        proc.stdout?.on('data', () => {
-          // keep quiet unless startup fails
-        });
-        proc.stderr?.on('data', (chunk) => {
-          const line = String(chunk || '').trim();
-          if (line) {
-            console.warn(`[vector-index] qdrant: ${line}`);
-          }
-        });
-
-        const earlyExit = new Promise((resolve) => {
-          proc.once('error', () => resolve(false));
-          proc.once('exit', () => resolve(false));
-        });
-        const ready = await Promise.race([waitForQdrantReady(qdrantUrl, 15000), earlyExit]);
-        if (ready) {
-          qdrantProcess = proc;
-          qdrantStartedByApp = true;
-          proc.on('exit', (code, signal) => {
-            if (qdrantProcess === proc) {
-              qdrantProcess = null;
-              qdrantStartedByApp = false;
-            }
-            console.warn(
-              `[vector-index] qdrant exited (code=${String(code)}, signal=${String(signal)})`
-            );
-          });
-          console.log(`[vector-index] qdrant started by app on ${qdrantUrl}`);
-          return true;
-        }
-
-        proc.kill('SIGTERM');
-      } catch (error) {
-        if (proc && !proc.killed) {
-          try {
-            proc.kill('SIGTERM');
-          } catch {
-            // ignore
-          }
-        }
-      }
-    }
-
-    console.warn(
-      `[vector-index] failed to auto-start qdrant. Set MINDPAPER_QDRANT_BIN or start qdrant manually (${qdrantUrl}).`
-    );
-    return false;
-  })().finally(() => {
-    qdrantBootPromise = null;
-  });
-
-  return qdrantBootPromise;
-};
-
-const stopManagedQdrant = async () => {
-  if (!qdrantStartedByApp || !qdrantProcess || qdrantProcess.killed) return;
-  const proc = qdrantProcess;
-  await new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (settled) return;
-      settled = true;
-      resolve(null);
-    };
-    proc.once('exit', done);
-    try {
-      proc.kill('SIGTERM');
-    } catch {
-      done();
-      return;
-    }
-    setTimeout(() => {
-      if (!proc.killed) {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          // ignore
-        }
-      }
-      done();
-    }, 3000);
-  });
-  qdrantProcess = null;
-  qdrantStartedByApp = false;
-};
-
-const buildQdrantUrl = (pathname) => `${getQdrantUrl().replace(/\/$/, '')}${pathname}`;
-
-const qdrantRequest = async (pathname, options = {}) => {
-  const response = await fetch(buildQdrantUrl(pathname), {
-    method: options.method || 'GET',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-  let data = null;
-  try {
-    data = await response.json();
-  } catch {
-    data = null;
-  }
-  if (!response.ok || data?.status === 'error') {
-    const reason = data?.status?.error || data?.error || response.statusText || 'qdrant request failed';
-    throw new Error(String(reason));
-  }
-  return data;
-};
-
-const getLibraryFoldersPointId = () => toQdrantPointId(`library:${LIBRARY_FOLDERS_POINT_KEY}`);
-const getLibraryMigrationPointId = () => toQdrantPointId(`library:${LIBRARY_MIGRATION_POINT_KEY}`);
-const getLibraryStatePointId = (paperId) => toQdrantPointId(`library:state:${String(paperId || '').trim()}`);
-const getPaperArticleId = (paperId) => toQdrantPointId(String(paperId || '').trim());
-
-const buildMetaVector = () => ({ [LIBRARY_META_VECTOR_NAME]: [1] });
-
-const ensureLibraryMetaCollection = async () => {
-  const collection = getLibraryMetaCollection();
-  try {
-    await qdrantRequest(`/collections/${collection}`);
-    return;
-  } catch {
-    // create if missing
-  }
-  await qdrantRequest(`/collections/${collection}`, {
-    method: 'PUT',
-    body: {
-      vectors: {
-        [LIBRARY_META_VECTOR_NAME]: {
-          size: LIBRARY_META_VECTOR_DIM,
-          distance: 'Cosine'
-        }
-      }
-    }
-  });
-};
-
-const hasLibraryMetaCollection = async () => {
-  try {
-    await qdrantRequest(`/collections/${getLibraryMetaCollection()}`);
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const extractNamedVectorDim = (collectionResult) => {
-  const vectors = collectionResult?.config?.params?.vectors;
-  if (!vectors) return 0;
-  if (typeof vectors?.size === 'number') {
-    return Number.isFinite(vectors.size) && vectors.size > 0 ? Math.floor(vectors.size) : 0;
-  }
-  const namedVector = vectors?.[PAPERS_VECTOR_NAME];
-  if (namedVector && typeof namedVector.size === 'number') {
-    return Number.isFinite(namedVector.size) && namedVector.size > 0
-      ? Math.floor(namedVector.size)
-      : 0;
-  }
-  return 0;
-};
-
-const extractPapersVectorNames = (collectionResult) => {
-  const vectors = collectionResult?.config?.params?.vectors;
-  if (!vectors) return [];
-  if (typeof vectors?.size === 'number') {
-    return ['__unnamed__'];
-  }
-  return Object.keys(vectors || {})
-    .map((name) => String(name || '').trim())
-    .filter(Boolean)
-    .sort();
-};
-
-const createPapersVectorCollection = async (collection, dim) => {
-  await qdrantRequest(`/collections/${collection}`, {
-    method: 'PUT',
-    body: {
-      vectors: {
-        [PAPERS_VECTOR_NAME]: {
-          size: dim,
-          distance: 'Cosine'
-        }
-      }
-    }
-  });
-};
-
-const ensurePapersVectorCollection = async () => {
-  const collection = getPapersVectorCollection();
-  const configuredDim = getConfiguredSummaryVectorDim();
-  try {
-    const existing = await qdrantRequest(`/collections/${collection}`);
-    const vectorNames = extractPapersVectorNames(existing?.result || {});
-    const summaryOnly =
-      vectorNames.length === 1 && vectorNames[0] === PAPERS_VECTOR_NAME;
-    if (!summaryOnly) {
-      console.warn(
-        `[vector-index] papers collection has legacy vectors (${vectorNames.join(', ') || 'none'}), recreating to summary-only.`
-      );
-      await qdrantRequest(`/collections/${collection}`, { method: 'DELETE' });
-      await createPapersVectorCollection(collection, configuredDim);
-      return;
-    }
-    const existingDim = extractNamedVectorDim(existing?.result || {});
-    if (existingDim > 0 && existingDim !== configuredDim) {
-      console.warn(
-        `[vector-index] papers vector dim mismatch: collection=${existingDim}, configured=${configuredDim}. Using collection dim.`
-      );
-    }
-    return;
-  } catch {
-    // create if missing
-  }
-  await createPapersVectorCollection(collection, configuredDim);
-};
-
-const getPapersVectorCollectionDim = async () => {
-  const collection = getPapersVectorCollection();
-  try {
-    const info = await qdrantRequest(`/collections/${collection}`);
-    const dim = extractNamedVectorDim(info?.result || {});
-    if (dim > 0) return dim;
-  } catch {
-    // fallback to configured value
-  }
-  return getConfiguredSummaryVectorDim();
-};
-
 const deletePaperVectorPoints = async (paperIds = []) => {
   const ids = (Array.isArray(paperIds) ? paperIds : []).map((paperId) => String(paperId || '').trim()).filter(Boolean);
   if (!ids.length) return;
@@ -1011,65 +600,6 @@ const enqueueSummaryVectorSync = (papers = []) => {
       console.warn('[vector-index] summary vector sync failed:', error?.message || error);
     });
   return summaryVectorSyncChain;
-};
-
-const upsertLibraryMetaPoints = async (points = []) => {
-  if (!points.length) return;
-  const collection = getLibraryMetaCollection();
-  await qdrantRequest(`/collections/${collection}/points`, {
-    method: 'PUT',
-    body: { points, wait: true }
-  });
-};
-
-const deleteLibraryMetaPoints = async (ids = []) => {
-  const list = (Array.isArray(ids) ? ids : []).map((id) => String(id || '').trim()).filter(Boolean);
-  if (!list.length) return;
-  const collection = getLibraryMetaCollection();
-  await qdrantRequest(`/collections/${collection}/points/delete`, {
-    method: 'POST',
-    body: { points: list, wait: true }
-  });
-};
-
-const getLibraryMetaPoint = async (id) => {
-  const pointId = String(id || '').trim();
-  if (!pointId) return null;
-  const collection = getLibraryMetaCollection();
-  const data = await qdrantRequest(`/collections/${collection}/points`, {
-    method: 'POST',
-    body: {
-      ids: [pointId],
-      with_payload: true,
-      with_vector: false
-    }
-  });
-  const points = Array.isArray(data?.result) ? data.result : [];
-  return points[0] || null;
-};
-
-const scrollLibraryMetaPoints = async (filter = null) => {
-  const collection = getLibraryMetaCollection();
-  const points = [];
-  let offset = null;
-  while (true) {
-    // eslint-disable-next-line no-await-in-loop
-    const data = await qdrantRequest(`/collections/${collection}/points/scroll`, {
-      method: 'POST',
-      body: {
-        limit: 256,
-        offset: offset || undefined,
-        filter: filter || undefined,
-        with_payload: true,
-        with_vector: false
-      }
-    });
-    const batch = Array.isArray(data?.result?.points) ? data.result.points : [];
-    points.push(...batch);
-    offset = data?.result?.next_page_offset || null;
-    if (!offset) break;
-  }
-  return points;
 };
 
 const fileExists = async (filePath) => {
@@ -1242,160 +772,6 @@ const normalizePaperForStorage = async (paper, paths) => {
   return sanitizePaperForMeta(raw, targetPdfPath);
 };
 
-const normalizePaperForMeta = async (paper, order, paths) => {
-  const next = await normalizePaperForStorage(paper, paths);
-  if (!next) return null;
-  const paperPointId = getPaperArticleId(next.id);
-  return {
-    point: {
-      id: paperPointId,
-      vector: buildMetaVector(),
-      payload: {
-        type: 'paper',
-        order,
-        updatedAt: Date.now(),
-        paper: next
-      }
-    },
-    paper: next
-  };
-};
-
-const isLegacyVectorPayloadShape = (payload = {}) => {
-  const allowedKeys = new Set(['type', 'paperId', 'summaryHash', 'updatedAt']);
-  const keys = Object.keys(payload || {});
-  return keys.some((key) => !allowedKeys.has(key));
-};
-
-const saveFoldersToMeta = async (folders) => {
-  const payload = Array.isArray(folders) ? folders : [];
-  await upsertLibraryMetaPoints([
-    {
-      id: getLibraryFoldersPointId(),
-      vector: buildMetaVector(),
-      payload: {
-        type: 'folders',
-        folders: payload,
-        updatedAt: Date.now()
-      }
-    }
-  ]);
-  return payload;
-};
-
-const loadFoldersFromMeta = async () => {
-  const point = await getLibraryMetaPoint(getLibraryFoldersPointId());
-  return Array.isArray(point?.payload?.folders) ? point.payload.folders : null;
-};
-
-const loadPapersFromMeta = async () => {
-  const paths = getLibraryPaths();
-  const points = await scrollLibraryMetaPoints({
-    must: [{ key: 'type', match: { value: 'paper' } }]
-  });
-  return points
-    .map((point) => ({
-      order: Number(point?.payload?.order ?? Number.MAX_SAFE_INTEGER),
-      paper: point?.payload?.paper || null
-    }))
-    .filter((item) => item.paper && typeof item.paper === 'object')
-    .sort((a, b) => a.order - b.order)
-    .map((item) => {
-      const source = { ...item.paper };
-      const paperId = String(source.id || '').trim();
-      const paperPointId = getPaperArticleId(paperId);
-      const next = sanitizePaperForMeta(source, path.join(paths.papersDir, `${paperPointId}.pdf`));
-      return next;
-    });
-};
-
-const savePapersToMeta = async (papers, paths) => {
-  const source = Array.isArray(papers) ? papers : [];
-  const runtimeStateById = new Map(
-    source
-      .map((paper) => [
-        String(paper?.id || '').trim(),
-        {
-          isParsing: Boolean(paper?.isParsing),
-          isBackgroundProcessing: Boolean(paper?.isBackgroundProcessing)
-        }
-      ])
-      .filter((entry) => entry[0])
-  );
-  const normalizedPapers = [];
-  const paperPoints = [];
-  for (let index = 0; index < source.length; index += 1) {
-    // eslint-disable-next-line no-await-in-loop
-    const normalized = await normalizePaperForMeta(source[index], index, paths);
-    if (!normalized) continue;
-    normalizedPapers.push(normalized.paper);
-    paperPoints.push(normalized.point);
-  }
-  const existingPaperPoints = await scrollLibraryMetaPoints({
-    must: [{ key: 'type', match: { value: 'paper' } }]
-  });
-  const existingPaperIds = new Set(
-    existingPaperPoints.map((point) => String(point?.id || '').trim()).filter(Boolean)
-  );
-  const nextPaperIds = new Set(
-    paperPoints.map((point) => String(point?.id || '').trim()).filter(Boolean)
-  );
-  const removedPaperIds = Array.from(existingPaperIds).filter((id) => !nextPaperIds.has(id));
-  const removedStateIds = existingPaperPoints
-    .filter((point) => removedPaperIds.includes(String(point?.id || '').trim()))
-    .map((point) => getLibraryStatePointId(point?.payload?.paper?.id))
-    .filter(Boolean);
-  if (paperPoints.length) {
-    await upsertLibraryMetaPoints(paperPoints);
-  }
-  if (removedPaperIds.length) {
-    await deleteLibraryMetaPoints(removedPaperIds);
-    await deleteLibraryMetaPoints(removedStateIds);
-    await deletePaperVectorPoints(
-      existingPaperPoints
-        .filter((point) => removedPaperIds.includes(String(point?.id || '').trim()))
-        .map((point) => String(point?.payload?.paper?.id || '').trim())
-        .filter(Boolean)
-    );
-  }
-  const vectorReadyPapers = normalizedPapers.filter(
-    (paper) => {
-      const state = runtimeStateById.get(String(paper?.id || '').trim());
-      return !state?.isParsing && !state?.isBackgroundProcessing;
-    }
-  );
-  if (vectorReadyPapers.length) {
-    void enqueueSummaryVectorSync(vectorReadyPapers);
-  }
-  return normalizedPapers;
-};
-
-const savePaperStateToMeta = async (paperId, state) => {
-  const normalizedPaperId = String(paperId || '').trim();
-  if (!normalizedPaperId) return { ok: false, error: '缺少paperId' };
-  const statePointId = getLibraryStatePointId(normalizedPaperId);
-  await upsertLibraryMetaPoints([
-    {
-      id: statePointId,
-      vector: buildMetaVector(),
-      payload: {
-        type: 'state',
-        paperId: normalizedPaperId,
-        state: state || {},
-        updatedAt: Date.now()
-      }
-    }
-  ]);
-  return { ok: true };
-};
-
-const loadPaperStateFromMeta = async (paperId) => {
-  const normalizedPaperId = String(paperId || '').trim();
-  if (!normalizedPaperId) return null;
-  const statePoint = await getLibraryMetaPoint(getLibraryStatePointId(normalizedPaperId));
-  return statePoint?.payload?.state || null;
-};
-
 const loadLegacyStates = async (paths) => {
   const result = [];
   let files = [];
@@ -1423,54 +799,6 @@ const safeJsonParse = (value, fallback) => {
   } catch {
     return fallback;
   }
-};
-
-const loadPaperStatesFromMeta = async () => {
-  const points = await scrollLibraryMetaPoints({
-    must: [{ key: 'type', match: { value: 'state' } }]
-  });
-  return points
-    .map((point) => ({
-      paperId: String(point?.payload?.paperId || '').trim(),
-      state: point?.payload?.state || {}
-    }))
-    .filter((item) => item.paperId);
-};
-
-const migrateLegacyLibraryToQdrant = async (paths) => {
-  const migrationPoint = await getLibraryMetaPoint(getLibraryMigrationPointId()).catch(() => null);
-  if (Number(migrationPoint?.payload?.version || 0) >= LIBRARY_SQLITE_VERSION) return;
-  const folders = await readJsonFile(paths.foldersPath, []);
-  const papers = await readJsonFile(paths.papersPath, []);
-  const normalizedPapers = await savePapersToMeta(papers, paths);
-  await saveFoldersToMeta(folders);
-  const legacyStates = await loadLegacyStates(paths);
-  if (legacyStates.length) {
-    const statePoints = legacyStates.map((item) => ({
-      id: getLibraryStatePointId(item.paperId),
-      vector: buildMetaVector(),
-      payload: {
-        type: 'state',
-        paperId: item.paperId,
-        state: item.state || {},
-        updatedAt: Date.now()
-      }
-    }));
-    await upsertLibraryMetaPoints(statePoints);
-  }
-  await upsertLibraryMetaPoints([
-    {
-      id: getLibraryMigrationPointId(),
-      vector: buildMetaVector(),
-      payload: {
-        type: 'migration',
-        version: LIBRARY_SQLITE_VERSION,
-        migratedAt: Date.now(),
-        paperCount: normalizedPapers.length
-      }
-    }
-  ]);
-  console.log(`[library-meta] migrated legacy json to qdrant: papers=${normalizedPapers.length}`);
 };
 
 const migrateExistingLibraryToSqlite = async (paths) => {
@@ -1548,7 +876,7 @@ const {
   ensureLibrary
 } = sqliteModule;
 
-const debugQdrantStartup = async () => {
+const debugVectorBackendStartup = async () => {
   try {
     await ensureLibraryStoreReady();
     const vectors = loadPaperVectorsFromSqlite();
@@ -1562,7 +890,7 @@ const debugQdrantStartup = async () => {
   }
 };
 
-const debugDumpQdrantInfo = async () => {
+const debugDumpVectorBackendInfo = async () => {
   try {
     await ensureLibraryStoreReady();
     const vectors = loadPaperVectorsFromSqlite();
@@ -2432,7 +1760,7 @@ ipcMain.handle('vector-get-paper-statuses', async (_event, payload = {}) => {
 
 ipcMain.handle('vector-get-status', async () => {
   await ensureLibraryStoreReady();
-  const startup = await debugQdrantStartup();
+  const startup = await debugVectorBackendStartup();
   const ready = Boolean(startup?.ok);
   const paths = getLibraryPaths();
   let pointCount = -1;
@@ -2464,11 +1792,11 @@ ipcMain.handle('vector-get-status', async () => {
 });
 
 ipcMain.handle('vector-debug-qdrant-startup', async () => {
-  return debugQdrantStartup();
+  return debugVectorBackendStartup();
 });
 
 ipcMain.handle('vector-debug-dump-qdrant', async () => {
-  return debugDumpQdrantInfo();
+  return debugDumpVectorBackendInfo();
 });
 
 app.whenReady().then(() => {
