@@ -57,6 +57,8 @@ let runtimeSettings = {
   baseUrl: '',
   model: '',
   parsePdfWithAI: false,
+  idleAutoSyncEnabled: false,
+  idleAutoSyncMinutes: 10,
   libraryPath: '',
   webdavServer: '',
   webdavUsername: '',
@@ -172,12 +174,21 @@ const normalizeWebDavRemotePath = (value) => {
   return normalized.startsWith('/') ? normalized || DEFAULT_WEBDAV_REMOTE_PATH : `/${normalized}`;
 };
 
+const normalizeIdleAutoSyncMinutes = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 10;
+  const integer = Math.floor(parsed);
+  return Math.max(1, Math.min(1440, integer));
+};
+
 const sanitizeSettings = (payload = {}) => ({
   translationEngine: payload.translationEngine === 'openai' ? 'openai' : 'cnki',
   apiKey: String(payload.apiKey || '').trim(),
   baseUrl: String(payload.baseUrl || '').trim(),
   model: String(payload.model || '').trim(),
   parsePdfWithAI: Boolean(payload.parsePdfWithAI),
+  idleAutoSyncEnabled: Boolean(payload.idleAutoSyncEnabled),
+  idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(payload.idleAutoSyncMinutes),
   libraryPath: resolveLibraryPath(payload.libraryPath),
   webdavServer: normalizeWebDavServer(payload.webdavServer),
   webdavUsername: String(payload.webdavUsername || '').trim(),
@@ -219,7 +230,7 @@ const loadSettings = async () => {
 
 const saveSettings = async (payload = {}) => {
   const prevLibraryRoot = getLibraryRoot();
-  const next = { ...runtimeSettings, ...sanitizeSettings(payload) };
+  const next = sanitizeSettings({ ...runtimeSettings, ...(payload || {}) });
   if (!next.libraryPath) {
     next.libraryPath = DEFAULT_LIBRARY_ROOT;
   }
@@ -869,33 +880,11 @@ const getPapersVectorCollectionDim = async () => {
   return getConfiguredSummaryVectorDim();
 };
 
-const fetchPaperVectorPointsByIds = async (pointIds = []) => {
-  const ids = (Array.isArray(pointIds) ? pointIds : []).map((id) => String(id || '').trim()).filter(Boolean);
-  if (!ids.length) return [];
-  const collection = getPapersVectorCollection();
-  const data = await qdrantRequest(`/collections/${collection}/points`, {
-    method: 'POST',
-    body: {
-      ids,
-      with_payload: true,
-      with_vector: false
-    }
-  });
-  return Array.isArray(data?.result) ? data.result : [];
-};
-
 const deletePaperVectorPoints = async (paperIds = []) => {
-  const ids = (Array.isArray(paperIds) ? paperIds : [])
-    .map((paperId) => getPaperArticleId(paperId))
-    .map((id) => String(id || '').trim())
-    .filter(Boolean);
+  const ids = (Array.isArray(paperIds) ? paperIds : []).map((paperId) => String(paperId || '').trim()).filter(Boolean);
   if (!ids.length) return;
   try {
-    const collection = getPapersVectorCollection();
-    await qdrantRequest(`/collections/${collection}/points/delete`, {
-      method: 'POST',
-      body: { points: ids, wait: false }
-    });
+    deletePaperVectorsFromSqlite(ids);
   } catch (error) {
     console.warn('[vector-index] delete vector points failed:', error?.message || error);
   }
@@ -920,9 +909,6 @@ const syncSummaryVectorsForPapers = async (papers = []) => {
   if (!settings?.apiKey || !settings?.baseUrl) {
     return { ok: false, skipped: source.length, error: 'missing_openai_config' };
   }
-  const ready = await ensureQdrantReady();
-  if (!ready) return { ok: false, skipped: source.length, error: 'qdrant_not_ready' };
-  await ensurePapersVectorCollection();
 
   const candidates = source
     .map((paper) => {
@@ -931,15 +917,8 @@ const syncSummaryVectorsForPapers = async (papers = []) => {
       if (!paperId) return null;
       return {
         paperId,
-        pointId: getPaperArticleId(paperId),
         summary,
-        summaryHash: hashSummaryText(summary),
-        payload: {
-          type: 'paper_vector',
-          paperId,
-          summaryHash: hashSummaryText(summary),
-          updatedAt: Date.now()
-        }
+        summaryHash: hashSummaryText(summary)
       };
     })
     .filter(Boolean);
@@ -954,21 +933,20 @@ const syncSummaryVectorsForPapers = async (papers = []) => {
     return { ok: true, indexed: 0, skipped: candidates.length };
   }
 
-  const existing = await fetchPaperVectorPointsByIds(nonEmpty.map((item) => item.pointId));
+  const existing = loadPaperVectorsFromSqlite(nonEmpty.map((item) => item.paperId));
   const existingMetaMap = new Map(
-    existing.map((point) => [
-      String(point?.id || '').trim(),
+    existing.map((row) => [
+      String(row?.paperId || '').trim(),
       {
-        summaryHash: String(point?.payload?.summaryHash || '').trim(),
-        legacyPayload: isLegacyVectorPayloadShape(point?.payload || {})
+        summaryHash: String(row?.summaryHash || '').trim()
       }
     ])
   );
   const changed = nonEmpty.filter((item) => {
-    const existingMeta = existingMetaMap.get(item.pointId);
+    const existingMeta = existingMetaMap.get(item.paperId);
     if (!existingMeta) return true;
     if (existingMeta.summaryHash !== item.summaryHash) return true;
-    return Boolean(existingMeta.legacyPayload);
+    return false;
   });
   if (!changed.length) {
     if (emptySummaryIds.length) {
@@ -978,7 +956,7 @@ const syncSummaryVectorsForPapers = async (papers = []) => {
   }
 
   const model = String(process.env.MINDPAPER_SUMMARY_EMBED_MODEL || DEFAULT_SUMMARY_EMBEDDING_MODEL).trim();
-  const vectorDim = await getPapersVectorCollectionDim();
+  const vectorDim = getConfiguredSummaryVectorDim();
   const batchSize = 16;
   let indexed = 0;
   for (let i = 0; i < changed.length; i += batchSize) {
@@ -996,26 +974,26 @@ const syncSummaryVectorsForPapers = async (papers = []) => {
       logProgress('完成向量化', item.paperId);
       logProgress('开始入库', item.paperId);
     });
-    const points = chunk
+    const vectorRows = chunk
       .map((item, idx) => {
         const vector = Array.isArray(vectors[idx]) ? vectors[idx] : null;
         if (!vector) return null;
         return {
-          id: item.pointId,
-          vector: { [PAPERS_VECTOR_NAME]: vector },
-          payload: item.payload
+          paperId: item.paperId,
+          summaryHash: item.summaryHash,
+          model,
+          dim: vector.length,
+          vector,
+          updatedAt: Date.now()
         };
       })
       .filter(Boolean);
-    if (!points.length) continue;
-    // eslint-disable-next-line no-await-in-loop
-    await qdrantRequest(`/collections/${getPapersVectorCollection()}/points`, {
-      method: 'PUT',
-      body: { points, wait: false }
-    });
-    indexed += points.length;
-    points.forEach((point) => {
-      const paperId = String(point?.payload?.paperId || '').trim();
+    if (!vectorRows.length) continue;
+    const saveResult = savePaperVectorsToSqlite(vectorRows);
+    indexed += Number(saveResult?.saved || 0);
+    vectorRows.forEach((row) => {
+      const paperId = String(row?.paperId || '').trim();
+      if (!paperId) return;
       logProgress('完成入库', paperId);
     });
   }
@@ -1508,24 +1486,7 @@ const migrateExistingLibraryToSqlite = async (paths) => {
   let folders = await readJsonFile(paths.foldersPath, []);
   let papers = await readJsonFile(paths.papersPath, []);
   let states = await loadLegacyStates(paths);
-  let source = 'legacy-json';
-
-  try {
-    const ready = await ensureQdrantReady();
-    if (ready && (await hasLibraryMetaCollection())) {
-      const metaFolders = await loadFoldersFromMeta();
-      const metaPapers = await loadPapersFromMeta();
-      const metaStates = await loadPaperStatesFromMeta();
-      if ((Array.isArray(metaPapers) && metaPapers.length) || (Array.isArray(metaFolders) && metaFolders.length)) {
-        folders = Array.isArray(metaFolders) ? metaFolders : [];
-        papers = Array.isArray(metaPapers) ? metaPapers : [];
-        states = Array.isArray(metaStates) ? metaStates : [];
-        source = 'qdrant-meta';
-      }
-    }
-  } catch (error) {
-    console.warn('[library-sqlite] qdrant migration source unavailable:', error?.message || error);
-  }
+  const source = 'legacy-json';
 
   await saveFoldersToSqlite(folders);
   const paperSaveResult = await savePapersToSqlite(papers, paths, { preserveIncomingVersion: true });
@@ -1552,7 +1513,6 @@ const sqliteModule = createSqliteModule({
   sanitizePaperForMeta,
   normalizePaperForStorage,
   getPaperArticleId,
-  deletePaperVectorPoints,
   enqueueSummaryVectorSync,
   migrateExistingLibraryToSqlite
 });
@@ -1581,110 +1541,49 @@ const {
   savePaperStateToSqlite,
   loadPaperStateFromSqlite,
   loadPaperStatesFromSqlite,
+  loadPaperVectorsFromSqlite,
+  savePaperVectorsToSqlite,
+  deletePaperVectorsFromSqlite,
   ensureLibraryStoreReady,
   ensureLibrary
 } = sqliteModule;
 
 const debugQdrantStartup = async () => {
-  const qdrantUrl = getQdrantUrl();
-  const ready = await ensureQdrantReady();
-  if (!ready) {
-    console.warn(`[vector-index] qdrant startup check failed: ${qdrantUrl}`);
-    return { ok: false, error: 'qdrant not ready', qdrantUrl };
-  }
   try {
-    const response = await fetch(`${qdrantUrl}/collections`, { method: 'GET' });
-    const data = await response.json();
-    const collections = Array.isArray(data?.result?.collections)
-      ? data.result.collections.map((item) => String(item?.name || '')).filter(Boolean)
-      : [];
-    console.log(
-      `[vector-index] qdrant startup check ok: url=${qdrantUrl}, collections=${collections.length}`
-    );
-    return { ok: true, qdrantUrl, collections };
+    await ensureLibraryStoreReady();
+    const vectors = loadPaperVectorsFromSqlite();
+    const paths = getLibraryPaths();
+    console.log(`[vector-index] sqlite-vector startup check ok: vectors=${vectors.length}`);
+    return { ok: true, backend: 'sqlite-vector', vectorDbPath: paths.sqlitePath, count: vectors.length };
   } catch (error) {
-    const message = error?.message || 'qdrant startup check failed';
-    console.warn(`[vector-index] qdrant startup check error: ${message}`);
-    return { ok: false, qdrantUrl, error: message };
+    const message = error?.message || 'sqlite-vector startup check failed';
+    console.warn(`[vector-index] sqlite-vector startup check error: ${message}`);
+    return { ok: false, backend: 'sqlite-vector', error: message };
   }
 };
 
 const debugDumpQdrantInfo = async () => {
-  const qdrantUrl = getQdrantUrl().replace(/\/$/, '');
   try {
-    const ready = await ensureQdrantReady();
-    if (!ready) {
-      return { ok: false, error: 'qdrant not ready', qdrantUrl };
-    }
-    const requestJson = async (path, options = {}) => {
-      const response = await fetch(`${qdrantUrl}${path}`, {
-        method: options.method || 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(options.headers || {})
-        },
-        body: options.body ? JSON.stringify(options.body) : undefined
-      });
-      const text = await response.text();
-      const data = text ? JSON.parse(text) : {};
-      if (!response.ok) {
-        const detail = data?.status?.error || data?.result?.error || text || response.statusText;
-        throw new Error(`Qdrant ${options.method || 'GET'} ${path} failed: ${detail}`);
-      }
-      return data;
+    await ensureLibraryStoreReady();
+    const vectors = loadPaperVectorsFromSqlite();
+    const summary = {
+      collection: 'paper_summary_vectors',
+      pointsCount: vectors.length,
+      vectorNames: [PAPERS_VECTOR_NAME],
+      samplePoints: vectors.slice(0, 3).map((item) => ({
+        id: String(item?.paperId || ''),
+        payloadKeys: ['paperId', 'summaryHash', 'model', 'dim']
+      }))
     };
-
-    const collectionsResp = await requestJson('/collections');
-    const collections = Array.isArray(collectionsResp?.result?.collections)
-      ? collectionsResp.result.collections
-          .map((item) => String(item?.name || '').trim())
-          .filter(Boolean)
-      : [];
-
-    console.log(`[vector-index] ===== qdrant dump begin =====`);
-    console.log(`[vector-index] url=${qdrantUrl}`);
-    console.log(`[vector-index] collections=${collections.length} -> ${collections.join(', ') || '(none)'}`);
-
-    const details = [];
-    for (const name of collections) {
-      // eslint-disable-next-line no-await-in-loop
-      const info = await requestJson(`/collections/${name}`);
-      // eslint-disable-next-line no-await-in-loop
-      const countResp = await requestJson(`/collections/${name}/points/count`, {
-        method: 'POST',
-        body: { exact: true }
-      });
-      const pointsCount = Number(countResp?.result?.count || 0);
-      // eslint-disable-next-line no-await-in-loop
-      const scrollResp = await requestJson(`/collections/${name}/points/scroll`, {
-        method: 'POST',
-        body: { limit: 3, with_payload: true, with_vector: false }
-      });
-      const samplePoints = Array.isArray(scrollResp?.result?.points)
-        ? scrollResp.result.points.map((point) => ({
-            id: String(point?.id || ''),
-            payloadKeys: Object.keys(point?.payload || {})
-          }))
-        : [];
-      console.log(
-        `[vector-index] collection=${name} points=${pointsCount} vectors=${Object.keys(
-          info?.result?.config?.params?.vectors || {}
-        ).join(', ')}`
-      );
-      console.log(`[vector-index] sample=${JSON.stringify(samplePoints)}`);
-      details.push({
-        name,
-        pointsCount,
-        vectorNames: Object.keys(info?.result?.config?.params?.vectors || {}),
-        samplePoints
-      });
-    }
-    console.log(`[vector-index] ===== qdrant dump end =====`);
-    return { ok: true, qdrantUrl, collections: details };
+    console.log(`[vector-index] ===== sqlite-vector dump begin =====`);
+    console.log(`[vector-index] rows=${vectors.length}`);
+    console.log(`[vector-index] sample=${JSON.stringify(summary.samplePoints)}`);
+    console.log(`[vector-index] ===== sqlite-vector dump end =====`);
+    return { ok: true, backend: 'sqlite-vector', collections: [summary] };
   } catch (error) {
-    const message = error?.message || 'qdrant dump failed';
-    console.warn(`[vector-index] qdrant dump failed: ${message}`);
-    return { ok: false, qdrantUrl, error: message };
+    const message = error?.message || 'sqlite-vector dump failed';
+    console.warn(`[vector-index] sqlite-vector dump failed: ${message}`);
+    return { ok: false, backend: 'sqlite-vector', error: message };
   }
 };
 
@@ -2183,10 +2082,13 @@ const webDavSyncModule = createWebDavSyncModule({
   loadFoldersFromSqlite,
   loadPapersFromSqlite,
   loadPaperStatesFromSqlite,
+  loadPaperVectorsFromSqlite,
   saveFoldersToSqlite,
   savePapersToSqlite,
   savePaperStateToSqlite,
+  savePaperVectorsToSqlite,
   deletePaperStatesFromSqlite,
+  deletePaperVectorsFromSqlite,
   loadLibraryDataFromSqliteFile,
   removeFileIfExists,
   getPaperArticleId,
@@ -2249,7 +2151,6 @@ registerLibraryIpc({
   savePaperStateToSqlite: sqliteModule.savePaperStateToSqlite,
   removeFileIfExists,
   deletePapersFromSqlite: sqliteModule.deletePapersFromSqlite,
-  deletePaperVectorPoints,
   recordSyncChange
 });
 
@@ -2446,6 +2347,26 @@ ipcMain.handle('library-match-references', async (_event, payload = {}) => {
   }
 });
 
+const cosineSimilarity = (left = [], right = []) => {
+  const a = Array.isArray(left) ? left : [];
+  const b = Array.isArray(right) ? right : [];
+  const len = Math.min(a.length, b.length);
+  if (!len) return 0;
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < len; index += 1) {
+    const av = Number(a[index]);
+    const bv = Number(b[index]);
+    if (!Number.isFinite(av) || !Number.isFinite(bv)) continue;
+    dot += av * bv;
+    leftNorm += av * av;
+    rightNorm += bv * bv;
+  }
+  if (leftNorm <= 0 || rightNorm <= 0) return 0;
+  return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
+};
+
 ipcMain.handle('vector-search-papers', async (_event, payload = {}) => {
   try {
     const query = String(payload?.query || '').trim();
@@ -2458,34 +2379,34 @@ ipcMain.handle('vector-search-papers', async (_event, payload = {}) => {
     if (!settings?.apiKey || !settings?.baseUrl) {
       return { ok: false, error: '请先在设置中配置 API Key 和 Base URL' };
     }
-    const ready = await ensureQdrantReady();
-    if (!ready) return { ok: false, error: 'qdrant not ready' };
-    await ensurePapersVectorCollection();
+    await ensureLibraryStoreReady();
+    const vectorRows = loadPaperVectorsFromSqlite();
+    if (!vectorRows.length) return { ok: true, results: [] };
     const model = String(payload?.model || process.env.MINDPAPER_SUMMARY_EMBED_MODEL || DEFAULT_SUMMARY_EMBEDDING_MODEL).trim();
-    const vectorDim = await getPapersVectorCollectionDim();
+    const vectorDim = Math.max(1, Number(vectorRows[0]?.dim || vectorRows[0]?.vector?.length || getConfiguredSummaryVectorDim()));
     const vectors = await openaiEmbeddings(query, settings, { model, dimensions: vectorDim });
     const vector = Array.isArray(vectors[0]) ? vectors[0] : null;
     if (!vector) return { ok: false, error: 'query embedding failed' };
-    const data = await qdrantRequest(`/collections/${getPapersVectorCollection()}/points/search`, {
-      method: 'POST',
-      body: {
-        vector: {
-          name: PAPERS_VECTOR_NAME,
-          vector
-        },
-        limit,
-        with_payload: true,
-        with_vector: false
-      }
-    });
-    const points = Array.isArray(data?.result) ? data.result : [];
-    const results = points
-      .map((item) => ({
-        id: String(item?.id || ''),
-        paperId: String(item?.payload?.paperId || ''),
-        score: Number(item?.score || 0),
-        payload: item?.payload || {}
-      }))
+    const results = vectorRows
+      .map((item) => {
+        const paperId = String(item?.paperId || '').trim();
+        const score = cosineSimilarity(vector, item?.vector || []);
+        if (!paperId || !Number.isFinite(score)) return null;
+        return {
+          id: getPaperArticleId(paperId),
+          paperId,
+          score,
+          payload: {
+            paperId,
+            summaryHash: String(item?.summaryHash || '').trim(),
+            model: String(item?.model || '').trim(),
+            dim: Number(item?.dim || 0)
+          }
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => Number(b?.score || 0) - Number(a?.score || 0))
+      .slice(0, limit)
       .filter((item) => item.paperId);
     return { ok: true, results };
   } catch (error) {
@@ -2499,17 +2420,9 @@ ipcMain.handle('vector-get-paper-statuses', async (_event, payload = {}) => {
       ? payload.paperIds.map((id) => String(id || '').trim()).filter(Boolean)
       : [];
     if (!paperIds.length) return { ok: true, vectorizedPaperIds: [] };
-    const ready = await ensureQdrantReady();
-    if (!ready) return { ok: false, error: 'qdrant not ready', vectorizedPaperIds: [] };
-    await ensurePapersVectorCollection();
-    const pointIdToPaperId = new Map(paperIds.map((paperId) => [getPaperArticleId(paperId), paperId]));
-    const points = await fetchPaperVectorPointsByIds(Array.from(pointIdToPaperId.keys()));
-    const vectorizedPaperIds = points
-      .map((point) => {
-        const payloadPaperId = String(point?.payload?.paperId || '').trim();
-        if (payloadPaperId) return payloadPaperId;
-        return pointIdToPaperId.get(String(point?.id || '').trim()) || '';
-      })
+    await ensureLibraryStoreReady();
+    const vectorizedPaperIds = loadPaperVectorsFromSqlite(paperIds)
+      .map((row) => String(row?.paperId || '').trim())
       .filter(Boolean);
     return { ok: true, vectorizedPaperIds: Array.from(new Set(vectorizedPaperIds)) };
   } catch (error) {
@@ -2522,9 +2435,9 @@ ipcMain.handle('vector-get-status', async () => {
   const startup = await debugQdrantStartup();
   const ready = Boolean(startup?.ok);
   const paths = getLibraryPaths();
-  const papersCollectionName = getPapersVectorCollection();
   let pointCount = -1;
   let summaryVectorCount = -1;
+  let vectorDim = getConfiguredSummaryVectorDim();
   try {
     const db = getLibraryDb();
     const row = db.prepare('SELECT COUNT(*) AS count FROM papers').get();
@@ -2532,35 +2445,21 @@ ipcMain.handle('vector-get-status', async () => {
   } catch {
     pointCount = -1;
   }
-  if (ready) {
-    try {
-      const qdrantUrl = getQdrantUrl().replace(/\/$/, '');
-      const summaryResp = await fetch(`${qdrantUrl}/collections/${papersCollectionName}/points/count`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exact: true })
-      }).catch(() => null);
-      if (summaryResp?.ok) {
-        const data = await summaryResp.json();
-        summaryVectorCount = Number(data?.result?.count || 0);
-      }
-    } catch {
-      summaryVectorCount = -1;
-    }
+  const vectors = loadPaperVectorsFromSqlite();
+  summaryVectorCount = vectors.length;
+  if (vectors.length) {
+    vectorDim = Math.max(1, Number(vectors[0]?.dim || vectors[0]?.vector?.length || vectorDim));
   }
   return {
     ok: ready,
-    collection: 'sqlite',
+    collection: 'sqlite-vector',
     vectorFields: [PAPERS_VECTOR_NAME],
-    vectorDim: getConfiguredSummaryVectorDim(),
+    vectorDim,
     pointCount,
-    summaryVectorCollection: papersCollectionName,
+    summaryVectorCollection: 'paper_summary_vectors',
     summaryVectorCount,
-    qdrantUrl: getQdrantUrl(),
-    qdrantStoragePath: getQdrantStoragePath(),
     metadataDbPath: paths.sqlitePath,
-    qdrantManagedByApp: qdrantStartedByApp,
-    error: ready ? undefined : startup?.error || 'qdrant not ready'
+    error: ready ? undefined : startup?.error || 'sqlite-vector not ready'
   };
 });
 
@@ -2586,7 +2485,6 @@ app.whenReady().then(() => {
   void (async () => {
     try {
       await ensureLibraryStoreReady();
-      await debugQdrantStartup();
       const papers = await loadPapersFromSqlite();
       if (Array.isArray(papers) && papers.length) {
         void enqueueSummaryVectorSync(papers);
@@ -2609,11 +2507,6 @@ app.on('before-quit', (event) => {
   isForceQuitting = true;
   Promise.resolve()
     .then(async () => {
-      try {
-        await stopManagedQdrant();
-      } catch {
-        // ignore
-      }
       closeLibraryDb();
     })
     .finally(() => {

@@ -3,7 +3,7 @@ import { LibraryView } from './components/LibraryView';
 import { ReaderView } from './components/ReaderView';
 import { Folder, Paper, PaperReference } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
-import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud, FolderOpen } from 'lucide-react';
+import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud, FolderOpen, Clock3 } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
   extractPdfFullText,
@@ -20,6 +20,8 @@ const App: React.FC = () => {
     baseUrl: '',
     model: '',
     parsePdfWithAI: false,
+    idleAutoSyncEnabled: false,
+    idleAutoSyncMinutes: 10,
     libraryPath: '',
     webdavServer: '',
     webdavUsername: '',
@@ -41,7 +43,7 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync' | 'storage'>('ai');
+  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync' | 'idle' | 'storage'>('ai');
   const [webdavPassword, setWebdavPassword] = useState('');
   const [webdavServerInput, setWebdavServerInput] = useState('');
   const [webdavStatus, setWebdavStatus] = useState('');
@@ -49,6 +51,10 @@ const App: React.FC = () => {
   const [webdavSaving, setWebdavSaving] = useState(false);
   const [webdavClearingLock, setWebdavClearingLock] = useState(false);
   const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const isCloudSyncingRef = useRef(false);
+  const idleAutoSyncTimerRef = useRef<number | null>(null);
+  const idleAutoSyncTriggeredRef = useRef(false);
+  const idleActivityAtRef = useRef(0);
 
   const getWebDavServerEditablePart = (value: string) =>
     String(value || '')
@@ -58,6 +64,13 @@ const App: React.FC = () => {
 
   const normalizeWebDavServerInput = (value: string) =>
     getWebDavServerEditablePart(value).replace(/\/+$/, '');
+
+  const normalizeIdleAutoSyncMinutes = (value: unknown) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return 10;
+    const integer = Math.floor(parsed);
+    return Math.max(1, Math.min(1440, integer));
+  };
 
   const commitWebDavServerInput = () => {
     const normalized = normalizeWebDavServerInput(webdavServerInput);
@@ -829,6 +842,31 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.settingsGet) return;
+    let cancelled = false;
+    const bootstrapSettings = async () => {
+      try {
+        const data = await window.electronAPI!.settingsGet!();
+        if (cancelled || !data) return;
+        setSettingsForm((prev) => ({
+          ...prev,
+          ...data,
+          idleAutoSyncEnabled: Boolean(data.idleAutoSyncEnabled),
+          idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(data.idleAutoSyncMinutes)
+        }));
+        setWebdavServerInput(getWebDavServerEditablePart(data.webdavServer || ''));
+        setWebdavPassword(data?.webdavHasPassword ? SAVED_WEBDAV_PASSWORD_MASK : '');
+      } catch {
+        // ignore bootstrap settings errors
+      }
+    };
+    void bootstrapSettings();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (typeof window === 'undefined') return;
     const handleProgress = (event: Event) => {
       const payload = (event as CustomEvent<{ stage?: string; paperId?: string }>).detail || {};
@@ -897,6 +935,10 @@ const App: React.FC = () => {
     window.electronAPI.library.savePapers?.(papers);
   }, [folders, papers, libraryLoaded, isCloudSyncing]);
 
+  useEffect(() => {
+    isCloudSyncingRef.current = isCloudSyncing;
+  }, [isCloudSyncing]);
+
   const loadSettings = async () => {
     setSettingsError('');
     setWebdavStatus('');
@@ -907,7 +949,12 @@ const App: React.FC = () => {
     setSettingsLoading(true);
     try {
       const data = await window.electronAPI.settingsGet();
-      setSettingsForm((prev) => ({ ...prev, ...data }));
+      setSettingsForm((prev) => ({
+        ...prev,
+        ...data,
+        idleAutoSyncEnabled: Boolean(data?.idleAutoSyncEnabled),
+        idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(data?.idleAutoSyncMinutes)
+      }));
       setWebdavServerInput(getWebDavServerEditablePart(data?.webdavServer || ''));
       setWebdavPassword(data?.webdavHasPassword ? SAVED_WEBDAV_PASSWORD_MASK : '');
     } catch (error: any) {
@@ -926,7 +973,12 @@ const App: React.FC = () => {
     setSettingsLoading(true);
     try {
       const data = await window.electronAPI.settingsSet(settingsForm);
-      setSettingsForm((prev) => ({ ...prev, ...data }));
+      setSettingsForm((prev) => ({
+        ...prev,
+        ...data,
+        idleAutoSyncEnabled: Boolean(data?.idleAutoSyncEnabled),
+        idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(data?.idleAutoSyncMinutes)
+      }));
       setWebdavServerInput(getWebDavServerEditablePart(data?.webdavServer || settingsForm.webdavServer));
       setSettingsSaved(true);
       window.setTimeout(() => setSettingsSaved(false), 1500);
@@ -1039,6 +1091,89 @@ const App: React.FC = () => {
       setIsCloudSyncing(false);
     }
   };
+
+  useEffect(() => {
+    const clearIdleTimer = () => {
+      if (idleAutoSyncTimerRef.current) {
+        window.clearTimeout(idleAutoSyncTimerRef.current);
+        idleAutoSyncTimerRef.current = null;
+      }
+    };
+
+    if (typeof window === 'undefined') return;
+    const enabled = Boolean(settingsForm.idleAutoSyncEnabled);
+    const idleMinutes = normalizeIdleAutoSyncMinutes(settingsForm.idleAutoSyncMinutes);
+    if (!enabled) {
+      idleAutoSyncTriggeredRef.current = false;
+      clearIdleTimer();
+      return;
+    }
+
+    const idleMs = idleMinutes * 60 * 1000;
+    const scheduleTimer = (delayMs: number = idleMs) => {
+      clearIdleTimer();
+      idleAutoSyncTimerRef.current = window.setTimeout(async () => {
+        if (!libraryLoaded) {
+          scheduleTimer(5000);
+          return;
+        }
+        if (isCloudSyncingRef.current) {
+          scheduleTimer(5000);
+          return;
+        }
+        if (idleAutoSyncTriggeredRef.current) return;
+        idleAutoSyncTriggeredRef.current = true;
+        try {
+          await handleCloudSync('auto');
+        } catch {
+          // ignore idle auto-sync error, wait next idle cycle
+        }
+      }, delayMs);
+    };
+
+    const markActivity = (event?: Event) => {
+      if (event?.type === 'mousemove') {
+        const nowTs = Date.now();
+        if (nowTs - idleActivityAtRef.current < 800) {
+          return;
+        }
+        idleActivityAtRef.current = nowTs;
+      }
+      idleAutoSyncTriggeredRef.current = false;
+      scheduleTimer();
+    };
+
+    markActivity();
+    const activityEvents: Array<keyof WindowEventMap> = [
+      'mousemove',
+      'mousedown',
+      'keydown',
+      'wheel',
+      'touchstart',
+      'scroll'
+    ];
+    activityEvents.forEach((eventName) => {
+      window.addEventListener(eventName, markActivity, { passive: true });
+    });
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        markActivity();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      activityEvents.forEach((eventName) => {
+        window.removeEventListener(eventName, markActivity);
+      });
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      clearIdleTimer();
+    };
+  }, [
+    settingsForm.idleAutoSyncEnabled,
+    settingsForm.idleAutoSyncMinutes,
+    libraryLoaded
+  ]);
 
   const handleClearWebDavLock = async () => {
     setWebdavStatus('');
@@ -1208,6 +1343,20 @@ const App: React.FC = () => {
                   aria-label="同步功能"
                 >
                   <Cloud size={14} />
+                </button>
+              </Tooltip>
+              <Tooltip label="自动同步">
+                <button
+                  type="button"
+                  onClick={() => setSettingsSection('idle')}
+                  className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
+                    settingsSection === 'idle'
+                      ? 'bg-gray-200 text-gray-900'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
+                  }`}
+                  aria-label="自动同步"
+                >
+                  <Clock3 size={14} />
                 </button>
               </Tooltip>
               <Tooltip label="存储位置">
@@ -1406,6 +1555,52 @@ const App: React.FC = () => {
                     <div className="text-[11px] text-gray-500">{webdavStatus}</div>
                   ) : null}
                 </div>
+              ) : settingsSection === 'idle' ? (
+                <div className="rounded-lg border border-gray-200 p-3 space-y-3">
+                  <div className="text-xs font-semibold text-gray-700">空闲自动同步</div>
+                  <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                    <div className="text-xs text-gray-700">启用空闲自动同步</div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setSettingsForm((prev) => ({
+                          ...prev,
+                          idleAutoSyncEnabled: !prev.idleAutoSyncEnabled
+                        }))
+                      }
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        settingsForm.idleAutoSyncEnabled ? 'bg-emerald-500' : 'bg-gray-300'
+                      }`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                          settingsForm.idleAutoSyncEnabled ? 'translate-x-5' : 'translate-x-1'
+                        }`}
+                      />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2">
+                    <label className="text-xs text-gray-500">空闲时长（分钟）</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={1440}
+                      step={1}
+                      value={settingsForm.idleAutoSyncMinutes}
+                      onChange={(e) =>
+                        setSettingsForm((prev) => ({
+                          ...prev,
+                          idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(e.target.value)
+                        }))
+                      }
+                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      placeholder="10"
+                    />
+                  </div>
+                  <div className="text-[11px] text-gray-400">
+                    用户无操作达到设定时长后，会自动触发一次云同步。
+                  </div>
+                </div>
               ) : (
                 <div className="rounded-lg border border-gray-200 p-3 space-y-3">
                   <div className="text-xs font-semibold text-gray-700">文件存储位置</div>
@@ -1438,6 +1633,8 @@ const App: React.FC = () => {
                   ? '开启 AI 功能需填写 API KEY / URL / 模型。'
                   : settingsSection === 'sync'
                     ? 'WebDAV 密码使用系统安全存储，需单独保存凭据。'
+                    : settingsSection === 'idle'
+                      ? '空闲自动同步仅在启用后生效。'
                     : '修改存储位置后，建议等待迁移完成再进行云同步。'}
               </div>
               <button

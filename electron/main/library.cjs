@@ -16,7 +16,6 @@ const registerLibraryIpc = ({
   savePaperStateToSqlite,
   removeFileIfExists,
   deletePapersFromSqlite,
-  deletePaperVectorPoints,
   recordSyncChange
 }) => {
   ipcMain.handle('library-get-folders', async () => {
@@ -156,7 +155,6 @@ const registerLibraryIpc = ({
       await removeFileIfExists(path.join(paths.papersDir, `${getPaperArticleId(paperId)}.pdf`));
       await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
       deletePapersFromSqlite([paperId]);
-      await deletePaperVectorPoints([paperId]);
       const papers = await loadPapersFromSqlite();
       const remainIds = Array.isArray(papers)
         ? papers
@@ -187,7 +185,6 @@ const registerLibraryIpc = ({
         await removeFileIfExists(path.join(paths.statesDir, `${paperId}.json`));
       }
       deletePapersFromSqlite(ids);
-      await deletePaperVectorPoints(ids);
       const papers = await loadPapersFromSqlite();
       const idSet = new Set(ids);
       const remainIds = Array.isArray(papers)

@@ -1218,7 +1218,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   // State
   const [viewMode, setViewMode] = useState<ReaderMode>(ReaderMode.PDF);
-  const [activeTab, setActiveTab] = useState<AssistantTab>(AssistantTab.QUESTIONS);
+  const [activeTab, setActiveTab] = useState<AssistantTab>(AssistantTab.INFO);
   const [pdfZoom, setPdfZoom] = useState(100);
   const [mindmapZoom, setMindmapZoom] = useState(80);
   const [expandedTOC, setExpandedTOC] = useState<Set<string>>(new Set(['1', '2']));
@@ -1298,6 +1298,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
   const [infoRefreshError, setInfoRefreshError] = useState('');
+  const [infoTitleDraft, setInfoTitleDraft] = useState(String(paper.title || ''));
+  const [isInfoTitleEditing, setIsInfoTitleEditing] = useState(false);
+  const [infoTitleError, setInfoTitleError] = useState('');
+  const skipInfoTitleCommitRef = useRef(false);
   const logProgress = async (stage: string, paperId?: string) => {
     if (typeof window === 'undefined' || !window.electronAPI?.logProgress) return;
     try {
@@ -2225,6 +2229,72 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   };
 
+  const handleStartTitleEdit = () => {
+    if (isCloudSyncing) return;
+    skipInfoTitleCommitRef.current = false;
+    setInfoTitleDraft(String(paper.title || ''));
+    setInfoTitleError('');
+    setIsInfoTitleEditing(true);
+  };
+
+  const applyTitleToOutlineRoot = useCallback((nextTitle: string) => {
+    setOutlineNodes((prev) => {
+      if (!prev.length) return prev;
+      const root = prev[0];
+      if (root.title === nextTitle) return prev;
+      return [{ ...root, title: nextTitle }, ...prev.slice(1)];
+    });
+  }, []);
+
+  const applyTitleToDocRoot = useCallback((nextTitle: string) => {
+    setDocNodes((prev) => {
+      if (!Array.isArray(prev) || !prev.length) return prev;
+      let changed = false;
+      const next = prev.map((item) => {
+        if (!item || item.kind !== 'root') return item;
+        if (item.text === nextTitle) return item;
+        changed = true;
+        return {
+          ...item,
+          text: nextTitle,
+          updatedAt: Date.now()
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const handleCancelTitleEdit = () => {
+    skipInfoTitleCommitRef.current = true;
+    setInfoTitleDraft(String(paper.title || ''));
+    setInfoTitleError('');
+    setIsInfoTitleEditing(false);
+  };
+
+  const handleCommitTitleEdit = () => {
+    if (skipInfoTitleCommitRef.current) {
+      skipInfoTitleCommitRef.current = false;
+      return;
+    }
+    if (isCloudSyncing) return;
+    const nextTitle = String(infoTitleDraft || '').trim();
+    if (!nextTitle) {
+      setInfoTitleError('标题不能为空');
+      return;
+    }
+    const currentTitle = String(paper.title || '').trim();
+    if (nextTitle === currentTitle) {
+      setInfoTitleError('');
+      setIsInfoTitleEditing(false);
+      return;
+    }
+    applyTitleToOutlineRoot(nextTitle);
+    applyTitleToDocRoot(nextTitle);
+    onUpdatePaper(paper.id, { title: nextTitle });
+    setInfoTitleError('');
+    setIsInfoTitleEditing(false);
+  };
+
   const handleToolbarCloudSync = async () => {
     if (isCloudSyncing || !onCloudSync) return;
     try {
@@ -2237,6 +2307,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   useEffect(() => {
     pdfDocRef.current = null;
   }, [paper.id]);
+
+  useEffect(() => {
+    setInfoTitleDraft(String(paper.title || ''));
+    setInfoTitleError('');
+    setIsInfoTitleEditing(false);
+  }, [paper.id, paper.title]);
 
   const clearSelection = useCallback(() => {
     setSelectionText('');
@@ -6392,14 +6468,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   }, [paper.id, cloudRefreshToken]);
 
   useEffect(() => {
-    setOutlineNodes((prev) => {
-      if (!prev.length) return prev;
-      const root = prev[0];
-      const nextTitle = paper.title || 'Document';
-      if (root.title === nextTitle) return prev;
-      return [{ ...root, title: nextTitle }, ...prev.slice(1)];
-    });
-  }, [paper.title]);
+    applyTitleToOutlineRoot(paper.title || 'Document');
+    applyTitleToDocRoot(paper.title || 'Document');
+  }, [paper.title, applyTitleToOutlineRoot, applyTitleToDocRoot]);
 
   // --- Components ---
 
@@ -7208,6 +7279,14 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       >
         {/* Tabs: Matches App Title Bar Height (h-10) */}
         <div className="h-10 flex border-b border-gray-200">
+          <Tooltip label="文章信息" wrapperClassName="flex-1 h-full">
+            <button 
+               onClick={() => setActiveTab(AssistantTab.INFO)}
+               className={`w-full h-full flex justify-center items-center border-b-2 transition-colors ${activeTab === AssistantTab.INFO ? 'border-blue-400 text-blue-600 bg-blue-50' : 'border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-200'}`}
+            >
+               <FileText size={16} />
+            </button>
+          </Tooltip>
           <Tooltip label="阅读问题" wrapperClassName="flex-1 h-full">
             <button 
               onClick={() => setActiveTab(AssistantTab.QUESTIONS)}
@@ -7218,14 +7297,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 <path d="M6.7 6.2C6.9 5.4 7.6 4.9 8.4 4.9C9.4 4.9 10.2 5.6 10.2 6.6C10.2 7.2 9.9 7.6 9.4 7.9C8.8 8.3 8.6 8.6 8.6 9.1V9.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
                 <circle cx="8.6" cy="11.3" r="1" fill="currentColor" />
               </svg>
-            </button>
-          </Tooltip>
-          <Tooltip label="文章信息" wrapperClassName="flex-1 h-full">
-            <button 
-               onClick={() => setActiveTab(AssistantTab.INFO)}
-               className={`w-full h-full flex justify-center items-center border-b-2 transition-colors ${activeTab === AssistantTab.INFO ? 'border-blue-400 text-blue-600 bg-blue-50' : 'border-transparent text-gray-400 hover:text-gray-600 hover:bg-gray-200'}`}
-            >
-               <FileText size={16} />
             </button>
           </Tooltip>
           <Tooltip label="询问AI" wrapperClassName="flex-1 h-full">
@@ -7426,8 +7497,51 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                 </div>
                 <div className="space-y-4 text-sm">
                   <div>
-                    <div className="text-gray-400 text-xs uppercase mb-1">标题</div>
-                    <div className="font-medium">{paper.title}</div>
+                    <div className="text-gray-400 text-xs uppercase mb-1 flex items-center justify-between">
+                      <span>标题</span>
+                      {!isInfoTitleEditing ? (
+                        <button
+                          type="button"
+                          onClick={handleStartTitleEdit}
+                          disabled={isCloudSyncing}
+                          className="p-1 rounded-md text-gray-400 hover:bg-gray-100 hover:text-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                          aria-label="编辑标题"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      ) : null}
+                    </div>
+                    {isInfoTitleEditing ? (
+                      <div className="space-y-2">
+                        <input
+                          type="text"
+                          value={infoTitleDraft}
+                          onChange={(event) => {
+                            setInfoTitleDraft(event.target.value);
+                            if (infoTitleError) setInfoTitleError('');
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.preventDefault();
+                              event.currentTarget.blur();
+                            }
+                            if (event.key === 'Escape') {
+                              event.preventDefault();
+                              handleCancelTitleEdit();
+                              event.currentTarget.blur();
+                            }
+                          }}
+                          onBlur={handleCommitTitleEdit}
+                          className="w-full rounded-md border border-gray-300 px-2 py-1.5 text-sm font-medium text-gray-800 outline-none focus:ring-2 focus:ring-blue-200"
+                          placeholder="输入文章标题"
+                        />
+                        {infoTitleError ? (
+                          <div className="text-xs text-red-500">{infoTitleError}</div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="font-medium break-words">{paper.title || '-'}</div>
+                    )}
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">作者</div>

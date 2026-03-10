@@ -8,7 +8,6 @@ module.exports = function createSqliteModule(deps = {}) {
     sanitizePaperForMeta,
     normalizePaperForStorage,
     getPaperArticleId,
-    deletePaperVectorPoints,
     enqueueSummaryVectorSync,
     migrateExistingLibraryToSqlite
   } = deps;
@@ -19,7 +18,7 @@ module.exports = function createSqliteModule(deps = {}) {
   let libraryStoreReadyPromise = null;
   let syncQueueSuppressedDepth = 0;
 
-  const SYNC_ENTITY_TYPES = new Set(['folders', 'papers', 'paper_state', 'pdf']);
+  const SYNC_ENTITY_TYPES = new Set(['folders', 'papers', 'paper_state', 'pdf', 'paper_vector']);
   const SYNC_ACTIONS = new Set(['upsert', 'delete']);
 
   const safeJsonParse = (value, fallback) => {
@@ -117,6 +116,16 @@ module.exports = function createSqliteModule(deps = {}) {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS paper_summary_vectors (
+        paper_id TEXT PRIMARY KEY,
+        summary_hash TEXT NOT NULL DEFAULT '',
+        model TEXT NOT NULL DEFAULT '',
+        dim INTEGER NOT NULL DEFAULT 0,
+        vector_json TEXT NOT NULL DEFAULT '[]',
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS sync_queue (
         entity_type TEXT NOT NULL,
         entity_id TEXT NOT NULL,
@@ -135,6 +144,7 @@ module.exports = function createSqliteModule(deps = {}) {
 
       CREATE INDEX IF NOT EXISTS idx_papers_sort_order ON papers(sort_order);
       CREATE INDEX IF NOT EXISTS idx_papers_folder_id ON papers(folder_id);
+      CREATE INDEX IF NOT EXISTS idx_paper_summary_vectors_updated_at ON paper_summary_vectors(updated_at);
       CREATE INDEX IF NOT EXISTS idx_sync_queue_updated_at ON sync_queue(updated_at);
     `);
     const columns = db.prepare("PRAGMA table_info('papers')").all();
@@ -287,9 +297,179 @@ module.exports = function createSqliteModule(deps = {}) {
     db.prepare(`DELETE FROM paper_states WHERE paper_id IN (${placeholders})`).run(...ids);
   };
 
+  const normalizeVectorValues = (values) =>
+    (Array.isArray(values) ? values : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value));
+
+  const mapPaperVectorRow = (row) => {
+    const paperId = String(row?.paper_id || '').trim();
+    if (!paperId) return null;
+    const vector = normalizeVectorValues(safeJsonParse(row?.vector_json, []));
+    if (!vector.length) return null;
+    return {
+      paperId,
+      summaryHash: String(row?.summary_hash || '').trim(),
+      model: String(row?.model || '').trim(),
+      dim: Math.max(1, Number(row?.dim || vector.length || 0)),
+      vector,
+      updatedAt: Number(row?.updated_at || 0)
+    };
+  };
+
+  const loadPaperVectorsFromSqlite = (paperIds = null) => {
+    const db = getLibraryDb();
+    const ids = Array.isArray(paperIds)
+      ? Array.from(new Set(paperIds.map((id) => String(id || '').trim()).filter(Boolean)))
+      : null;
+    let rows = [];
+    if (ids) {
+      if (!ids.length) return [];
+      const placeholders = ids.map(() => '?').join(', ');
+      rows = db
+        .prepare(
+          `SELECT paper_id, summary_hash, model, dim, vector_json, updated_at
+           FROM paper_summary_vectors
+           WHERE paper_id IN (${placeholders})
+           ORDER BY updated_at ASC, paper_id ASC`
+        )
+        .all(...ids);
+    } else {
+      rows = db
+        .prepare(
+          `SELECT paper_id, summary_hash, model, dim, vector_json, updated_at
+           FROM paper_summary_vectors
+           ORDER BY updated_at ASC, paper_id ASC`
+        )
+        .all();
+    }
+    return rows.map((row) => mapPaperVectorRow(row)).filter(Boolean);
+  };
+
+  const savePaperVectorsToSqlite = (vectors = [], options = {}) => {
+    const source = Array.isArray(vectors) ? vectors : [];
+    const deduped = new Map();
+    source.forEach((item) => {
+      const paperId = String(item?.paperId || '').trim();
+      if (!paperId) return;
+      const vector = normalizeVectorValues(item?.vector);
+      if (!vector.length) return;
+      const summaryHash = String(item?.summaryHash || '').trim();
+      const model = String(item?.model || '').trim();
+      const dim = Math.max(1, Number(item?.dim || vector.length || 0));
+      const updatedAt = Number(item?.updatedAt || Date.now());
+      deduped.set(paperId, {
+        paperId,
+        summaryHash,
+        model,
+        dim,
+        vector,
+        vectorJson: JSON.stringify(vector),
+        updatedAt: Number.isFinite(updatedAt) && updatedAt > 0 ? updatedAt : Date.now()
+      });
+    });
+    const normalized = Array.from(deduped.values());
+    if (!normalized.length) return { saved: 0, skipped: 0 };
+
+    const db = getLibraryDb();
+    const placeholders = normalized.map(() => '?').join(', ');
+    const existingRows = db
+      .prepare(
+        `SELECT paper_id, summary_hash, model, dim, vector_json
+         FROM paper_summary_vectors
+         WHERE paper_id IN (${placeholders})`
+      )
+      .all(...normalized.map((item) => item.paperId));
+    const existingById = new Map(
+      existingRows.map((row) => [String(row?.paper_id || '').trim(), row]).filter((entry) => entry[0])
+    );
+    const upsert = db.prepare(
+      `
+        INSERT INTO paper_summary_vectors (paper_id, summary_hash, model, dim, vector_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(paper_id) DO UPDATE SET
+          summary_hash = excluded.summary_hash,
+          model = excluded.model,
+          dim = excluded.dim,
+          vector_json = excluded.vector_json,
+          updated_at = excluded.updated_at
+      `
+    );
+    let changedCount = 0;
+    const changedItems = [];
+    const tx = db.transaction((items) => {
+      items.forEach((item) => {
+        const existing = existingById.get(item.paperId);
+        const unchanged =
+          existing &&
+          String(existing.summary_hash || '') === item.summaryHash &&
+          String(existing.model || '') === item.model &&
+          Number(existing.dim || 0) === item.dim &&
+          String(existing.vector_json || '') === item.vectorJson;
+        if (unchanged) return;
+        upsert.run(
+          item.paperId,
+          item.summaryHash,
+          item.model,
+          item.dim,
+          item.vectorJson,
+          item.updatedAt
+        );
+        changedCount += 1;
+        changedItems.push(item);
+      });
+    });
+    tx(normalized);
+    changedItems.forEach((item) => {
+      recordSyncChange(
+        {
+          entityType: 'paper_vector',
+          entityId: item.paperId,
+          action: 'upsert',
+          payload: {
+            paperId: item.paperId,
+            summaryHash: item.summaryHash,
+            model: item.model,
+            dim: item.dim,
+            vector: item.vector
+          },
+          updatedAt: item.updatedAt
+        },
+        options
+      );
+    });
+    return {
+      saved: changedCount,
+      skipped: Math.max(0, normalized.length - changedCount)
+    };
+  };
+
+  const deletePaperVectorsFromSqlite = (paperIds = [], options = {}) => {
+    const ids = Array.from(new Set((Array.isArray(paperIds) ? paperIds : []).map((id) => String(id || '').trim()))).filter(
+      Boolean
+    );
+    if (!ids.length) return { deleted: 0 };
+    const db = getLibraryDb();
+    const placeholders = ids.map(() => '?').join(', ');
+    const result = db.prepare(`DELETE FROM paper_summary_vectors WHERE paper_id IN (${placeholders})`).run(...ids);
+    ids.forEach((paperId) => {
+      recordSyncChange(
+        {
+          entityType: 'paper_vector',
+          entityId: paperId,
+          action: 'delete',
+          payload: { paperId }
+        },
+        options
+      );
+    });
+    return { deleted: Number(result?.changes || 0) };
+  };
+
   const deletePapersFromSqlite = (paperIds = [], options = {}) => {
     const ids = Array.isArray(paperIds) ? paperIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
     if (!ids.length) return [];
+    deletePaperVectorsFromSqlite(ids, options);
     deletePaperStatesFromSqlite(ids);
     const db = getLibraryDb();
     const placeholders = ids.map(() => '?').join(', ');
@@ -380,13 +560,26 @@ module.exports = function createSqliteModule(deps = {}) {
       const stateRows = db
         .prepare('SELECT paper_id, state_json FROM paper_states ORDER BY updated_at ASC, paper_id ASC')
         .all();
+      const vectorTableExists = Boolean(
+        db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'paper_summary_vectors'").get()
+      );
+      const vectorRows = vectorTableExists
+        ? db
+            .prepare(
+              `SELECT paper_id, summary_hash, model, dim, vector_json, updated_at
+               FROM paper_summary_vectors
+               ORDER BY updated_at ASC, paper_id ASC`
+            )
+            .all()
+        : [];
       return {
         folders,
         papers: paperRows.map((row) => mapSqlitePaperRow(row, paths)),
         states: stateRows.map((row) => ({
           paperId: String(row?.paper_id || '').trim(),
           state: safeJsonParse(row?.state_json, {})
-        }))
+        })),
+        vectors: vectorRows.map((row) => mapPaperVectorRow(row)).filter(Boolean)
       };
     } finally {
       try {
@@ -613,7 +806,7 @@ module.exports = function createSqliteModule(deps = {}) {
     writeTransaction(normalizedPapers);
 
     if (removedPaperIds.length) {
-      await deletePaperVectorPoints(removedPaperIds);
+      deletePaperVectorsFromSqlite(removedPaperIds, options);
     }
 
     const persistedPapers = normalizedPapers.map((item) => item.paper);
@@ -774,6 +967,9 @@ module.exports = function createSqliteModule(deps = {}) {
     savePaperStateToSqlite,
     loadPaperStateFromSqlite,
     loadPaperStatesFromSqlite,
+    loadPaperVectorsFromSqlite,
+    savePaperVectorsToSqlite,
+    deletePaperVectorsFromSqlite,
     ensureLibraryStoreReady,
     ensureLibrary
   };

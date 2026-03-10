@@ -53,10 +53,13 @@ const createWebDavSyncModule = (deps = {}) => {
     loadFoldersFromSqlite,
     loadPapersFromSqlite,
     loadPaperStatesFromSqlite,
+    loadPaperVectorsFromSqlite,
     saveFoldersToSqlite,
     savePapersToSqlite,
     savePaperStateToSqlite,
+    savePaperVectorsToSqlite,
     deletePaperStatesFromSqlite,
+    deletePaperVectorsFromSqlite,
     loadLibraryDataFromSqliteFile,
     removeFileIfExists,
     getPaperArticleId,
@@ -472,6 +475,11 @@ const createWebDavSyncModule = (deps = {}) => {
         .map((item) => [String(item?.paperId || '').trim(), item?.state || {}])
         .filter((entry) => entry[0])
     );
+    const vectorMap = new Map(
+      (await loadPaperVectorsFromSqlite())
+        .map((item) => [String(item?.paperId || '').trim(), item || null])
+        .filter((entry) => entry[0] && entry[1])
+    );
     const pdfChanges = [];
 
     list.forEach((change) => {
@@ -495,6 +503,31 @@ const createWebDavSyncModule = (deps = {}) => {
         stateMap.set(paperId, change?.payload?.state || {});
         return;
       }
+      if (change.entityType === 'paper_vector') {
+        const paperId = String(change?.payload?.paperId || change.entityId || '').trim();
+        if (!paperId) return;
+        if (change.action === 'delete') {
+          vectorMap.delete(paperId);
+          return;
+        }
+        const rawVector = Array.isArray(change?.payload?.vector) ? change.payload.vector : [];
+        const vector = rawVector
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value));
+        if (!vector.length) {
+          vectorMap.delete(paperId);
+          return;
+        }
+        vectorMap.set(paperId, {
+          paperId,
+          summaryHash: String(change?.payload?.summaryHash || '').trim(),
+          model: String(change?.payload?.model || '').trim(),
+          dim: Math.max(1, Number(change?.payload?.dim || vector.length || 0)),
+          vector,
+          updatedAt: Number(change?.updatedAt || now())
+        });
+        return;
+      }
       if (change.entityType === 'pdf') {
         pdfChanges.push(change);
       }
@@ -513,14 +546,33 @@ const createWebDavSyncModule = (deps = {}) => {
 
       const staleStateIds = Array.from(stateMap.keys()).filter((paperId) => !retainPaperIds.has(paperId));
       staleStateIds.forEach((paperId) => stateMap.delete(paperId));
+      const staleVectorIds = Array.from(vectorMap.keys()).filter((paperId) => !retainPaperIds.has(paperId));
+      staleVectorIds.forEach((paperId) => vectorMap.delete(paperId));
       const localStateIds = (await loadPaperStatesFromSqlite())
         .map((item) => String(item?.paperId || '').trim())
         .filter(Boolean);
       deletePaperStatesFromSqlite(localStateIds.filter((paperId) => !stateMap.has(paperId)));
+      const localVectorIds = (await loadPaperVectorsFromSqlite())
+        .map((item) => String(item?.paperId || '').trim())
+        .filter(Boolean);
+      deletePaperVectorsFromSqlite(localVectorIds.filter((paperId) => !vectorMap.has(paperId)), {
+        skipSyncQueue: true
+      });
       for (const [paperId, state] of stateMap.entries()) {
         // eslint-disable-next-line no-await-in-loop
         await savePaperStateToSqlite(paperId, state || {}, { skipSyncQueue: true });
       }
+      savePaperVectorsToSqlite(
+        Array.from(vectorMap.values()).map((item) => ({
+          paperId: String(item?.paperId || '').trim(),
+          summaryHash: String(item?.summaryHash || '').trim(),
+          model: String(item?.model || '').trim(),
+          dim: Number(item?.dim || 0),
+          vector: Array.isArray(item?.vector) ? item.vector : [],
+          updatedAt: Number(item?.updatedAt || now())
+        })),
+        { skipSyncQueue: true }
+      );
     });
 
     let downloadedPdfCount = 0;
@@ -595,10 +647,16 @@ const createWebDavSyncModule = (deps = {}) => {
       const folders = Array.isArray(remoteData?.folders) ? remoteData.folders : [];
       const papers = Array.isArray(remoteData?.papers) ? remoteData.papers : [];
       const states = Array.isArray(remoteData?.states) ? remoteData.states : [];
+      const vectors = Array.isArray(remoteData?.vectors) ? remoteData.vectors : [];
       const stateMap = new Map(
         states
           .map((item) => [String(item?.paperId || '').trim(), item?.state || {}])
           .filter((entry) => entry[0])
+      );
+      const vectorMap = new Map(
+        vectors
+          .map((item) => [String(item?.paperId || '').trim(), item || null])
+          .filter((entry) => entry[0] && entry[1])
       );
       await withSyncQueueSuppressed(async () => {
         await saveFoldersToSqlite(folders, { skipSyncQueue: true });
@@ -613,10 +671,34 @@ const createWebDavSyncModule = (deps = {}) => {
           .map((item) => String(item?.paperId || '').trim())
           .filter(Boolean);
         deletePaperStatesFromSqlite(localStateIds.filter((paperId) => !retainIds.has(paperId)));
+        const localVectorIds = (await loadPaperVectorsFromSqlite())
+          .map((item) => String(item?.paperId || '').trim())
+          .filter(Boolean);
+        const retainVectorIds = new Set(
+          Array.from(vectorMap.keys()).filter((paperId) => retainIds.has(paperId))
+        );
+        deletePaperVectorsFromSqlite(
+          localVectorIds.filter((paperId) => !retainVectorIds.has(paperId)),
+          { skipSyncQueue: true }
+        );
         for (const paperId of retainIds) {
           // eslint-disable-next-line no-await-in-loop
           await savePaperStateToSqlite(paperId, stateMap.get(paperId) || {}, { skipSyncQueue: true });
         }
+        savePaperVectorsToSqlite(
+          Array.from(retainVectorIds)
+            .map((paperId) => vectorMap.get(paperId))
+            .filter(Boolean)
+            .map((item) => ({
+              paperId: String(item?.paperId || '').trim(),
+              summaryHash: String(item?.summaryHash || '').trim(),
+              model: String(item?.model || '').trim(),
+              dim: Number(item?.dim || 0),
+              vector: Array.isArray(item?.vector) ? item.vector : [],
+              updatedAt: Number(item?.updatedAt || now())
+            })),
+          { skipSyncQueue: true }
+        );
       });
       const { downloadedPdfCount, downloadedPdfBytes } = await syncLocalPdfFilesFromRemote(
         client,

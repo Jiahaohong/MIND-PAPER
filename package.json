@@ -38,25 +38,13 @@
         "dmg",
         "zip"
       ],
-      "identity": null,
-      "extraResources": [
-        {
-          "from": "resources/qdrant/qdrant-macos",
-          "to": "qdrant/qdrant-macos"
-        }
-      ]
+      "identity": null
     },
     "win": {
       "icon": "assets/mind-paper-v2.ico",
       "target": [
         "nsis",
         "zip"
-      ],
-      "extraResources": [
-        {
-          "from": "resources/qdrant/qdrant-win.exe",
-          "to": "qdrant/qdrant-win.exe"
-        }
       ]
     }
   },

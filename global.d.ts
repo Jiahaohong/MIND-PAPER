@@ -84,6 +84,8 @@ declare global {
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        idleAutoSyncEnabled?: boolean;
+        idleAutoSyncMinutes?: number;
         libraryPath?: string;
         webdavServer?: string;
         webdavUsername?: string;
@@ -96,6 +98,8 @@ declare global {
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        idleAutoSyncEnabled?: boolean;
+        idleAutoSyncMinutes?: number;
         libraryPath?: string;
         webdavServer?: string;
         webdavUsername?: string;
@@ -106,6 +110,8 @@ declare global {
         baseUrl?: string;
         model?: string;
         parsePdfWithAI?: boolean;
+        idleAutoSyncEnabled?: boolean;
+        idleAutoSyncMinutes?: number;
         libraryPath?: string;
         webdavServer?: string;
         webdavUsername?: string;
