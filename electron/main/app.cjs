@@ -41,6 +41,7 @@ let settingsLoaded = false;
 let writeChain = Promise.resolve();
 let pendingWrites = 0;
 let isForceQuitting = false;
+let forceQuitTimer = null;
 let runtimeSettings = {
   translationEngine: 'cnki',
   apiKey: '',
@@ -124,6 +125,29 @@ const enqueueWrite = (task) => {
 };
 
 const flushWrites = () => writeChain;
+
+const forceExitSoon = (delayMs = 2000) => {
+  if (forceQuitTimer) return;
+  forceQuitTimer = setTimeout(() => {
+    try {
+      app.exit(0);
+    } catch {
+      // ignore forced exit errors
+    }
+  }, delayMs);
+};
+
+const requestAppQuit = () => {
+  if (isForceQuitting) return;
+  isForceQuitting = true;
+  try {
+    closeLibraryDb();
+  } catch {
+    // ignore close db errors during quit
+  }
+  forceExitSoon();
+  app.quit();
+};
 
 const resolveLibraryPath = (value) => {
   const raw = String(value || '').trim();
@@ -1800,13 +1824,34 @@ ipcMain.handle('vector-debug-dump-qdrant', async () => {
 });
 
 app.whenReady().then(() => {
-  const createWindow = () =>
-    createMainWindow({
+  const bindCtrlQQuitShortcut = (win) => {
+    if (!win?.webContents) return;
+    win.webContents.on('before-input-event', (event, input = {}) => {
+      const key = String(input?.key || '').toLowerCase();
+      if (
+        input?.type === 'keyDown' &&
+        input?.control &&
+        !input?.meta &&
+        !input?.alt &&
+        !input?.shift &&
+        key === 'q'
+      ) {
+        event.preventDefault();
+        requestAppQuit();
+      }
+    });
+  };
+
+  const createWindow = () => {
+    const win = createMainWindow({
       isDev,
       devServerURL,
       preloadPath: path.join(__dirname, '..', 'bridge', 'preload.cjs'),
       indexHtmlPath: path.join(__dirname, '..', '..', 'dist', 'index.html')
     });
+    bindCtrlQQuitShortcut(win);
+    return win;
+  };
 
   createWindow();
 
@@ -1829,17 +1874,20 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', (event) => {
-  if (isForceQuitting) return;
-  event.preventDefault();
+app.on('before-quit', () => {
   isForceQuitting = true;
-  Promise.resolve()
-    .then(async () => {
-      closeLibraryDb();
-    })
-    .finally(() => {
-      app.quit();
-    });
+  try {
+    closeLibraryDb();
+  } catch {
+    // ignore close db errors on quit
+  }
+});
+
+app.on('will-quit', () => {
+  if (forceQuitTimer) {
+    clearTimeout(forceQuitTimer);
+    forceQuitTimer = null;
+  }
 });
 
 app.on('window-all-closed', () => {
