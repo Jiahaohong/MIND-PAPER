@@ -114,6 +114,23 @@ const cleanAuthorText = (value: string): string => {
   return text.slice(0, 200).trim();
 };
 
+const normalizeTitleForOpenSourceSearch = (value: string): string => {
+  let text = String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1')
+    .trim();
+  if (!text) return '';
+  // Decorative drop-caps may split words: "A ttention" -> "Attention".
+  for (let i = 0; i < 4; i += 1) {
+    const next = text.replace(/\b([A-Z])\s+([a-z]{2,})\b/g, '$1$2');
+    if (next === text) break;
+    text = next;
+  }
+  // Merge spaced acronyms like "N L P" -> "NLP".
+  text = text.replace(/\b((?:[A-Z]\s+){2,}[A-Z])\b/g, (match) => match.replace(/\s+/g, ''));
+  return text;
+};
+
 export const resolvePaperMetadata = async (params: {
   fileData: ArrayBuffer;
   fallbackTitle: string;
@@ -196,7 +213,17 @@ export const resolvePaperMetadata = async (params: {
       seedTitle = String(local?.title || '').trim();
     }
     if (!seedTitle) return null;
-    const remote = await openSourceSearcher(seedTitle);
+    const normalizedSeedTitle = normalizeTitleForOpenSourceSearch(seedTitle);
+    const searchTitles =
+      normalizedSeedTitle && normalizedSeedTitle !== seedTitle
+        ? [seedTitle, normalizedSeedTitle]
+        : [seedTitle];
+    let remote: OpenSourcePaperMetadata | null = null;
+    for (const queryTitle of searchTitles) {
+      // eslint-disable-next-line no-await-in-loop
+      remote = await openSourceSearcher(queryTitle);
+      if (remote) break;
+    }
     if (!remote) return null;
     const rawAuthors = Array.isArray(remote.authors)
       ? remote.authors.map((item) => String(item ?? ''))

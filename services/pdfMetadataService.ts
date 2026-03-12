@@ -133,9 +133,9 @@ export const searchPaperOpenSourceByTitle = async (
 ): Promise<OpenSourcePaperMetadata | null> => {
   const query = String(title || '').trim();
   if (!query) return null;
-  const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
-  if (openAlex) return openAlex;
-  return searchSemanticScholarByTitle(query).catch(() => null);
+  const semantic = await searchSemanticScholarByTitle(query).catch(() => null);
+  if (semantic) return semantic;
+  return searchOpenAlexByTitle(query).catch(() => null);
 };
 
 const ensureWorker = () => {
@@ -152,6 +152,20 @@ const normalizeLine = (value: string) =>
     .replace(/\s+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1')
     .trim();
+
+const normalizeTitleCandidateText = (value: string) => {
+  let text = normalizeLine(String(value || ''));
+  if (!text) return '';
+  // Decorative drop-caps in some PDFs may split words like "A ttention" / "M odel".
+  for (let i = 0; i < 4; i += 1) {
+    const next = text.replace(/\b([A-Z])\s+([a-z]{2,})\b/g, '$1$2');
+    if (next === text) break;
+    text = next;
+  }
+  // Merge spaced acronyms like "N L P" -> "NLP".
+  text = text.replace(/\b((?:[A-Z]\s+){2,}[A-Z])\b/g, (match) => match.replace(/\s+/g, ''));
+  return text;
+};
 
 const ABSTRACT_HEADING_REGEX = /^(abstract|摘要|summary)\b[:：]?\s*/i;
 const KEYWORD_HEADING_REGEX = /^(keywords?|关键[词字])\b[:：]?/i;
@@ -212,8 +226,9 @@ const buildLines = (items: any[]): LineItem[] => {
     for (let i = 1; i < ordered.length; i += 1) {
       const prev = ordered[i - 1];
       const current = ordered[i];
-      // Large x-gap usually means the next chunk belongs to another column.
-      if (current.x - prev.x > 80) {
+      // Dynamic threshold: large-font title lines may have decorative initial gaps.
+      const gapThreshold = Math.max(80, Math.max(prev.size, current.size) * 4.2);
+      if (current.x - prev.x > gapThreshold) {
         segments.push([current]);
       } else {
         segments[segments.length - 1].push(current);
@@ -751,21 +766,24 @@ const extractMetadataFromLines = (lines: LineItem[], fallbackTitle: string) => {
   const keywordLineIndex = lines.findIndex((line) => KEYWORD_HEADING_REGEX.test(line.text));
 
   const headingLimit = abstractLineIndex > 0 ? abstractLineIndex : Math.min(lines.length, 12);
-  const headingLines = lines.slice(0, headingLimit);
+  const headingLines = lines
+    .slice(0, headingLimit)
+    .map((line, index) => ({ index, line, normalizedText: normalizeTitleCandidateText(line.text) }));
   const titleCandidates = headingLines.filter(
-    (line) =>
-      line.text.length >= 8 &&
-      line.text.length <= 220 &&
-      !/^(abstract|摘要|summary|keywords?|关键[词字])\b[:：]?/i.test(line.text)
+    ({ normalizedText }) =>
+      normalizedText.length >= 8 &&
+      normalizedText.length <= 220 &&
+      !/^(abstract|摘要|summary|keywords?|关键[词字])\b[:：]?/i.test(normalizedText)
   );
-  const maxSize = titleCandidates.reduce((max, line) => Math.max(max, line.size), 0);
-  const selectedTitleLines = titleCandidates.filter((line) => line.size >= maxSize - 0.3).slice(0, 2);
-  const title = (selectedTitleLines.map((line) => line.text).join(' ').trim() || fallbackTitle).slice(0, 280);
-  const titleLineTexts = new Set(selectedTitleLines.map((line) => line.text));
-  const titleIndices = lines
-    .map((line, index) => (titleLineTexts.has(line.text) ? index : -1))
-    .filter((index) => index >= 0);
-  const titleIndex = lines.findIndex((line) => line.text === titleCandidates[0]?.text);
+  const maxSize = titleCandidates.reduce((max, item) => Math.max(max, item.line.size), 0);
+  const selectedTitleLines = titleCandidates
+    .filter((item) => item.line.size >= maxSize - 0.3)
+    .slice(0, 2);
+  const title = (
+    selectedTitleLines.map((item) => item.normalizedText).join(' ').trim() || fallbackTitle
+  ).slice(0, 280);
+  const titleIndices = selectedTitleLines.map((item) => item.index);
+  const titleIndex = titleCandidates[0]?.index ?? -1;
   const lastTitleIndex = titleIndices.length ? Math.max(...titleIndices) : titleIndex;
   const authorStart = lastTitleIndex >= 0 ? lastTitleIndex + 1 : 1;
   const authorEnd =

@@ -1392,19 +1392,8 @@ const searchPaperOpenSource = async (title) => {
   const query = String(title || '').trim();
   if (!query) return null;
   let primary = null;
-  const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
-  if (openAlex) {
-    primary = {
-      source: 'OpenAlex',
-      title: String(openAlex?.title || '').trim(),
-      authors: Array.isArray(openAlex?.authors) ? openAlex.authors.filter(Boolean) : [],
-      publication_date: String(openAlex?.publication_date || '').trim(),
-      venue: String(openAlex?.venue || '').trim(),
-      doi: String(openAlex?.doi || '').trim() || null
-    };
-  } else {
-    const semantic = await searchSemanticScholarByTitle(query).catch(() => null);
-    if (!semantic) return null;
+  const semantic = await searchSemanticScholarByTitle(query).catch(() => null);
+  if (semantic) {
     primary = {
       source: 'Semantic Scholar',
       title: String(semantic?.title || '').trim(),
@@ -1412,6 +1401,17 @@ const searchPaperOpenSource = async (title) => {
       publication_date: String(semantic?.publication_date || '').trim(),
       venue: String(semantic?.venue || '').trim(),
       doi: String(semantic?.doi || '').trim() || null
+    };
+  } else {
+    const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
+    if (!openAlex) return null;
+    primary = {
+      source: 'OpenAlex',
+      title: String(openAlex?.title || '').trim(),
+      authors: Array.isArray(openAlex?.authors) ? openAlex.authors.filter(Boolean) : [],
+      publication_date: String(openAlex?.publication_date || '').trim(),
+      venue: String(openAlex?.venue || '').trim(),
+      doi: String(openAlex?.doi || '').trim() || null
     };
   }
   console.log(
