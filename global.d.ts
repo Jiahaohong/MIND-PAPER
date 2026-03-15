@@ -227,6 +227,15 @@ declare global {
         getPapers?: () => Promise<any>;
         savePapers?: (payload: any) => Promise<{ ok: boolean }>;
         saveSnapshot?: (payload: { folders: any[]; papers: any[] }) => Promise<{ ok: boolean }>;
+        exportMarkdown?: (payload: {
+          paperTitle?: string;
+          content: string;
+        }) => Promise<{
+          ok: boolean;
+          canceled?: boolean;
+          filePath?: string;
+          error?: string;
+        }>;
         savePdf?: (payload: { paperId: string; data: ArrayBuffer }) => Promise<{
           ok: boolean;
           filePath?: string;

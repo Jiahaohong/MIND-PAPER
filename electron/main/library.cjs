@@ -1,5 +1,7 @@
 const registerLibraryIpc = ({
   ipcMain,
+  BrowserWindow,
+  dialog,
   enqueueWrite,
   ensureLibraryStoreReady,
   getLibraryPaths,
@@ -18,6 +20,12 @@ const registerLibraryIpc = ({
   deletePapersFromSqlite,
   recordSyncChange
 }) => {
+  const sanitizeMarkdownFileName = (value) => {
+    const base = String(value || '').trim().replace(/\.md$/i, '');
+    const safe = base.replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ').replace(/\s+/g, ' ').trim();
+    return `${safe || 'mind-paper-export'}.md`;
+  };
+
   ipcMain.handle('library-get-folders', async () => {
     await ensureLibraryStoreReady();
     const folders = await loadFoldersFromSqlite();
@@ -65,6 +73,34 @@ const registerLibraryIpc = ({
       await writeJsonFile(paths.indexPath, { updatedAt: Date.now() });
       return { ok: true };
     });
+  });
+
+  ipcMain.handle('library-export-markdown', async (event, payload = {}) => {
+    const content = String(payload?.content || '');
+    if (!content.trim()) {
+      return { ok: false, error: '缺少导出内容' };
+    }
+    if (!dialog?.showSaveDialog) {
+      return { ok: false, error: '当前环境不支持导出' };
+    }
+    const defaultFileName = sanitizeMarkdownFileName(payload?.paperTitle || 'mind-paper-export');
+    const ownerWindow =
+      BrowserWindow?.fromWebContents?.(event.sender) || BrowserWindow?.getFocusedWindow?.() || null;
+    const dialogOptions = {
+      title: '导出 Markdown',
+      defaultPath: defaultFileName,
+      buttonLabel: '导出',
+      filters: [{ name: 'Markdown', extensions: ['md'] }]
+    };
+    const result = ownerWindow
+      ? await dialog.showSaveDialog(ownerWindow, dialogOptions)
+      : await dialog.showSaveDialog(dialogOptions);
+    if (result.canceled || !result.filePath) {
+      return { ok: true, canceled: true };
+    }
+    const finalPath = /\.md$/i.test(result.filePath) ? result.filePath : `${result.filePath}.md`;
+    await fs.writeFile(finalPath, content, 'utf8');
+    return { ok: true, canceled: false, filePath: finalPath };
   });
 
   ipcMain.handle('library-save-pdf', async (_event, payload = {}) => {

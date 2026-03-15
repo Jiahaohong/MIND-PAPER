@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getPapers: () => ipcRenderer.invoke('library-get-papers'),
     savePapers: (payload) => ipcRenderer.invoke('library-save-papers', payload),
     saveSnapshot: (payload) => ipcRenderer.invoke('library-save-snapshot', payload),
+    exportMarkdown: (payload) => ipcRenderer.invoke('library-export-markdown', payload),
     savePdf: (payload) => ipcRenderer.invoke('library-save-pdf', payload),
     readPdf: (payload) => ipcRenderer.invoke('library-read-pdf', payload),
     getPaperState: (paperId) => ipcRenderer.invoke('library-get-paper-state', { paperId }),

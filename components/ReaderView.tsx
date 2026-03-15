@@ -4,6 +4,7 @@ import {
   ChevronDown, 
   ChevronRight, 
   FileText, 
+  FileUp,
   Network, 
   ZoomIn, 
   ZoomOut, 
@@ -198,6 +199,11 @@ type HighlightItem = {
   isDeleted?: boolean;
 };
 
+type BuiltHighlightDraft = {
+  highlight: HighlightItem;
+  siblingOrderPatch: Map<string, number>;
+};
+
 type ChatThread = {
   id: string;
   title: string;
@@ -277,6 +283,56 @@ const buildAnnotationIdentityKey = (item: Partial<HighlightItem> | null | undefi
     return `highlight:${Number(item.pageIndex || 0)}:${rectKey}`;
   }
   return '';
+};
+
+const normalizeMarkdownText = (value: string) =>
+  String(value || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .trim();
+
+const buildMarkdownQuote = (value: string) => {
+  const text = normalizeMarkdownText(value);
+  if (!text) return '';
+  return text
+    .split('\n')
+    .map((line) => `> ${line.trim()}`)
+    .join('\n');
+};
+
+const buildMarkdownFromMindmap = (root: MindMapNode | null) => {
+  if (!root) return '';
+
+  const sections: string[] = [];
+  const appendBlock = (value: string) => {
+    const text = String(value || '').trim();
+    if (!text) return;
+    sections.push(text);
+  };
+
+  const walk = (node: MindMapNode, level: number) => {
+    if (node.kind === 'root' || node.kind === 'chapter') {
+      const title = normalizeMarkdownText(node.text);
+      const headingLevel = Math.max(1, Math.min(6, level));
+      if (title) {
+        appendBlock(`${'#'.repeat(headingLevel)} ${title}`);
+      }
+      (node.children || []).forEach((child) => walk(child, level + 1));
+      return;
+    }
+
+    const translated = normalizeMarkdownText(node.translation || node.text || '');
+    const original = normalizeMarkdownText(node.text || '');
+    if (translated) {
+      appendBlock(translated);
+    }
+    if (original) {
+      appendBlock(buildMarkdownQuote(original));
+    }
+  };
+
+  walk(root, 1);
+  return `${sections.join('\n\n').trim()}\n`;
 };
 
 const choosePreferredAnnotationVariant = (
@@ -602,12 +658,15 @@ const buildAnnotationsForSave = (
   previousAnnotations: HighlightItem[]
 ): HighlightItem[] => {
   const now = Date.now();
-  const normalizedPreviousAnnotations = dedupeEquivalentAnnotations(
+  // Chapter promotion can briefly produce both a manual chapter annotation and a
+  // PDF-backed chapter annotation for the same chapter node. Collapse those first
+  // so the PDF-backed variant is preserved during version merging.
+  const normalizedPreviousAnnotations = dedupeChapterAnnotations(
     (Array.isArray(previousAnnotations) ? previousAnnotations : [])
       .map((item) => normalizeSyncedHighlight(item))
       .filter(Boolean) as HighlightItem[]
   );
-  const normalizedCurrentHighlights = dedupeEquivalentAnnotations(
+  const normalizedCurrentHighlights = dedupeChapterAnnotations(
     (Array.isArray(currentHighlights) ? currentHighlights : [])
       .map((item) => normalizeSyncedHighlight(item))
       .filter(Boolean) as HighlightItem[]
@@ -1298,6 +1357,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const mindmapZoomScale = mindmapZoom / 100;
   const [infoRefreshing, setInfoRefreshing] = useState(false);
   const [infoRefreshError, setInfoRefreshError] = useState('');
+  const [isExportingMarkdown, setIsExportingMarkdown] = useState(false);
   const [infoTitleDraft, setInfoTitleDraft] = useState(String(paper.title || ''));
   const [isInfoTitleEditing, setIsInfoTitleEditing] = useState(false);
   const [infoTitleError, setInfoTitleError] = useState('');
@@ -1530,8 +1590,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   );
   const visibleHighlights = useMemo(() => getVisibleHighlights(annotations), [annotations]);
   const annotationById = useMemo(
-    () => new Map(annotations.map((item) => [String(item.id || '').trim(), item])),
-    [annotations]
+    () => new Map(visibleHighlights.map((item) => [String(item.id || '').trim(), item])),
+    [visibleHighlights]
   );
   const noteAnnotations = useMemo(
     () => annotations.filter((item) => item && !item.isDeleted && !item.isChapterTitle),
@@ -1605,6 +1665,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     },
     [rebuildDocNodes]
   );
+
+  const patchCustomChapterOrders = useCallback((siblingOrderPatch: Map<string, number>) => {
+    if (!siblingOrderPatch.size) return;
+    setCustomChapters((prev) =>
+      prev.map((item) => {
+        const nextOrder = siblingOrderPatch.get(item.id);
+        if (typeof nextOrder !== 'number') return item;
+        if (typeof item.order === 'number' && Math.abs(item.order - nextOrder) <= 1e-6) {
+          return item;
+        }
+        return { ...item, order: nextOrder };
+      })
+    );
+  }, [setCustomChapters]);
 
   const clonePdfBuffer = useCallback((value: unknown): ArrayBuffer | null => {
     if (value instanceof ArrayBuffer) {
@@ -2304,6 +2378,33 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     }
   };
 
+  const handleExportMarkdown = async () => {
+    if (isExportingMarkdown) return;
+    const markdown = buildMarkdownFromMindmap(mindmapRoot);
+    if (!markdown.trim()) {
+      window.alert('当前没有可导出的思维导图内容。');
+      return;
+    }
+    if (typeof window === 'undefined' || !window.electronAPI?.library?.exportMarkdown) {
+      window.alert('当前环境不支持导出 Markdown。');
+      return;
+    }
+    setIsExportingMarkdown(true);
+    try {
+      const result = await window.electronAPI.library.exportMarkdown({
+        paperTitle: paper.title || 'mind-paper-export',
+        content: markdown
+      });
+      if (!result?.ok) {
+        throw new Error(result?.error || '导出失败');
+      }
+    } catch (error: any) {
+      window.alert(error?.message || '导出失败');
+    } finally {
+      setIsExportingMarkdown(false);
+    }
+  };
+
   useEffect(() => {
     pdfDocRef.current = null;
   }, [paper.id]);
@@ -2475,10 +2576,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   const buildHighlightFromSelection = (
     color: string,
     options: Partial<HighlightItem> = {}
-  ) => {
+  ): BuiltHighlightDraft | null => {
     if (!selectionInfo || !selectionText) return;
     const topRatio = selectionInfo.rects.length
       ? Math.min(...selectionInfo.rects.map((rect) => rect.y))
+      : 0;
+    const leftRatio = selectionInfo.rects.length
+      ? Math.min(...selectionInfo.rects.map((rect) => rect.x ?? 0))
       : 0;
     const chapterId = findParentChapterId(selectionInfo.pageIndex, topRatio);
     const cachedTranslation = translationCacheRef.current.get(
@@ -2502,18 +2606,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       ...options
     } as HighlightItem;
     let nextOrder = base.order;
+    let siblingOrderPatch = new Map<string, number>();
     if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
       const preFirstNativeOrder = getOrderForPreFirstNativeHighlight(
         base.chapterId,
         selectionInfo.pageIndex,
         topRatio
       );
-      nextOrder =
-        typeof preFirstNativeOrder === 'number'
-          ? preFirstNativeOrder
-          : getCombinedOrderValue(base.chapterId);
+      if (typeof preFirstNativeOrder === 'number') {
+        nextOrder = preFirstNativeOrder;
+      } else {
+        const slot = getNodeOrderValueByChildPositionSlot(
+          base.chapterId,
+          selectionInfo.pageIndex,
+          topRatio,
+          leftRatio
+        );
+        nextOrder = slot.order;
+        siblingOrderPatch = slot.siblingOrderPatch;
+      }
     }
-    return { ...base, order: nextOrder };
+    return {
+      highlight: { ...base, order: nextOrder },
+      siblingOrderPatch
+    };
   };
 
   const buildHighlightFromSelectionData = (
@@ -2521,10 +2637,13 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     info: { pageIndex: number; rects: HighlightRect[]; text: string } | null,
     text: string,
     options: Partial<HighlightItem> = {}
-  ) => {
+  ): BuiltHighlightDraft | null => {
     if (!info || !text) return null;
     const topRatio = info.rects.length
       ? Math.min(...info.rects.map((rect) => rect.y))
+      : 0;
+    const leftRatio = info.rects.length
+      ? Math.min(...info.rects.map((rect) => rect.x ?? 0))
       : 0;
     const chapterId = findParentChapterId(info.pageIndex, topRatio);
     const cachedTranslation = translationCacheRef.current.get(
@@ -2548,18 +2667,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       ...options
     } as HighlightItem;
     let nextOrder = base.order;
+    let siblingOrderPatch = new Map<string, number>();
     if (typeof nextOrder !== 'number' && !base.isChapterTitle) {
       const preFirstNativeOrder = getOrderForPreFirstNativeHighlight(
         base.chapterId,
         info.pageIndex,
         topRatio
       );
-      nextOrder =
-        typeof preFirstNativeOrder === 'number'
-          ? preFirstNativeOrder
-          : getCombinedOrderValue(base.chapterId);
+      if (typeof preFirstNativeOrder === 'number') {
+        nextOrder = preFirstNativeOrder;
+      } else {
+        const slot = getNodeOrderValueByChildPositionSlot(
+          base.chapterId,
+          info.pageIndex,
+          topRatio,
+          leftRatio
+        );
+        nextOrder = slot.order;
+        siblingOrderPatch = slot.siblingOrderPatch;
+      }
     }
-    return { ...base, order: nextOrder };
+    return {
+      highlight: { ...base, order: nextOrder },
+      siblingOrderPatch
+    };
   };
 
   const isManualHighlight = useCallback((item: HighlightItem) => {
@@ -2597,15 +2728,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     options?: { keepHighlightId?: string; keepHighlightColor?: string }
   ) => {
     const parentId = resolveParentForChapter(chapterId);
-    setCustomChapters((prev) =>
-      prev
+    setDocNodes((prevDocNodes) => {
+      const prevCustomChapters = buildCustomChaptersFromDocNodes(prevDocNodes);
+      const prevAnnotations = buildAnnotationsFromDocNodes(prevDocNodes);
+      const prevHighlights = getVisibleHighlights(prevAnnotations);
+
+      const nextCustomChapters = prevCustomChapters
         .filter((item) => item.id !== chapterId)
         .map((item) =>
           item.parentId === chapterId ? { ...item, parentId } : item
-        )
-    );
-    setHighlights((prev) =>
-      prev
+        );
+
+      const nextHighlights = prevHighlights
         .filter((item) => {
           if (options?.keepHighlightId) return true;
           return !(item.isChapterTitle && item.chapterNodeId === chapterId);
@@ -2624,14 +2758,34 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             return { ...item, chapterId: parentId };
           }
           return item;
-        })
-    );
+        });
+
+      const nextNotes = nextHighlights.filter((item) => !item.isChapterTitle);
+      const nextChapterAnnotations = buildChapterAnnotationsFromOutlineNodes(
+        nextCustomChapters,
+        prevAnnotations
+      );
+      const nextAnnotations = dedupeChapterAnnotations(
+        buildAnnotationsForSave(
+          dedupeChapterAnnotations([...nextNotes, ...nextChapterAnnotations]),
+          prevAnnotations
+        )
+      );
+      const nextDocNodes = rebuildDocNodes(nextAnnotations);
+      return areDocNodesEquivalent(prevDocNodes, nextDocNodes) ? prevDocNodes : nextDocNodes;
+    });
     setExpandedTOC((prev) => {
       const next = new Set(prev);
       next.delete(chapterId);
+      const path = findOutlinePath(outlineDisplayRef.current, parentId);
+      if (path?.length) {
+        path.forEach((id) => next.add(id));
+      } else if (parentId) {
+        next.add(parentId);
+      }
       return next;
     });
-  }, [resolveParentForChapter, setCustomChapters, setHighlights]);
+  }, [rebuildDocNodes, resolveParentForChapter]);
 
   const addHighlight = (color: string) => {
     clearNativeSelection();
@@ -2655,8 +2809,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       }
       return;
     }
-    const newItem = buildHighlightFromSelection(color);
-    if (!newItem) return;
+    const builtHighlight = buildHighlightFromSelection(color);
+    if (!builtHighlight) return;
+    patchCustomChapterOrders(builtHighlight.siblingOrderPatch);
+    const newItem = builtHighlight.highlight;
     setHighlights((prev) => [...prev, newItem]);
     setActiveHighlightId(newItem.id);
     setExpandedTOC((prev) => {
@@ -2772,16 +2928,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       return;
     }
     const defaultColor = HIGHLIGHT_COLORS[0]?.fill || 'rgba(250, 204, 21, 0.45)';
-    const nextHighlight = buildHighlightFromSelectionData(
+    const builtHighlight = buildHighlightFromSelectionData(
       defaultColor,
       questionPicker.selectionInfo,
       questionPicker.selectionText,
       { questionIds: [question.id] }
     );
-    if (!nextHighlight) {
+    if (!builtHighlight) {
       setQuestionPicker({ open: false, highlightId: null, selectionInfo: null, selectionText: '' });
       return;
     }
+    patchCustomChapterOrders(builtHighlight.siblingOrderPatch);
+    const nextHighlight = builtHighlight.highlight;
     setHighlights((prev) => [...prev, nextHighlight]);
     setActiveHighlightId(nextHighlight.id);
     setQuestionPicker({ open: false, highlightId: null, selectionInfo: null, selectionText: '' });
@@ -2969,7 +3127,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       );
       setActiveHighlightId(activeHighlightId);
     } else {
-      const chapterHighlight = buildHighlightFromSelection('rgba(107, 114, 128, 0.35)', {
+      const builtChapterHighlight = buildHighlightFromSelection('rgba(107, 114, 128, 0.35)', {
         isChapterTitle: true,
         chapterId: chapterNode.id,
         chapterNodeId: chapterNode.id,
@@ -2979,7 +3137,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         rects,
         order
       });
-      if (chapterHighlight) {
+      if (builtChapterHighlight) {
+        const chapterHighlight = builtChapterHighlight.highlight;
         setHighlights((prev) => [...prev, chapterHighlight]);
         setActiveHighlightId(chapterHighlight.id);
       }
@@ -7001,6 +7160,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
               </button>
             </Tooltip>
           </div>
+          <Tooltip label={isExportingMarkdown ? '导出中' : '导出 Markdown'}>
+            <button
+              type="button"
+              onClick={handleExportMarkdown}
+              disabled={isExportingMarkdown}
+              className="p-1 rounded text-gray-600 hover:bg-gray-200 hover:text-gray-900 disabled:opacity-40 disabled:cursor-not-allowed"
+              aria-label="导出 Markdown"
+            >
+              {isExportingMarkdown ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <FileUp size={14} />
+              )}
+            </button>
+          </Tooltip>
           {viewMode === ReaderMode.MIND_MAP ? (
             <div className="flex-1 flex justify-center items-center gap-2">
               <Tooltip label="新增子节点">
