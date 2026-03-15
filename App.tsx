@@ -3,7 +3,7 @@ import { LibraryView } from './components/LibraryView';
 import { ReaderView } from './components/ReaderView';
 import { Folder, Paper, PaperReference } from './types';
 import { INITIAL_FOLDERS, MOCK_PAPERS, SYSTEM_FOLDER_ALL_ID, SYSTEM_FOLDER_TRASH_ID } from './constants';
-import { LayoutGrid, Settings, X, FileText, Sparkles, Cloud, FolderOpen, Clock3 } from 'lucide-react';
+import { LayoutGrid, Settings, X, FileText, Sparkles, FolderOpen } from 'lucide-react';
 import { Tooltip } from './components/Tooltip';
 import {
   extractPdfFullText,
@@ -43,7 +43,7 @@ const App: React.FC = () => {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState('');
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync' | 'idle' | 'storage'>('ai');
+  const [settingsSection, setSettingsSection] = useState<'ai' | 'sync' | 'storage'>('ai');
   const [webdavPassword, setWebdavPassword] = useState('');
   const [webdavServerInput, setWebdavServerInput] = useState('');
   const [webdavStatus, setWebdavStatus] = useState('');
@@ -1342,21 +1342,17 @@ const App: React.FC = () => {
                   }`}
                   aria-label="同步功能"
                 >
-                  <Cloud size={14} />
-                </button>
-              </Tooltip>
-              <Tooltip label="自动同步">
-                <button
-                  type="button"
-                  onClick={() => setSettingsSection('idle')}
-                  className={`flex items-center px-2 py-1 rounded-md text-xs font-medium transition-all ${
-                    settingsSection === 'idle'
-                      ? 'bg-gray-200 text-gray-900'
-                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200'
-                  }`}
-                  aria-label="自动同步"
-                >
-                  <Clock3 size={14} />
+                  <svg
+                    className="h-[14px] w-[14px]"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M7 18.25h10.5a3.75 3.75 0 0 0 .24-7.49A5.75 5.75 0 0 0 6.6 9.38 4 4 0 0 0 7 18.25Z" />
+                  </svg>
                 </button>
               </Tooltip>
               <Tooltip label="存储位置">
@@ -1554,51 +1550,50 @@ const App: React.FC = () => {
                   {webdavStatus ? (
                     <div className="text-[11px] text-gray-500">{webdavStatus}</div>
                   ) : null}
-                </div>
-              ) : settingsSection === 'idle' ? (
-                <div className="rounded-lg border border-gray-200 p-3 space-y-3">
-                  <div className="text-xs font-semibold text-gray-700">空闲自动同步</div>
-                  <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
-                    <div className="text-xs text-gray-700">启用空闲自动同步</div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setSettingsForm((prev) => ({
-                          ...prev,
-                          idleAutoSyncEnabled: !prev.idleAutoSyncEnabled
-                        }))
-                      }
-                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                        settingsForm.idleAutoSyncEnabled ? 'bg-emerald-500' : 'bg-gray-300'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
-                          settingsForm.idleAutoSyncEnabled ? 'translate-x-5' : 'translate-x-1'
+                  <div className="pt-1 border-t border-gray-200 space-y-3">
+                    <div className="text-xs font-semibold text-gray-700">空闲自动同步</div>
+                    <div className="flex items-center justify-between rounded-md border border-gray-200 px-3 py-2">
+                      <div className="text-xs text-gray-700">启用空闲自动同步</div>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSettingsForm((prev) => ({
+                            ...prev,
+                            idleAutoSyncEnabled: !prev.idleAutoSyncEnabled
+                          }))
+                        }
+                        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                          settingsForm.idleAutoSyncEnabled ? 'bg-emerald-500' : 'bg-gray-300'
                         }`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                            settingsForm.idleAutoSyncEnabled ? 'translate-x-5' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-1 gap-2">
+                      <label className="text-xs text-gray-500">空闲时长（分钟）</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={1440}
+                        step={1}
+                        value={settingsForm.idleAutoSyncMinutes}
+                        onChange={(e) =>
+                          setSettingsForm((prev) => ({
+                            ...prev,
+                            idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(e.target.value)
+                          }))
+                        }
+                        className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                        placeholder="10"
                       />
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-1 gap-2">
-                    <label className="text-xs text-gray-500">空闲时长（分钟）</label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={1440}
-                      step={1}
-                      value={settingsForm.idleAutoSyncMinutes}
-                      onChange={(e) =>
-                        setSettingsForm((prev) => ({
-                          ...prev,
-                          idleAutoSyncMinutes: normalizeIdleAutoSyncMinutes(e.target.value)
-                        }))
-                      }
-                      className="w-full rounded-md border border-gray-200 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
-                      placeholder="10"
-                    />
-                  </div>
-                  <div className="text-[11px] text-gray-400">
-                    用户无操作达到设定时长后，会自动触发一次云同步。
+                    </div>
+                    <div className="text-[11px] text-gray-400">
+                      用户无操作达到设定时长后，会自动触发一次云同步。
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -1633,8 +1628,6 @@ const App: React.FC = () => {
                   ? '开启 AI 功能需填写 API KEY / URL / 模型。'
                   : settingsSection === 'sync'
                     ? 'WebDAV 密码使用系统安全存储，需单独保存凭据。'
-                    : settingsSection === 'idle'
-                      ? '空闲自动同步仅在启用后生效。'
                     : '修改存储位置后，建议等待迁移完成再进行云同步。'}
               </div>
               <button
