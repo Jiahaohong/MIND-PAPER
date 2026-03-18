@@ -31,6 +31,15 @@ type LineItem = {
   size: number;
 };
 
+type TextRun = {
+  text: string;
+  x: number;
+  y: number;
+  size: number;
+  width: number;
+  endX: number;
+};
+
 const normalizePaperTitle = (value: string) =>
   String(value || '')
     .toLowerCase()
@@ -167,6 +176,51 @@ const normalizeTitleCandidateText = (value: string) => {
   return text;
 };
 
+const estimateTextRunWidth = (text: string, size: number, rawWidth: number) => {
+  const normalizedSize = Math.max(Math.abs(Number(size || 0)), 1);
+  const normalizedRawWidth = Math.abs(Number(rawWidth || 0));
+  const visibleChars = String(text || '').replace(/\s+/g, '').length;
+  const estimatedWidth = visibleChars
+    ? visibleChars * normalizedSize * 0.32
+    : normalizedSize * 0.6;
+  return Math.max(normalizedRawWidth, estimatedWidth);
+};
+
+const shouldInsertSpaceBetweenRuns = (prev: TextRun, current: TextRun) => {
+  const visualGap = current.x - prev.endX;
+  const maxSize = Math.max(prev.size, current.size);
+  if (visualGap <= Math.max(1.5, maxSize * 0.12)) return false;
+
+  const prevText = String(prev.text || '').replace(/\s+/g, '');
+  const currentText = String(current.text || '').replace(/\s+/g, '');
+  if (!prevText || !currentText) return visualGap > Math.max(2, maxSize * 0.18);
+
+  if (/^[,.;:!?%)\]}]/.test(currentText)) return false;
+  if (/[(\[{'"“‘/-]$/.test(prevText)) return false;
+
+  const splitWordGapThreshold = Math.max(4, maxSize * 0.38);
+  if (visualGap <= splitWordGapThreshold) {
+    if (/^[A-Za-z]$/.test(prevText) && /^[A-Za-z]{2,}$/.test(currentText)) return false;
+    if (/^[A-Za-z]+$/.test(prevText) && /^[a-z][A-Za-z]*$/.test(currentText)) return false;
+    if (/^[A-Z]+$/.test(prevText) && /^[A-Z]{2,}$/.test(currentText)) return false;
+    if (/^\d+$/.test(prevText) && /^[A-Za-z]+$/.test(currentText)) return false;
+  }
+
+  return true;
+};
+
+const joinTextRunsLikeSelection = (runs: TextRun[]) => {
+  if (!runs.length) return '';
+  let text = String(runs[0].text || '');
+  for (let i = 1; i < runs.length; i += 1) {
+    const prev = runs[i - 1];
+    const current = runs[i];
+    text += shouldInsertSpaceBetweenRuns(prev, current) ? ' ' : '';
+    text += String(current.text || '');
+  }
+  return normalizeLine(text);
+};
+
 const ABSTRACT_HEADING_REGEX = /^(abstract|摘要|summary)\b[:：]?\s*/i;
 const KEYWORD_HEADING_REGEX = /^(keywords?|关键[词字])\b[:：]?/i;
 const SECTION_HEADING_REGEX =
@@ -199,36 +253,40 @@ const buildLines = (items: any[]): LineItem[] => {
       const x = Number(transform[4] || 0);
       const y = Number(transform[5] || 0);
       const size = Math.max(Math.abs(Number(transform[0] || 0)), Math.abs(Number(transform[3] || 0)));
-      return { text, x, y, size: size || 1 };
+      const width = estimateTextRunWidth(text, size || 1, Number(item?.width || 0));
+      return { text, x, y, size: size || 1, width, endX: x + width };
     })
-    .filter(Boolean) as Array<{ text: string; x: number; y: number; size: number }>;
+    .filter(Boolean) as TextRun[];
 
   const sorted = textItems.sort((a, b) => {
     if (Math.abs(a.y - b.y) > 2) return b.y - a.y;
     return a.x - b.x;
   });
 
-  const lines: Array<{ y: number; parts: Array<{ x: number; text: string; size: number }> }> = [];
+  const lines: Array<{ y: number; parts: TextRun[] }> = [];
   sorted.forEach((item) => {
     const existing = lines.find((line) => Math.abs(line.y - item.y) <= 2);
     if (existing) {
-      existing.parts.push({ x: item.x, text: item.text, size: item.size });
+      existing.parts.push(item);
       existing.y = (existing.y + item.y) / 2;
       return;
     }
-    lines.push({ y: item.y, parts: [{ x: item.x, text: item.text, size: item.size }] });
+    lines.push({ y: item.y, parts: [item] });
   });
 
   const lineItems = lines.flatMap((line) => {
     const ordered = [...line.parts].sort((a, b) => a.x - b.x);
     if (!ordered.length) return [];
-    const segments: Array<Array<{ x: number; text: string; size: number }>> = [[ordered[0]]];
+    const segments: TextRun[][] = [[ordered[0]]];
     for (let i = 1; i < ordered.length; i += 1) {
       const prev = ordered[i - 1];
       const current = ordered[i];
-      // Dynamic threshold: large-font title lines may have decorative initial gaps.
-      const gapThreshold = Math.max(80, Math.max(prev.size, current.size) * 4.2);
-      if (current.x - prev.x > gapThreshold) {
+      // Use the visible tail of the previous run instead of only comparing origins.
+      // This keeps decorative drop caps attached to the rest of the word while still
+      // allowing clearly separated columns/blocks to split into independent segments.
+      const visualGap = current.x - prev.endX;
+      const gapThreshold = Math.max(22, Math.max(prev.size, current.size) * 1.9);
+      if (visualGap > gapThreshold) {
         segments.push([current]);
       } else {
         segments[segments.length - 1].push(current);
@@ -237,7 +295,7 @@ const buildLines = (items: any[]): LineItem[] => {
     return segments.map((segment) => ({
       y: line.y,
       x: segment[0].x,
-      text: normalizeLine(segment.map((part) => part.text).join(' ')),
+      text: joinTextRunsLikeSelection(segment),
       size: segment.reduce((max, part) => Math.max(max, part.size), 1)
     }));
   });

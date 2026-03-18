@@ -2199,16 +2199,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       if (!parseBuffer) {
         throw new Error('无法读取PDF内容');
       }
-      const fallbackDate = paper.date || '';
-      const normalizedCurrentAuthor = String(paper.author || '').trim();
-      const isUnknownLike = (value: string) => {
-        const v = String(value || '').trim().toLowerCase();
-        return !v || v === 'unknown' || v === 'unknow';
-      };
       const resolved = await resolvePaperMetadata({
         fileData: parseBuffer,
         fallbackTitle,
-        fallbackDate,
+        fallbackDate: '',
         priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
         parsePdfWithAI: parseWithAI && canUseAI,
         askAI: window.electronAPI?.askAI,
@@ -2218,16 +2212,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       });
       const originalAbstract = String(resolved.abstract || resolved.summary || '').trim();
       const resolvedAuthor = String(resolved.author || '').trim();
-      const nextAuthor = isUnknownLike(resolvedAuthor)
-        ? normalizedCurrentAuthor || 'Unknown'
-        : resolvedAuthor;
+      const nextAuthor = resolvedAuthor || 'Unknown';
+      const nextDate = String(resolved.date || '').trim() || 'Unknown';
       const parsedAbstract = String(resolved.abstract || resolved.summary || '').trim();
       updates = {
         ...(resolved.title ? { title: resolved.title } : {}),
         ...(nextAuthor ? { author: nextAuthor } : {}),
         ...(parsedAbstract ? { abstract: parsedAbstract } : {}),
         keywords: Array.isArray(resolved.keywords) ? resolved.keywords : [],
-        ...(resolved.date ? { date: resolved.date } : {}),
+        date: nextDate,
         ...(resolved.publisher ? { publisher: resolved.publisher } : {}),
         ...(resolved.doi ? { doi: resolved.doi } : {})
       };
@@ -7719,15 +7712,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">作者</div>
-                    <div>{paper.author}</div>
+                    <div>{paper.author || 'Unknown'}</div>
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布日期</div>
-                    <div>{formatDateYmd(paper.date)}</div>
+                    <div>{formatDateYmd(paper.date) || 'Unknown'}</div>
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">发布机构</div>
-                    <div>{paper.publisher || '-'}</div>
+                    <div>{paper.publisher || 'Unknown'}</div>
                   </div>
                   <div>
                     <div className="text-gray-400 text-xs uppercase mb-1">参考文献</div>

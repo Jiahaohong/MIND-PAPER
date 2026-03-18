@@ -2337,7 +2337,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                              {paper.title}
                            </div>
                            <div className="text-xs text-gray-500 w-full truncate" title={paper.author}>
-                             {paper.author}
+                             {paper.author || 'Unknown'}
                            </div>
                            {paper.isBackgroundProcessing && paper.backgroundTask && paper.backgroundTask !== '重写摘要中' ? (
                              <div className="mt-1 inline-flex items-center rounded-full bg-blue-50 px-2 py-0.5 text-[10px] text-blue-600">
@@ -2345,7 +2345,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                              </div>
                            ) : null}
                            <div className="mt-0.5 w-full text-xs text-gray-400 flex items-center justify-between">
-                             <span>{formatDateYmd(paper.date)}</span>
+                             <span>{formatDateYmd(paper.date) || 'Unknown'}</span>
                              <span>{formatUploadDateYmd(paper)}</span>
                            </div>
                          </>

@@ -304,13 +304,6 @@ const App: React.FC = () => {
     const localPaperId = createPaperId();
     let id = localPaperId;
     const fallbackTitle = file.name.replace(/\.pdf$/i, '');
-    const formatNowDate = () => {
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = now.getMonth() + 1;
-      const day = now.getDate();
-      return `${year}年${month}月${day}日`;
-    };
     const nowIso = new Date().toISOString();
     const nowTs = Date.now();
     const assignedFolderId =
@@ -327,7 +320,7 @@ const App: React.FC = () => {
       id,
       title: fallbackTitle,
       author: 'Unknown',
-      date: formatNowDate(),
+      date: 'Unknown',
       addedDate: nowIso,
       uploadedAt: nowTs,
       folderId: assignedFolderId,
@@ -366,7 +359,7 @@ const App: React.FC = () => {
       let parsedAuthor = 'Unknown';
       let parsedAbstract = '';
       let parsedKeywords: string[] = [];
-      let parsedDate = formatNowDate();
+      let parsedDate = 'Unknown';
       let parsedPublisher = '';
       let parsedDoi = '';
       let parsedReferences: PaperReference[] = [];
@@ -389,7 +382,7 @@ const App: React.FC = () => {
         const resolved = await resolvePaperMetadata({
           fileData,
           fallbackTitle,
-          fallbackDate: parsedDate,
+          fallbackDate: '',
           priority: parseWithAI && canUseAI ? ['open_source', 'ai', 'local'] : ['open_source', 'local'],
           parsePdfWithAI: parseWithAI && canUseAI,
           askAI: window.electronAPI?.askAI,
@@ -398,10 +391,10 @@ const App: React.FC = () => {
             : undefined
         });
         parsedTitle = resolved.title;
-        parsedAuthor = isUnknownLike(resolved.author) ? 'Unknown' : resolved.author;
+        parsedAuthor = String(resolved.author || '').trim() || 'Unknown';
         parsedAbstract = resolved.abstract || resolved.summary || '';
         parsedKeywords = resolved.keywords;
-        parsedDate = resolved.date || parsedDate;
+        parsedDate = String(resolved.date || '').trim() || 'Unknown';
         parsedPublisher = resolved.publisher || parsedPublisher;
         parsedDoi = resolved.doi || '';
         let apiReferences: PaperReference[] = [];

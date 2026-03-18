@@ -131,6 +131,13 @@ const normalizeTitleForOpenSourceSearch = (value: string): string => {
   return text;
 };
 
+const normalizeTitleForComparison = (value: string): string =>
+  normalizeTitleForOpenSourceSearch(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
 export const resolvePaperMetadata = async (params: {
   fileData: ArrayBuffer;
   fallbackTitle: string;
@@ -168,6 +175,8 @@ export const resolvePaperMetadata = async (params: {
   let aiCandidate: ParsedCandidate | null = null;
   let openSourceCandidate: ParsedCandidate | null = null;
   let firstPageText = '';
+  let apiTitleMismatch = false;
+  let recognizedTitle = String(fallbackTitle || '').trim();
 
   const ensureLocal = async (): Promise<ParsedCandidate> => {
     if (localCandidate) return localCandidate;
@@ -181,6 +190,7 @@ export const resolvePaperMetadata = async (params: {
       date: parsed.metadata.publishedDate,
       publisher: parsed.metadata.publisher
     };
+    recognizedTitle = String(localCandidate.title || '').trim() || recognizedTitle;
     return localCandidate;
   };
 
@@ -225,6 +235,21 @@ export const resolvePaperMetadata = async (params: {
       if (remote) break;
     }
     if (!remote) return null;
+    const normalizedRecognizedTitle = normalizeTitleForComparison(recognizedTitle || seedTitle);
+    const normalizedRemoteTitle = normalizeTitleForComparison(String(remote.title || ''));
+    if (
+      normalizedRecognizedTitle &&
+      normalizedRemoteTitle &&
+      normalizedRecognizedTitle !== normalizedRemoteTitle
+    ) {
+      apiTitleMismatch = true;
+      console.warn(
+        `[metadata-resolver] ignore open_source mismatch: local="${recognizedTitle}" remote="${String(
+          remote.title || ''
+        ).trim()}"`
+      );
+      return null;
+    }
     const rawAuthors = Array.isArray(remote.authors)
       ? remote.authors.map((item) => String(item ?? ''))
       : [];
@@ -245,6 +270,7 @@ export const resolvePaperMetadata = async (params: {
   // 3) if API failed and AI enabled -> AI overwrite
   try {
     const local = await ensureLocal();
+    recognizedTitle = String(local.title || '').trim() || recognizedTitle;
     applyNonEmpty(resolved, local);
   } catch (error) {
     console.warn('[metadata-resolver] local failed:', error);
@@ -255,10 +281,25 @@ export const resolvePaperMetadata = async (params: {
     const api = await ensureOpenSource();
     if (api) {
       applyNonEmpty(resolved, api);
+      resolved.author = String(api.author || '').trim() || 'Unknown';
+      resolved.date = String(api.date || '').trim() || 'Unknown';
       apiSuccess = true;
     }
   } catch (error) {
     console.warn('[metadata-resolver] open_source failed:', error);
+  }
+
+  if (apiTitleMismatch) {
+    return {
+      title: recognizedTitle || fallbackTitle,
+      author: '',
+      summary: '',
+      abstract: '',
+      keywords: [],
+      date: '',
+      publisher: '',
+      doi: ''
+    };
   }
 
   if (!apiSuccess && parsePdfWithAI) {
@@ -274,6 +315,6 @@ export const resolvePaperMetadata = async (params: {
   if (!resolved.author) resolved.author = 'Unknown';
   if (!resolved.summary) resolved.summary = 'Uploaded PDF';
   if (!resolved.abstract) resolved.abstract = resolved.summary;
-  if (!resolved.date) resolved.date = fallbackDate;
+  if (!resolved.date) resolved.date = fallbackDate || 'Unknown';
   return resolved;
 };

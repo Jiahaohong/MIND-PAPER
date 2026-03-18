@@ -1108,7 +1108,12 @@ const searchOpenAlexByTitle = async (title) => {
   const url = `https://api.openalex.org/works?search=${encodeURIComponent(title)}&per-page=5`;
   const data = await fetchJsonWithTimeout(url);
   const results = Array.isArray(data?.results) ? data.results : [];
-  if (!results.length) return null;
+  if (!results.length) {
+    console.log(
+      `[open-source][openalex] query="${String(title || '').slice(0, 120)}" result=null`
+    );
+    return null;
+  }
   let best = null;
   let bestScore = -1;
   for (const item of results) {
@@ -1232,7 +1237,12 @@ const searchSemanticScholarByTitle = async (title) => {
   )}&limit=5&fields=title,authors,venue,year,publicationDate,externalIds,abstract`;
   const data = await fetchJsonWithTimeout(url);
   const results = Array.isArray(data?.data) ? data.data : [];
-  if (!results.length) return null;
+  if (!results.length) {
+    console.log(
+      `[open-source][semanticscholar] query="${String(title || '').slice(0, 120)}" result=null`
+    );
+    return null;
+  }
   let best = null;
   let bestScore = -1;
   for (const item of results) {
@@ -1391,29 +1401,26 @@ const getReferenceIntersectionByDoi = async (doi, title = '') => {
 const searchPaperOpenSource = async (title) => {
   const query = String(title || '').trim();
   if (!query) return null;
-  let primary = null;
-  const semantic = await searchSemanticScholarByTitle(query).catch(() => null);
-  if (semantic) {
-    primary = {
-      source: 'Semantic Scholar',
-      title: String(semantic?.title || '').trim(),
-      authors: Array.isArray(semantic?.authors) ? semantic.authors.filter(Boolean) : [],
-      publication_date: String(semantic?.publication_date || '').trim(),
-      venue: String(semantic?.venue || '').trim(),
-      doi: String(semantic?.doi || '').trim() || null
-    };
-  } else {
-    const openAlex = await searchOpenAlexByTitle(query).catch(() => null);
-    if (!openAlex) return null;
-    primary = {
-      source: 'OpenAlex',
-      title: String(openAlex?.title || '').trim(),
-      authors: Array.isArray(openAlex?.authors) ? openAlex.authors.filter(Boolean) : [],
-      publication_date: String(openAlex?.publication_date || '').trim(),
-      venue: String(openAlex?.venue || '').trim(),
-      doi: String(openAlex?.doi || '').trim() || null
-    };
-  }
+  const [semantic, openAlex] = await Promise.all([
+    searchSemanticScholarByTitle(query).catch((error) => {
+      console.warn('[open-source][semanticscholar] failed:', error?.message || error);
+      return null;
+    }),
+    searchOpenAlexByTitle(query).catch((error) => {
+      console.warn('[open-source][openalex] failed:', error?.message || error);
+      return null;
+    })
+  ]);
+  const preferred = semantic || openAlex;
+  if (!preferred) return null;
+  const primary = {
+    source: semantic ? 'Semantic Scholar' : 'OpenAlex',
+    title: String(preferred?.title || '').trim(),
+    authors: Array.isArray(preferred?.authors) ? preferred.authors.filter(Boolean) : [],
+    publication_date: String(preferred?.publication_date || '').trim(),
+    venue: String(preferred?.venue || '').trim(),
+    doi: String(preferred?.doi || '').trim() || null
+  };
   console.log(
     `[open-source][merged] query="${String(query || '').slice(0, 120)}" result=${JSON.stringify(
       primary
